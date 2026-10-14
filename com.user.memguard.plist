@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  mem-guard 的 LaunchAgent 模板（可选）。
+  作用：开机自启、常驻后台，每 30s 采样一次整台设备内存，越 90% 即写告警到 mem-guard.log。
+
+  安装（需把下方路径改成你机器上的真实路径）：
+    cp com.user.memguard.plist ~/Library/LaunchAgents/
+    # 编辑 plist 里的 ProgramArguments 路径（node 与 mem-guard.mjs）
+    launchctl load ~/Library/LaunchAgents/com.user.memguard.plist
+  卸载：
+    launchctl unload ~/Library/LaunchAgents/com.user.memguard.plist
+
+  ⚠️ 这不是 git 仓库的一部分被强制安装的东西——只是给你省事的模板。
+     想要"越线就重启网关"，把 ProgramArguments 里的 --cmd 补上重启命令即可
+     （注意幂等，别写成会自杀的循环）。
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.user.memguard</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/claw/.workbuddy/binaries/node/versions/22.22.2-3/bin/node</string>
+    <string>/Users/claw/.ollama-token-gateway/mem-guard.mjs</string>
+    <string>--watch</string>
+    <string>30</string>
+    <string>--at</string>
+    <string>0.9</string>
+    <string>--log</string>
+    <string>/Users/claw/.ollama-token-gateway/mem-guard.log</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/Users/claw/.ollama-token-gateway/mem-guard.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/claw/.ollama-token-gateway/mem-guard.err.log</string>
+  <key>WorkingDirectory</key>
+  <string>/Users/claw/.ollama-token-gateway</string>
+</dict>
+</plist>

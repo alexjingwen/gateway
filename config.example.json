@@ -1,0 +1,33 @@
+{
+  "_comment": "脱敏样例，仅供结构参考。真实 config.json 含 sk-ollama-*** token 与 TLS 私钥，已被 .gitignore 屏蔽，不会入库。",
+  "keys": {
+    "sk-ollama-REPLACE_WITH_REAL_KEY_1": {
+      "name": "Alex",
+      "daily_tokens": 0,
+      "monthly_tokens": 0,
+      "qps": 5,
+      "rate_limited": false,
+      "active": true,
+      "created": "2026-08-03"
+    },
+    "sk-ollama-REPLACE_WITH_REAL_KEY_2": {
+      "name": "Open",
+      "daily_tokens": 0,
+      "monthly_tokens": 0,
+      "qps": 5,
+      "rate_limited": false,
+      "active": true,
+      "created": "2026-08-03"
+    }
+  },
+  "global": {
+    "max_concurrency": 256,
+    "allow_models": ["*"],
+    "deny_models": [],
+    "listen_host": "0.0.0.0",
+    "listen_port": 3000
+  },
+  "admin": {
+    "token": ""
+  }
+}

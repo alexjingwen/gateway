@@ -1,0 +1,18 @@
+# ── 密钥 / 凭证：绝不入库 ──
+config.json
+config.json.bak*
+*.key
+*.crt
+certs/
+ipv6-ddns-state.json
+
+# ── 运行时产物 ──
+logs/
+mem-guard.log
+.DS_Store
+
+# ── 大型二进制（Tailscale 安装包等，不进版本库）──
+clients/
+
+# ── 依赖 ──
+node_modules/
