@@ -1,4 +1,4 @@
-# ollama-token-gateway · 运维工具：mem-guard
+# gateway · 运维工具：mem-guard
 
 这个目录是 **ollama-token-gateway**（模型管理 / token gateway）的运行与运维目录。
 本仓库**只纳入运维侧工具与脱敏配置**；真实的 `config.json`（含 `sk-ollama-***` token）、
