@@ -99,3 +99,11 @@ PAT 运行时从 `~/.git-credentials` 读取，只走内存，不落盘、不打
 - **源**：`alexjingwen/auto-florr` 的 `main` 分支，与本地 `/Users/claw/.ollama-token-gateway/` 工作副本逐字节一致。
 - **迁移约束**：本机 `github.com:443` 被代理拦截、仅 `api.github.com` 可达，故推送走 `tools/push-via-api.py`（Git Data API）。
 - **未纳入**：`config.json`（含真实 token）、`certs/`、`clients/`、`logs/` 等运维密钥在 `.gitignore` 中，不随仓库分发。
+
+---
+
+## 范围 / Scope
+
+- 本仓库是**本地局域网（LAN）**使用的 OpenAI 兼容 token 网关的「配置 + 运维」家目录：存放脱敏配置样例、设备内存守卫 `mem-guard.mjs`、LaunchAgent 模板与 Git Data API 推送工具。
+- 网关服务本身（监听 `:3000`、按 `config.json` 做 token 配额 / QPS / 限流）作为独立二进制部署，不进版本库（见 `.gitignore` 的 `clients/`、`certs/`、`config.json`）。
+- 仅用于可信的内网环境，不要直接暴露到公网。
