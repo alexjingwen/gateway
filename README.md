@@ -147,6 +147,8 @@ TG_DISABLE_HTTPS=1 TG_PORT=3000 python3 token-gateway.py
 | TG_READ_TIMEOUT | 900 | 上游读取超时（秒） |
 | TG_VLM_READ_TIMEOUT | 120 | 多模态请求读取超时（秒） |
 | TG_CONFIG_DIR | ~/.ollama-token-gateway | config.json / certs / logs 所在目录 |
+> **端口/地址优先级**：`config.json` 的 `global.listen_host` / `global.listen_port` 高于 `TG_HOST` / `TG_PORT` 环境变量。通常直接改 `config.json` 即可，无需动环境变量。
+
 
 ### macOS 后台运行（launchd）
 仓库内含 `com.token-gateway.server.plist` 模板：
