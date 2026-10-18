@@ -1,7 +1,7 @@
 # gateway · 运维工具：mem-guard
 
 这个目录是 **ollama-token-gateway**（模型管理 / token gateway）的运行与运维目录。
-本仓库**只纳入运维侧工具与脱敏配置**；真实的 `config.json`（含 `sk-ollama-***` token）、
+本仓库纳入**运维侧工具、脱敏配置样例，以及网关服务端源码 `token-gateway.py`**；真实的 `config.json`（含 `sk-ollama-***` token）、
 TLS 私钥 `certs/server.key`、Tailscale 客户端二进制等均在 `.gitignore` 中，不会进入版本库。
 
 ## mem-guard.mjs —— 设备级内存守卫
@@ -104,8 +104,8 @@ PAT 运行时从 `~/.git-credentials` 读取，只走内存，不落盘、不打
 
 ## 范围 / Scope
 
-- 本仓库是**本地局域网（LAN）**使用的 OpenAI 兼容 token 网关的「配置 + 运维」家目录：存放脱敏配置样例、设备内存守卫 `mem-guard.mjs`、LaunchAgent 模板与 Git Data API 推送工具。
-- 网关服务本身（监听 `:3000`、按 `config.json` 做 token 配额 / QPS / 限流）作为独立二进制部署，不进版本库（见 `.gitignore` 的 `clients/`、`certs/`、`config.json`）。
+- 本仓库是**本地局域网（LAN）**使用的 OpenAI 兼容 token 网关的「配置 + 运维 + 服务端源码」家目录：含网关服务端 `token-gateway.py`（单文件、纯标准库）、脱敏配置样例、设备内存守卫 `mem-guard.mjs`、LaunchAgent 模板与 Git Data API 推送工具。
+- 网关服务端的**源码 `token-gateway.py` 已纳入本仓库**（单文件、纯 Python 标准库，`git clone` 后可直接运行）；但运行期密钥 `config.json`、TLS 证书 `certs/`、`clients/`、`logs/` 仍由 `.gitignore` 排除、不随仓库分发。
 - 仅用于可信的内网环境，不要直接暴露到公网。
 
 ## 部署 / Deploy
