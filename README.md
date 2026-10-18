@@ -107,3 +107,56 @@ PAT 运行时从 `~/.git-credentials` 读取，只走内存，不落盘、不打
 - 本仓库是**本地局域网（LAN）**使用的 OpenAI 兼容 token 网关的「配置 + 运维」家目录：存放脱敏配置样例、设备内存守卫 `mem-guard.mjs`、LaunchAgent 模板与 Git Data API 推送工具。
 - 网关服务本身（监听 `:3000`、按 `config.json` 做 token 配额 / QPS / 限流）作为独立二进制部署，不进版本库（见 `.gitignore` 的 `clients/`、`certs/`、`config.json`）。
 - 仅用于可信的内网环境，不要直接暴露到公网。
+
+## 部署 / Deploy
+
+本仓库自带网关服务端 `token-gateway.py`：**单文件、纯 Python 标准库、无第三方依赖**（无需 `pip install`）。
+
+### 前置条件
+- Python 3.10+（仅标准库）
+- 上游推理服务（按需）：
+  - Ollama，默认 `http://127.0.0.1:11434`
+  - Rapid-MLX（多模态 VLM 上游），默认 `http://127.0.0.1:8090` 与 `http://127.0.0.1:8088`
+
+### 快速开始（命令行）
+```bash
+git clone https://github.com/alexjingwen/gateway
+cd gateway
+# 1) 准备配置（config.json 含真实 key，已被 .gitignore 排除，不入库）
+mkdir -p ~/.ollama-token-gateway
+cp config.example.json ~/.ollama-token-gateway/config.json
+#   编辑 config.json：填写 keys.* 与 admin.token
+# 2) 启动（默认监听 0.0.0.0:3000；局域网/内网用 TG_DISABLE_HTTPS=1 关闭 HTTPS）
+TG_DISABLE_HTTPS=1 TG_PORT=3000 python3 token-gateway.py
+```
+验证：`curl localhost:3000/health`、`curl localhost:3000/v1/models`。
+
+### 环境变量（TG_*）
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| TG_HOST | 0.0.0.0 | 监听地址 |
+| TG_PORT | 3000 | 监听端口 |
+| TG_DISABLE_HTTPS | (空) | 设为 1 关闭 HTTPS |
+| TG_OLLAMA_HOST | http://127.0.0.1:11434 | Ollama 上游 |
+| TG_RAPID_MLX_HOSTS | http://127.0.0.1:8002,http://127.0.0.1:8088 | Rapid-MLX 上游（多节点逗号分隔） |
+| TG_RAPID_MLX_VLM_HOSTS | http://127.0.0.1:8088 | 多模态 VLM 专用上游 |
+| TG_MLX_VLM_API_KEY | sk-test | 访问 VLM 上游所需的 key |
+| TG_MODEL_ALIASES | (空) | 模型别名，如 qwen3.5-122b=mlx-community/Qwen3.5-122B-A10B-4bit |
+| TG_QPS | 5 | 每 key 每秒请求数 |
+| TG_CONCURRENCY | 10 | 全局最大并发 |
+| TG_READ_TIMEOUT | 900 | 上游读取超时（秒） |
+| TG_VLM_READ_TIMEOUT | 120 | 多模态请求读取超时（秒） |
+| TG_CONFIG_DIR | ~/.ollama-token-gateway | config.json / certs / logs 所在目录 |
+
+### macOS 后台运行（launchd）
+仓库内含 `com.token-gateway.server.plist` 模板：
+```bash
+cp com.token-gateway.server.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/com.token-gateway.server.plist
+launchctl start com.token-gateway.server
+```
+> 部署前请将 plist 中 `WorkingDirectory` 与 `ProgramArguments` 的路径改为你的实际 clone 位置；`TG_RAPID_MLX_HOSTS` 等上游地址请按本机环境修改。
+
+### 说明
+- 当前运行在 `http://openmac-studio.taila46635.ts.net:3000` 的实例，即由本仓库 `token-gateway.py` 的同一实现驱动；`git clone` 后按上述步骤即可重建一个功能对等的本地网关。
+- `config.json`、`certs/`、`logs/` 含真实密钥/证书，已被 `.gitignore` 排除，不会进入版本库。

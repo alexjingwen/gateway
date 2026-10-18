@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+		<key>TG_HOST</key>
+		<string>0.0.0.0</string>
+		<key>TG_PORT</key>
+		<string>3000</string>
+		<key>TG_DISABLE_HTTPS</key>
+		<string>1</string>
+		<key>TG_OLLAMA_HOST</key>
+		<string>http://127.0.0.1:11434</string>
+		<key>TG_RAPID_MLX_HOSTS</key>
+		<string>http://127.0.0.1:8090,http://127.0.0.1:8088</string>
+		<key>TG_RAPID_MLX_VLM_HOSTS</key>
+		<string>http://127.0.0.1:8088</string>
+		<key>TG_MLX_VLM_API_KEY</key>
+		<string>sk-test</string>
+		<key>TG_MODEL_ALIASES</key>
+		<string>qwen3.5-122b=mlx-community/Qwen3.5-122B-A10B-4bit</string>
+		<key>TG_QPS</key>
+		<string>5</string>
+		<key>TG_CONCURRENCY</key>
+		<string>10</string>
+		<key>TG_READ_TIMEOUT</key>
+		<string>240</string>
+		<key>TG_VLM_READ_TIMEOUT</key>
+		<string>150</string>
+	</dict>
+	<key>KeepAlive</key>
+	<true/>
+	<key>Label</key>
+	<string>com.token-gateway.server</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/opt/homebrew/bin/python3</string>
+		<string>-u</string>
+		<string>/Users/claw/gateway/token-gateway.py</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/tmp/token-gateway.err.log</string>
+	<key>StandardOutPath</key>
+	<string>/tmp/token-gateway.log</string>
+	<key>WorkingDirectory</key>
+	<string>/Users/claw/gateway</string>
+</dict>
+</plist>

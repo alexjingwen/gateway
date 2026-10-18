@@ -1,0 +1,2 @@
+# No third-party dependencies.
+# token-gateway.py uses only the Python 3.10+ standard library.
