@@ -7,7 +7,20 @@
 - **运维工具**：`mem-guard.mjs` + `com.user.memguard.plist`
 - **推送工具**：`tools/push-via-api.py`（Git Data API，绕过被拦的 `github.com:443`）
 
-> 仅用于**可信内网**，不要直接暴露到公网。安全细则见 [安全](#安全)。
+> 仅用于**可信内网**，不要直接暴露到公网。安全细则见 [安全加固](#安全加固)。
+
+## 目录
+
+- [范围 / Scope](#范围--scope)
+- [部署 / Deploy](#部署--deploy)
+- [API 参考](#api-参考)
+- [配置字段速查](#配置字段速查)
+- [安全加固](#安全加固)
+- [mem-guard.mjs —— 设备级内存守卫](#mem-guardmjs--设备级内存守卫)
+- [故障排查 / 常见问题](#故障排查--常见问题)
+- [运维细节（日志 / 权限 / 轮转）](#运维细节日志--权限--轮转)
+- [推送到 GitHub](#推送到-github)
+- [仓库来源 / Provenance](#仓库来源--provenance)
 
 ## 范围 / Scope
 
@@ -32,7 +45,7 @@ cd gateway
 # 1) 准备配置（config.json 含真实 key，已被 .gitignore 排除，不入库）
 mkdir -p ~/.ollama-token-gateway
 cp config.example.json ~/.ollama-token-gateway/config.json
-#    编辑 config.json：填写 keys.* 与 admin.token（字段含义见「配置字段说明」，安全要求见「安全」）
+#    编辑 config.json：填写 keys.* 与 admin.token（字段含义见「配置字段速查」，安全要求见「安全加固」）
 # 2) 启动（默认监听 0.0.0.0:3000；局域网/内网用 TG_DISABLE_HTTPS=1 关闭 HTTPS）
 TG_DISABLE_HTTPS=1 TG_PORT=3000 python3 token-gateway.py
 ```
@@ -42,8 +55,9 @@ TG_DISABLE_HTTPS=1 TG_PORT=3000 python3 token-gateway.py
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | TG_HOST | 0.0.0.0 | 监听地址 |
-| TG_PORT | 3000 | 监听端口 |
-| TG_DISABLE_HTTPS | (空) | 设为 1 关闭 HTTPS |
+| TG_PORT | 3000 | 监听端口（`config.json` 的 `listen_port` 优先） |
+| TG_DISABLE_HTTPS | (空) | 设为 1 关闭 HTTPS（走明文 HTTP） |
+| TG_HTTP_PORT | 3001 | 启用 HTTPS 时，此端口做 HTTP→HTTPS 重定向 |
 | TG_OLLAMA_HOST | http://127.0.0.1:11434 | Ollama 上游 |
 | TG_RAPID_MLX_HOSTS | http://127.0.0.1:8002,http://127.0.0.1:8088 | Rapid-MLX 上游（多节点逗号分隔） |
 | TG_RAPID_MLX_VLM_HOSTS | http://127.0.0.1:8088 | 多模态 VLM 专用上游 |
@@ -53,9 +67,8 @@ TG_DISABLE_HTTPS=1 TG_PORT=3000 python3 token-gateway.py
 | TG_CONCURRENCY | 10 | 全局最大并发 |
 | TG_READ_TIMEOUT | 900 | 上游读取超时（秒） |
 | TG_VLM_READ_TIMEOUT | 120 | 多模态请求读取超时（秒） |
+| TG_CONNECT_TIMEOUT | 10 | 上游连接超时（秒） |
 | TG_CONFIG_DIR | ~/.ollama-token-gateway | config.json / certs / logs 所在目录 |
-
-> **端口/地址优先级**：`config.json` 的 `global.listen_host` / `global.listen_port` 高于 `TG_HOST` / `TG_PORT` 环境变量。通常直接改 `config.json` 即可，无需动环境变量。
 
 ### macOS 后台运行（launchd）
 仓库内含 `com.token-gateway.server.plist` 模板：
@@ -70,39 +83,93 @@ launchctl list | grep token-gateway
 tail -f /tmp/token-gateway.log
 ```
 
-## API 接口概览
+## API 参考
+
+所有 `/v1/*` 接口兼容 OpenAI 客户端。鉴权方式：
+- **OpenAI 兼容端点**：`Authorization: Bearer <key>`（也支持 `?api_key=<key>`）；`<key>` 必须是 `config.json` 的 `keys` 中存在且 `active: true` 的 key。
+- **管理端点**：`X-Admin-Token: <admin.token>`；当 `admin.token` 为空时**跳过校验**（依赖网络层鉴权，见 [安全加固](#安全加固)）。
 
 ### 公开端点（无需鉴权）
+
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/` `/admin` `/admin/` | Web 管理台（浏览器打开） |
 | GET | `/admin/chat` | 管理台内置聊天页 |
-| GET | `/health` `/healthz` | 健康检查，返回 `{"status":"ok","version":"1.0.0","uptime":<秒>}` |
+| GET | `/health` `/healthz` | 健康检查 |
 
-### OpenAI 兼容端点（鉴权：`Authorization: Bearer <key>`）
-`<key>` 必须是 `config.json` 中 `keys` 里存在且 `active: true` 的 key，否则返回 `401` / `403`。
+**`GET /health` 响应**
+```json
+{"status": "ok", "version": "1.0.0", "uptime": 2506690}
+```
+`uptime` 为服务已运行秒数。
+
+### OpenAI 兼容端点
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/v1/models` | 合并 Ollama + Rapid-MLX 的模型列表（OpenAI 格式） |
-| POST | `/v1/chat/completions` | 聊天补全，支持 `stream=true` 流式 |
+| GET | `/v1/models` | 合并 Ollama + Rapid-MLX 的模型列表 |
+| POST | `/v1/chat/completions` | 聊天补全，支持 `stream=true` |
 | POST | `/v1/completions` | 文本补全 |
-| POST | `/v1/embeddings` | 向量（代理到上游） |
+| POST | `/v1/embeddings` | 向量（代理上游） |
 | — | `/models` `/chat/completions` `/completions` `/embeddings` | 上述 `/v1/*` 的别名 |
 | — | `/api/tags` `/api/pull` `/api/delete` | Ollama 兼容入口，代理到 Ollama 上游 |
 
-```bash
-KEY=sk-ollama-xxxxxxxx
-# 列出模型
-curl http://127.0.0.1:3000/v1/models -H "Authorization: Bearer $KEY"
-# 聊天补全
-curl http://127.0.0.1:3000/v1/chat/completions \
-  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
-  -d '{"model":"gemma4:latest","messages":[{"role":"user","content":"hi"}]}'
+**`GET /v1/models` 响应**
+```json
+{
+  "object": "list",
+  "data": [
+    {"id": "qwen2.5vl:3b", "object": "model", "created": 0, "owned_by": "ollama"},
+    {"id": "gemma4:latest", "object": "model", "created": 0, "owned_by": "ollama"},
+    {"id": "muse-glimmer", "object": "model", "created": 0, "owned_by": "rapid-mlx"}
+  ]
+}
 ```
 
-### 管理端点（鉴权：`X-Admin-Token: <admin.token>`）
-当 `admin.token` 为空时**跳过校验**（依赖局域网 / Tailscale 网络层鉴权，见 [安全](#安全)）。
+**`POST /v1/chat/completions` 请求**
+```bash
+curl http://127.0.0.1:3000/v1/chat/completions \
+  -H "Authorization: Bearer sk-ollama-xxxxxxxx" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gemma4:latest","messages":[{"role":"user","content":"你好"}],"stream":false}'
+```
+**非流式响应**（标准 OpenAI 格式，字段以上游为准）
+```json
+{
+  "id": "chatcmpl-...",
+  "object": "chat.completion",
+  "created": 1730000000,
+  "model": "gemma4:latest",
+  "choices": [{"index": 0, "message": {"role": "assistant", "content": "你好！"}, "finish_reason": "stop"}],
+  "usage": {"prompt_tokens": 8, "completion_tokens": 5, "total_tokens": 13}
+}
+```
+**流式响应**（`stream: true`，SSE，每行 `data: {...}`，最后 `data: [DONE]`）
+```
+data: {"id":"chatcmpl-...","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"你"}}]}
+data: {"id":"chatcmpl-...","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"好"}}]}
+data: {"id":"chatcmpl-...","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":8,"completion_tokens":5,"total_tokens":13}}
+data: [DONE]
+```
+
+**错误响应格式**（所有错误统一）
+```json
+{"error": {"message": "无效的 API Key", "type": "invalid_api_key", "code": "invalid_api_key"}}
+```
+| HTTP | code | 含义 |
+|---|---|---|
+| 400 | `bad_request` | 请求体不是合法 JSON |
+| 401 | `invalid_api_key` | 缺少或无效的 API Key |
+| 401 | `admin_auth_failed` | 管理接口 token 错误 |
+| 403 | `api_key_disabled` | 该 key 已停用（`active:false`） |
+| 429 | `rate_limit_exceeded` | 超出该 key 的 QPS 限制 |
+| 429 | `quota_exceeded` | 超出每日/每月 token 配额 |
+| 429 | `too_many_requests` | 全局并发已满，请稍后重试 |
+| 404 | `key_not_found` | 删除 key 时无匹配 |
+
+> 响应头会暴露用量（CORS `Expose-Headers`）：`X-Token-Usage`、`X-Quota-Remaining`、`X-RateLimit-Limit`。
+
+### 管理端点（`/api/admin/*`）
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
@@ -111,18 +178,48 @@ curl http://127.0.0.1:3000/v1/chat/completions \
 | POST | `/api/admin/keys` | 新增 / 更新 key |
 | GET | `/api/admin/keys/list` | 完整 key 列表（含明文 key，慎用） |
 | DELETE | `/api/admin/keys/<prefix>` | 按前缀删除 key |
-| GET | `/api/admin/models` | 列出已安装模型（合并 Ollama + Rapid-MLX） |
+| GET | `/api/admin/models` | 已安装模型（合并 Ollama + Rapid-MLX） |
 | POST | `/api/admin/models/pull` | 拉取模型（异步任务） |
 | GET | `/api/admin/models/pull/status` | 拉取进度 |
 | DELETE | `/api/admin/models/pull/<taskId>` | 取消拉取 |
 | DELETE | `/api/admin/models/<name>` | 删除模型 |
 | GET | `/api/admin/recent-logs?limit=50` | 最近请求日志 |
 
-```bash
-curl http://127.0.0.1:3000/api/admin/status -H "X-Admin-Token: $ADMIN_TOKEN"
+**`GET /api/admin/status` 响应（节选）**
+```json
+{
+  "status": "ok", "uptime": 3600,
+  "ollama": "http://127.0.0.1:11434",
+  "rapid_mlx_hosts": ["http://127.0.0.1:8090", "http://127.0.0.1:8088"],
+  "active_concurrency": 0, "max_concurrency": 256,
+  "listen": "0.0.0.0:3000",
+  "keys": {
+    "sk-ollama-abc...": {"name": "alice", "active": true,
+      "daily_used": 1234, "daily_limit": 1000000,
+      "monthly_used": 5678, "monthly_limit": 30000000, "daily_requests": 12}
+  },
+  "log_file": "/Users/you/.ollama-token-gateway/logs/usage.jsonl", "log_size_mb": 0.02
+}
 ```
 
-## 配置字段说明（config.example.json）
+**`POST /api/admin/keys` 请求**（`key` 省略时服务端自动生成 `sk-ollama-<48hex>`）
+```json
+{"name": "alice-laptop", "daily_tokens": 1000000, "monthly_tokens": 30000000,
+ "qps": 5, "rate_limited": true, "active": true}
+```
+响应：`{"message":"Key 已保存","key":"sk-ollama-...","name":...,"daily_tokens":...,...}`
+
+**`DELETE /api/admin/keys/<prefix>`** 响应：`{"message":"已删除 1 个 Key","removed":["sk-ollama-..."]}`
+
+```bash
+ADMIN_TOKEN=...   # 若 config.json 的 admin.token 为空，可省略此头
+curl http://127.0.0.1:3000/api/admin/status -H "X-Admin-Token: $ADMIN_TOKEN"
+curl -X POST http://127.0.0.1:3000/api/admin/keys -H "X-Admin-Token: $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"alice","daily_tokens":1000000,"monthly_tokens":30000000,"qps":5,"rate_limited":true,"active":true}'
+```
+
+## 配置字段速查
 
 `config.json` 顶层三块：`keys` / `global` / `admin`（`_comment` 为自由备注，服务端忽略）。
 
@@ -136,6 +233,8 @@ curl http://127.0.0.1:3000/api/admin/status -H "X-Admin-Token: $ADMIN_TOKEN"
 | `rate_limited` | bool | `false` | 是否启用速率限制 |
 | `active` | bool | `true` | 是否启用该 key（`false` 时请求返回 403） |
 | `created` | string | 今天 | 创建日期（仅展示） |
+
+> 注：通过 `POST /api/admin/keys` 新建时，服务端默认 `daily_tokens=1000000`、`monthly_tokens=30000000`、`rate_limited=true`；与直接在 `config.json` 手写（默认 `0` / `false`）不同，注意区分。
 
 ### `global` —— 全局运行参数
 | 字段 | 类型 | 默认 | 说明 |
@@ -161,7 +260,67 @@ curl http://127.0.0.1:3000/api/admin/status -H "X-Admin-Token: $ADMIN_TOKEN"
   "admin": { "token": "" }
 }
 ```
-> 未写出的字段使用默认值（如 `active: true`、`daily_tokens: 0`、`qps: 5`）。生产环境请把 key 换成长随机串，并按 [安全](#安全) 设置 `admin.token`。
+> 未写出的字段使用默认值（如 `active: true`、`daily_tokens: 0`、`qps: 5`）。生产环境请把 key 换成长随机串，并按 [安全加固](#安全加固) 设置 `admin.token`。
+
+### 环境变量 vs config.json：冲突时的行为
+- **优先级**：`config.json` 的 `global.listen_host` / `global.listen_port` **高于** `TG_HOST` / `TG_PORT`。
+- `load_config` 只对 `global` / `admin` 用 `setdefault` 填充**缺失**字段；`keys` **不**从默认值合并。
+- 示例：
+
+| `config.json` | 环境变量 | 实际生效 |
+|---|---|---|
+| `listen_port: 3000` | `TG_PORT=8000` | **3000**（config 胜出） |
+| 无 `listen_port` | `TG_PORT=8000` | **8000**（用 env 默认） |
+| `admin.token: "s3cret"` | — | 管理接口要求 `X-Admin-Token: s3cret` |
+| 无 `admin.token` 字段 | — | 默认空 → 管理接口**开放**（依赖网络鉴权） |
+
+## 安全加固
+
+本仓库面向**可信内网**。公开部署前请逐条确认：
+
+### 1. 管理接口鉴权（admin.token）
+- `admin.token` 为空时，`/api/admin/*` **无鉴权**——仅当你已用 Tailscale / VPN / 内网隔离做网络层鉴权时才安全。
+- 若网关会暴露到不可信网络，**必须**设置强 `admin.token`（建议 32+ 位随机串）：
+  ```bash
+  # 生成一个强 token 填入 config.json 的 admin.token
+  python3 -c "import secrets; print(secrets.token_urlsafe(32))"
+  ```
+
+### 2. 启用 HTTPS（证书放置与自签名）
+HTTPS 的判定：**未设 `TG_DISABLE_HTTPS` 且 `certs/server.crt` 与 `certs/server.key` 均存在**时自动启用；否则退回明文 HTTP。
+
+```bash
+# 证书目录（默认 ~/.ollama-token-gateway/certs/）
+mkdir -p ~/.ollama-token-gateway/certs
+
+# 生成自签名证书（内网用；CN 换成你的主机名/IP）
+openssl req -x509 -newkey rsa:2048 -nodes -days 825 \
+  -keyout ~/.ollama-token-gateway/certs/server.key \
+  -out    ~/.ollama-token-gateway/certs/server.crt \
+  -subj "/CN=openmac-studio.taila46635.ts.net"
+
+# 启动时不设 TG_DISABLE_HTTPS 即走 HTTPS（主端口 3000）
+python3 token-gateway.py
+```
+- 启用 HTTPS 时，另起 `TG_HTTP_PORT`（默认 **3001**）做 HTTP→HTTPS 重定向。
+- 自签证书需客户端信任（或 `curl -k`）后才能校验通过。
+
+### 3. `TG_DISABLE_HTTPS=1` 的风险
+- 关闭 HTTPS 后所有请求（含 `Authorization` 头、API key、对话内容）**明文传输**。
+- 仅在**受信任的局域网 / Tailscale / 本机回环**下可接受；跨不可信网络**禁止**使用。
+
+### 4. 内网 vs 外网部署差异
+| 场景 | HTTPS | admin.token | 监听地址 | 备注 |
+|---|---|---|---|---|
+| 本机 / 局域网 | 可用明文（`TG_DISABLE_HTTPS=1`） | 可留空（若已有网络隔离） | `127.0.0.1` 或内网 IP | 最简单 |
+| Tailscale 内网 | 建议启用 | 可留空（Tailscale 已鉴权） | `0.0.0.0` | 当前生产形态 |
+| 公网 / 不可信网络 | **必须启用** | **必须强 token** | 建议前置反向代理 | 另加防火墙 / 限流 |
+
+### 5. 其他
+- **密钥隔离**：真实 `config.json`（含 `sk-ollama-*`）、`certs/`（TLS 私钥）、`logs/` 均被 `.gitignore` 排除，**切勿提交**。
+- **源码无内置密钥**：`token-gateway.py` 的 `DEFAULT_CONFIG.keys` 为空（fail-closed），首次运行不写入任何真实 key。
+- **令牌不入日志**：启动横幅与日志不打印 admin token / API key 明文。
+- **最小权限**：为每个调用方分配独立 key，设 `qps` / `daily_tokens` / `monthly_tokens`，便于审计与止损。
 
 ## mem-guard.mjs —— 设备级内存守卫
 
@@ -180,32 +339,29 @@ curl http://127.0.0.1:3000/api/admin/status -H "X-Admin-Token: $ADMIN_TOKEN"
 ### 用法
 
 ```bash
-# 一次性采样，打印 JSON
-node mem-guard.mjs --sample
-
-# 持续监控：每 30s 采样，越 90% 即写告警到 mem-guard.log
+node mem-guard.mjs --sample                     # 一次性采样，打印 JSON
 node mem-guard.mjs --watch 30 --at 0.9 --log mem-guard.log
-
-# 越线时额外执行一条命令（例如重启网关，需自己保证幂等）
 node mem-guard.mjs --watch 30 --at 0.9 --cmd "your-restart-command"
-
-# 越线时把告警 POST 到一个 webhook
 node mem-guard.mjs --watch 30 --at 0.9 --webhook https://your-endpoint/alert
-
-# 回归自测（合成 vm_stat，不碰真机）
-node mem-guard.mjs --selftest
+node mem-guard.mjs --selftest                   # 合成 vm_stat 回归自测
 ```
 
 ### 参数
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `--at` | `0.9` | 触发阈值（占上限比例）。`0.9` = 90% |
+| `--at` | `0.9` | 触发阈值（占上限比例） |
 | `--watch N` | 关 | 每 N 秒采样一次（不填则只采样一次） |
 | `--cmd "..."` | 无 | 越线时执行的命令 |
 | `--webhook URL` | 无 | 越线时 POST JSON 告警 |
 | `--log PATH` | 无 | 越线 JSONL 追加路径 |
-| `--fail-open` / `--no-fail-open` | fail-open | 读不到内存时是否静默放行（后者会显式报错，适合 CI） |
+| `--fail-open` / `--no-fail-open` | fail-open | 读不到内存时是否静默放行（后者显式报错） |
+
+### `--fail-open` 在 CI / 非 macOS 环境的行为
+- mem-guard 的读数是 **macOS 专属**（`sysctl` + `vm_stat`）。在 **Linux / 容器 / 沙箱 / 非 macOS** 上探针不可用。
+- 默认 `--fail-open`：探针失败时**静默放行、退出码 0**，不会误报、也不会让调用方崩溃——适合把 mem-guard 作为"可选旁路"挂在生产脚本里。
+- 若你希望"探针不可用即视为失败"（例如 **CI 校验**），用 `--no-fail-open`，此时会显式报错并以非 0 退出。
+- 注意：`--fail-open` 不等于"在非 macOS 上也能监控"——它只是不报错；真实内存监控仅在 macOS 生效。
 
 ### 设计取舍
 
@@ -214,8 +370,6 @@ node mem-guard.mjs --selftest
 - **只观察 + 可选动作**：越线保护不替网关决定业务策略（网关自己的限流在网关侧）；这里负责"看见 + 喊一声"。
 
 ### 安装为 LaunchAgent（`com.user.memguard.plist`）
-
-模板已放在仓库根目录，安装步骤：
 
 ```bash
 # 1) 复制模板到用户级 LaunchAgents
@@ -244,19 +398,81 @@ launchctl unload ~/Library/LaunchAgents/com.user.memguard.plist
 
 网关本身监听 `:3000`、按 `config.json` 做 token 配额与限流。mem-guard 是**旁路守卫**：它看的是整台设备内存，越线时通过日志 / webhook / 命令提醒人或触发既定动作，**不直接改动网关进程**。
 
-## 安全
+## 故障排查 / 常见问题
 
-本仓库面向**可信内网**。部署前请逐条确认：
+### `curl localhost:3000/health` 异常
+| 现象 | 可能原因 | 排查 / 处理 |
+|---|---|---|
+| `Connection refused` | 服务未启动 / 端口不对 | `lsof -nP -iTCP:3000 -sTCP:LISTEN`；确认 `config.json` 的 `listen_port`（它优先于 `TG_PORT`） |
+| 进程在但 `/health` 超时 | 绑定地址不对（如只绑 `127.0.0.1` 却从别机访问） | 改 `listen_host` 为 `0.0.0.0` 或内网 IP |
+| `/health` 正常但 `/v1/models` 为空 | 上游不可达 | `curl 127.0.0.1:11434/api/tags`；检查 `TG_RAPID_MLX_HOSTS` |
+| 请求返回 500 | 上游异常 / 代码异常 | 看 `/tmp/token-gateway.log` 与 `/tmp/token-gateway.err.log` |
+| 端口被占用（启动报 `Address already in use`） | 旧实例仍占用 3000 | 停旧实例，或改 `config.json` 的 `listen_port` |
 
-1. **管理接口鉴权（admin.token）**
-   - `admin.token` 为空时，`/api/admin/*` **无鉴权**——仅当你已用 Tailscale / VPN / 内网隔离做网络层鉴权时才安全。
-   - 若网关会暴露到不可信网络，**必须**设置强 `admin.token`（建议 32+ 位随机串）。
-2. **不要暴露公网**：优先 Tailscale（`*.ts.net`）/ 局域网 / VPN。确需公网时，至少启用 HTTPS 并设强 `admin.token`。
-3. **密钥隔离**：真实 `config.json`（含 `sk-ollama-*`）、`certs/`（TLS 私钥）、`logs/` 均被 `.gitignore` 排除，**切勿提交**。
-4. **源码无内置密钥**：`token-gateway.py` 的 `DEFAULT_CONFIG.keys` 为空（fail-closed），首次运行不会写入任何真实 key。
-5. **令牌不入日志**：启动横幅与日志不打印 admin token / API key 明文。
-6. **传输加密**：默认可用 HTTPS（需 `certs/server.crt|key`）；内网可用 `TG_DISABLE_HTTPS=1` 走明文 HTTP。
-7. **最小权限**：为每个调用方分配独立 key，设 `qps` / `daily_tokens` / `monthly_tokens` 限制，便于审计与止损。
+### GitHub 推送相关
+| 现象 | 可能原因 | 处理 |
+|---|---|---|
+| `git push` 超时 / CONNECT 502 | 本机代理拦 `github.com:443` | 改用 `python3 tools/push-via-api.py`（Git Data API，仅需 `api.github.com`） |
+| `POST /user/repos` 返回 403 | fine-grained PAT 无建库权限 | 在 GitHub 网页新建**空仓库**（不勾 README/.gitignore），再推送 |
+| 推送 403（仓库已存在） | PAT 限定「Only select repositories」 | 把该仓库加入 PAT 的授权列表；确认 `Contents: Read and write` |
+| `push-via-api.py` 读不到 PAT | `~/.git-credentials` 缺失/格式不对 | 格式应为 `https://x-access-token:<PAT>@github.com` |
+
+### LaunchAgent 加载失败
+```bash
+# 1) 校验 plist 语法
+plutil -lint ~/Library/LaunchAgents/com.token-gateway.server.plist
+# 2) 看是否已加载 / 运行状态
+launchctl list | grep token-gateway
+launchctl print gui/$(id -u)/com.token-gateway.server | head -40
+# 3) 常见原因：ProgramArguments 里 python3 或 token-gateway.py 路径写错；
+#    WorkingDirectory 不存在；端口被占；plist 放错目录（应为 ~/Library/LaunchAgents/）
+# 4) 改完 plist 后需重新加载
+launchctl unload ~/Library/LaunchAgents/com.token-gateway.server.plist
+launchctl load   ~/Library/LaunchAgents/com.token-gateway.server.plist
+# 5) 错误日志
+tail -n 50 /tmp/token-gateway.err.log
+```
+
+### mem-guard 相关
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| 非 macOS 上 `--sample` 返回空/报错 | 探针是 macOS 专属 | 属预期；默认 `--fail-open` 会静默放行 |
+| CI 里希望显式失败 | 默认 fail-open | 加 `--no-fail-open` |
+| `launchctl` 加载后不采样 | node 路径或 `mem-guard.mjs` 路径错 | 按「安装为 LaunchAgent」核对 `ProgramArguments` |
+
+## 运维细节（日志 / 权限 / 轮转）
+
+### 日志路径
+| 日志 | 路径 | 内容 |
+|---|---|---|
+| 网关 stdout | `/tmp/token-gateway.log`（launchd 下） | 启动横幅、请求日志 |
+| 网关 stderr | `/tmp/token-gateway.err.log` | 异常堆栈 |
+| 用量审计 | `~/.ollama-token-gateway/logs/usage.jsonl` | 每次请求一行 JSON（token 用量、key） |
+| mem-guard 越线 | `~/.ollama-token-gateway/mem-guard.log` | 越线告警（JSONL） |
+| mem-guard stdout/err | `~/.ollama-token-gateway/mem-guard.{out,err}.log` | LaunchAgent 输出 |
+
+### 权限建议
+`logs/` 与 `certs/` 含用量与私钥，建议收紧：
+```bash
+chmod 700 ~/.ollama-token-gateway/logs ~/.ollama-token-gateway/certs
+chmod 600 ~/.ollama-token-gateway/config.json \
+          ~/.ollama-token-gateway/logs/*.jsonl \
+          ~/.ollama-token-gateway/certs/server.key
+```
+
+### 轮转建议
+`usage.jsonl` 会随请求持续增长。服务端每次写入以**追加模式**打开，因此改名轮转是安全的（下次写入自动重建）：
+```bash
+# 手动 / 定时轮转
+mv ~/.ollama-token-gateway/logs/usage.jsonl \
+   ~/.ollama-token-gateway/logs/usage.jsonl.$(date +%F)
+```
+自动轮转可用 macOS `newsyslog`（在 `/etc/newsyslog.conf` 追加一行，按需调整路径/大小/保留份数）：
+```
+# logfilename                                   owner:group  mode count size(K) when flags
+/Users/你的用户名/.ollama-token-gateway/logs/usage.jsonl  claw:staff   600   7    10240   *    J
+```
+或用一个每日 launchd/cron 任务执行上面的 `mv`。
 
 ## 推送到 GitHub
 
