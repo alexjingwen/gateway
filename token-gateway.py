@@ -944,7 +944,7 @@ DEFAULT_CONFIG = {
         "listen_port": LISTEN_PORT,
     },
     "admin": {
-        "token": "admin-change-me-please",  # /api/admin/* 管理接口密码
+        "token": "",  # 留空 = 依赖 Tailscale 等网络层鉴权（admin 接口开放）；暴露于不可信网络时必须设强口令
     }
 }
 
@@ -2468,7 +2468,13 @@ def print_banner():
     print(f"  GET  /api/admin/usage      历史用量统计 (days=7)")
     print(f"  POST /api/admin/keys       新增/更新 API Key")
     print(f"  DEL  /api/admin/keys/<pfx> 删除 Key")
-    print(f"  Admin Token: {_cfg['admin']['token']}")
+    _at = _cfg['admin'].get('token', '')
+    print(f"  Admin Token: {'已设置' if _at else '未设置（admin 接口开放，须置于受信任网络/Tailscale）'}")
+    if not _at:
+        print("  \u26a0\ufe0f  安全警告：admin.token 为空，/api/admin/* 管理接口无鉴权。")
+        print("       仅当网关位于受信任内网 / Tailscale 网络层鉴权之后才安全；")
+        print("       若暴露到不可信网络，请在 config.json 设置强 admin.token。")
+
     print("")
     print("  ── OpenAI 兼容端点 ──")
     print(f"  GET  /v1/models            列出模型")
