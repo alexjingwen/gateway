@@ -933,15 +933,8 @@ def get_tailscale_info() -> Tuple[str, str]:
 # ---------- 配置加载与默认值 ----------
 DEFAULT_CONFIG = {
     "keys": {
-        "sk-ollama-b254b42b799eac68d1026b97e21da64c92d57c9edb4eb13e": {
-            "name": "默认主Key",
-            "daily_tokens": 1_000_000,     # 每日 100万 tokens
-            "monthly_tokens": 30_000_000,   # 每月 3000万 tokens
-            "qps": DEFAULT_QPS,
-            "rate_limited": True,
-            "active": True,
-            "created": time.strftime("%Y-%m-%d"),
-        }
+        # 安全：默认不内置任何真实 key。正式 key 由 config.json（gitignored，不入库）提供。
+        # 首次运行若缺失 config.json 会写出本默认配置，故此处必须为空，避免把密钥写进磁盘。
     },
     "global": {
         "max_concurrency": DEFAULT_MAX_CONCURRENCY,
