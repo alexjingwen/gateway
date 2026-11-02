@@ -125,6 +125,9 @@ cd gateway
 # 1) 准备配置（config.json 含真实 key，已被 .gitignore 排除，不入库）
 mkdir -p ~/.ollama-token-gateway
 cp config.example.json ~/.ollama-token-gateway/config.json
+#   admin.token 安全提示：网关置于 Tailscale / 受信任内网时可留空（admin 接口开放，靠网络层鉴权）；
+#   若需暴露到不可信网络，务必设置强口令，否则 /api/admin/* 管理接口无鉴权。
+
 #   编辑 config.json：填写 keys.* 与 admin.token
 # 2) 启动（默认监听 0.0.0.0:3000；局域网/内网用 TG_DISABLE_HTTPS=1 关闭 HTTPS）
 TG_DISABLE_HTTPS=1 TG_PORT=3000 python3 token-gateway.py
