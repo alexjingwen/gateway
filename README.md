@@ -89,6 +89,8 @@ tail -f /tmp/token-gateway.log
 - **OpenAI 兼容端点**：`Authorization: Bearer <key>`（也支持 `?api_key=<key>`）；`<key>` 必须是 `config.json` 的 `keys` 中存在且 `active: true` 的 key。
 - **管理端点**：`X-Admin-Token: <admin.token>`；当 `admin.token` 为空时**跳过校验**（依赖网络层鉴权，见 [安全加固](#安全加固)）。
 
+> ⚠️ **鉴权头区分**：管理接口用 **`X-Admin-Token`** 头，**不是** `Authorization: Bearer`；后者只用于 `/v1/*` 推理端点。
+
 ### 公开端点（无需鉴权）
 
 | 方法 | 路径 | 说明 |
@@ -152,6 +154,16 @@ data: {"id":"chatcmpl-...","object":"chat.completion.chunk","choices":[{"index":
 data: [DONE]
 ```
 
+**`POST /v1/embeddings` 请求/响应**（代理上游，字段以上游为准）
+```bash
+curl http://127.0.0.1:3000/v1/embeddings \
+  -H "Authorization: Bearer sk-ollama-xxxxxxxx" -H "Content-Type: application/json" \
+  -d '{"model":"nomic-embed-text:latest","input":"hello"}'
+```
+```json
+{"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.013,-0.007]}],"model":"nomic-embed-text:latest","usage":{"prompt_tokens":1,"total_tokens":1}}
+```
+
 **错误响应格式**（所有错误统一）
 ```json
 {"error": {"message": "无效的 API Key", "type": "invalid_api_key", "code": "invalid_api_key"}}
@@ -170,6 +182,8 @@ data: [DONE]
 > 响应头会暴露用量（CORS `Expose-Headers`）：`X-Token-Usage`、`X-Quota-Remaining`、`X-RateLimit-Limit`。
 
 ### 管理端点（`/api/admin/*`）
+
+> 所有 `/api/admin/*` 均需 `X-Admin-Token: <admin.token>`；`admin.token` 为空时无需该头（依赖网络层鉴权）。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
@@ -249,6 +263,13 @@ curl -X POST http://127.0.0.1:3000/api/admin/keys -H "X-Admin-Token: $ADMIN_TOKE
 | 字段 | 类型 | 默认 | 说明 |
 |---|---|---|---|
 | `token` | string | `""` | `/api/admin/*` 鉴权 token；空 = 跳过（走网络层鉴权） |
+
+### 关于 upstream（上游地址）
+`config.json` **不含** upstream 字段——上游地址通过环境变量配置：
+- `TG_OLLAMA_HOST`（默认 `http://127.0.0.1:11434`）
+- `TG_RAPID_MLX_HOSTS`（默认 `http://127.0.0.1:8002,http://127.0.0.1:8088`，逗号分隔多节点）
+- `TG_RAPID_MLX_VLM_HOSTS`（多模态 VLM 专用）
+- `TG_MODEL_ALIASES`（模型别名，如 `qwen3.5-122b=mlx-community/Qwen3.5-122B-A10B-4bit`）
 
 ### 最小可用示例
 ```json
@@ -473,6 +494,33 @@ mv ~/.ollama-token-gateway/logs/usage.jsonl \
 /Users/你的用户名/.ollama-token-gateway/logs/usage.jsonl  claw:staff   600   7    10240   *    J
 ```
 或用一个每日 launchd/cron 任务执行上面的 `mv`。
+
+### 日志格式示例（JSONL）
+
+**`logs/usage.jsonl`**（每次请求一行）：
+```json
+{"ts": 1730000000, "date": "2026-11-02", "time": "22:10:05", "api_key": "sk-ollama-abc...", "model": "gemma4:latest", "prompt_tokens": 8, "completion_tokens": 5, "total_tokens": 13, "elapsed_s": 1.23, "client_ip": "100.97.225.7", "stream": false}
+```
+
+**`mem-guard.log`**（越线告警，JSONL）：
+```json
+{"t": "2026-11-02T14:10:05.123Z", "pct": 0.912, "usedBytes": 252000000000, "totalBytes": 274877906944, "at": 0.9, "msg": "内存使用率 91.2% 超过阈值 90%"}
+```
+> `--webhook` 的 POST body：`{"alert":"memory-guard","pct":...,"usedBytes":...,"totalBytes":...,"at":...,"msg":...,"at_iso":...}`。
+
+### 备份 config.json
+`config.json` 含真实 key，改动前先备份（`config.json.bak*` 已在 `.gitignore`，不会入库）：
+```bash
+cp ~/.ollama-token-gateway/config.json \
+   ~/.ollama-token-gateway/config.json.bak.$(date +%Y%m%d-%H%M%S)
+```
+
+### 多实例部署
+同一台机器跑多个网关实例时，必须隔离：
+- **端口**：每个实例 `global.listen_port` 不同（它优先于 `TG_PORT`）。
+- **配置/日志目录**：每个实例独立 `TG_CONFIG_DIR`（各自的 `config.json` / `certs/` / `logs/`）。
+- **LaunchAgent 标签**：复制 plist 后改 `Label`（如 `com.token-gateway.server2`）及 `ProgramArguments` / `WorkingDirectory`。
+- **凭据**：不同实例用不同 `admin.token` 与 key 命名空间，避免串用。
 
 ## 推送到 GitHub
 
