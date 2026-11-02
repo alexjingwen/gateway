@@ -86,7 +86,8 @@ tail -f /tmp/token-gateway.log
 ## API 参考
 
 所有 `/v1/*` 接口兼容 OpenAI 客户端。鉴权方式：
-- **OpenAI 兼容端点**：`Authorization: Bearer <key>`（也支持 `?api_key=<key>`）；`<key>` 必须是 `config.json` 的 `keys` 中存在且 `active: true` 的 key。
+- **模型发现端点**（`/v1/models`、`/api/tags`）：**免鉴权**，无需 key。
+- **推理端点**（`/v1/chat/completions`、`/v1/completions`、`/v1/embeddings`、`/api/pull`、`/api/delete`）：`Authorization: Bearer <key>`（也支持 `?api_key=<key>`）；`<key>` 必须是 `config.json` 的 `keys` 中存在且 `active: true` 的 key。
 - **管理端点**：`X-Admin-Token: <admin.token>`；当 `admin.token` 为空时**跳过校验**（依赖网络层鉴权，见 [安全加固](#安全加固)）。
 
 > ⚠️ **鉴权头区分**：管理接口用 **`X-Admin-Token`** 头，**不是** `Authorization: Bearer`；后者只用于 `/v1/*` 推理端点。
@@ -98,6 +99,8 @@ tail -f /tmp/token-gateway.log
 | GET | `/` `/admin` `/admin/` | Web 管理台（浏览器打开） |
 | GET | `/admin/chat` | 管理台内置聊天页 |
 | GET | `/health` `/healthz` | 健康检查 |
+| GET | `/v1/models` | 模型列表（合并 Ollama + Rapid-MLX）；**免鉴权** |
+| GET | `/api/tags` | Ollama 兼容模型列表；**免鉴权** |
 
 **`GET /health` 响应**
 ```json
@@ -109,14 +112,13 @@ tail -f /tmp/token-gateway.log
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/v1/models` | 合并 Ollama + Rapid-MLX 的模型列表 |
 | POST | `/v1/chat/completions` | 聊天补全，支持 `stream=true` |
 | POST | `/v1/completions` | 文本补全 |
 | POST | `/v1/embeddings` | 向量（代理上游） |
-| — | `/models` `/chat/completions` `/completions` `/embeddings` | 上述 `/v1/*` 的别名 |
-| — | `/api/tags` `/api/pull` `/api/delete` | Ollama 兼容入口，代理到 Ollama 上游 |
+| — | `/models`(免鉴权) `/chat/completions` `/completions` `/embeddings` | 上述 `/v1/*` 的别名（`/models` 同 `/v1/models` 免鉴权） |
+| — | `/api/pull` `/api/delete` | Ollama 兼容写操作，代理到 Ollama 上游（需 Bearer） |
 
-**`GET /v1/models` 响应**
+**`GET /v1/models` 响应（免鉴权）**
 ```json
 {
   "object": "list",
