@@ -756,12 +756,16 @@ const param=det.parameter_size||'-';
 const ts=!m.modified?null:(typeof m.modified==='number'?(m.modified<1e12?m.modified*1000:m.modified):new Date(m.modified).getTime());
 const mod=ts?new Date(ts).toLocaleDateString('zh-CN'):'-';
 const isMLX=m.upstream==='rapid-mlx';
-const srcPill=isMLX
+const isVirtual=m.upstream==='gateway';
+const srcPill=isVirtual
+  ?`<span class="pill" style="background:rgba(168,85,247,0.15);color:#a855f7;border:1px solid rgba(168,85,247,0.35)">🎲 auto</span>`
+  :(isMLX
   ?`<span class="pill" style="background:rgba(34,197,94,0.15);color:#22c55e;border:1px solid rgba(34,197,94,0.3)">🟢 MLX</span>`
-  :`<span class="pill" style="background:rgba(148,163,184,0.15);color:#94a3b8;border:1px solid rgba(148,163,184,0.25)">⚪ Ollama</span>`;
+  :`<span class="pill" style="background:rgba(148,163,184,0.15);color:#94a3b8;border:1px solid rgba(148,163,184,0.25)">⚪ Ollama</span>`);
+const sizeCell=isVirtual?'—':(m.size_gb+' GB');
 return `<tr>
 <td style="font-family:'SF Mono',monospace;color:var(--accent);font-size:12px">${m.name} ${srcPill}</td>
-<td>${m.size_gb} GB</td>
+<td>${sizeCell}</td>
 <td><span class="pill on">${q}</span></td>
 <td>${param} <span style="color:var(--dim);font-size:11px">${fam}</span></td>
 <td style="font-size:11px;color:var(--dim)">${mod}</td>
@@ -2415,6 +2419,23 @@ iframe{{padding-top:0}}
                         })
                 except Exception:
                     continue
+            # 虚拟模型 auto：不属于任何上游，不占磁盘，大小/量化无意义。
+            # 追加在末尾，仅用于管理台可见性，不参与拉取/删除。
+            if AUTO_ENABLED:
+                models.append({
+                    "name": AUTO_MODEL_NAME,
+                    "size": 0,
+                    "size_gb": 0,
+                    "modified": "",
+                    "digest": "",
+                    "details": {
+                        "family": "虚拟模型（自动分配）",
+                        "parameter_size": "—",
+                        "quantization_level": "—",
+                        "virtual": True,
+                    },
+                    "upstream": "gateway",
+                })
             self._send_json({"models": models, "count": len(models)})
             return
 
