@@ -63,6 +63,20 @@ MODEL_ALIASES = _parse_model_aliases(
 )
 _MODEL_REVERSE_ALIAS = {v: k for k, v in MODEL_ALIASES.items()}
 
+# ========== auto 模型（自动分配） ==========
+# 虚拟模型名 "auto"：请求到达后由网关从"本地可用模型池"里自动挑一个真实模型，
+# 客户端不必为试不同模型而反复改 model 名。选中结果通过响应头 X-Gateway-Model 回传。
+AUTO_MODEL_NAME = "auto"
+AUTO_ENABLED = os.environ.get("TG_AUTO_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+# 分配策略：round-robin（默认，轮流用，覆盖最全）| random
+AUTO_STRATEGY = (os.environ.get("TG_AUTO_STRATEGY", "round-robin") or "round-robin").strip().lower()
+# 额外排除的模型（逗号分隔），与 config.json 的 global.deny_models 叠加生效
+AUTO_EXCLUDE = {m.strip() for m in os.environ.get("TG_AUTO_EXCLUDE", "").split(",") if m.strip()}
+# 非对话模型（嵌入/重排）名字特征：不参与 chat 分配，只服务 /v1/embeddings
+AUTO_EMBED_HINTS = ("embed", "bge", "mxbai", "gte-", "e5-", "rerank")
+# 视觉模型名字特征：带图请求优先选它们（其余候选会被网关按既有逻辑过滤图片）
+AUTO_VLM_HINTS = ("vl", "vision", "llava", "minicpm-v")
+
 
 LISTEN_HOST = os.environ.get("TG_HOST", "0.0.0.0")
 LISTEN_PORT = int(os.environ.get("TG_PORT", "3000"))
@@ -1220,10 +1234,11 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
                 continue
         return result
 
-    def _ollama_model_exists(self, model: str) -> bool:
-        """检查模型是否在任一上游存在。"""
-        if not model:
-            return True
+    def _refresh_model_caches(self) -> Tuple[set, dict]:
+        """刷新并返回 (ollama 模型集合, {rapid-mlx 模型: host})。
+
+        30 秒缓存；上游整体不可达时保留上一次的非空结果，避免候选池被瞬时清空。
+        """
         with self._models_cache_lock:
             now = time.time()
             if now - self._ollama_models_cache["ts"] > 30:
@@ -1236,10 +1251,100 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
                 if models or not self._rapid_mlx_models_cache["models"]:
                     self._rapid_mlx_models_cache["models"] = models
                 self._rapid_mlx_models_cache["ts"] = now
-        all_models = self._ollama_models_cache["models"] | set(self._rapid_mlx_models_cache["models"].keys())
+            return (set(self._ollama_models_cache["models"]),
+                    dict(self._rapid_mlx_models_cache["models"]))
+
+    def _ollama_model_exists(self, model: str) -> bool:
+        """检查模型是否在任一上游存在。"""
+        if not model:
+            return True
+        ollama_models, rapid_models = self._refresh_model_caches()
+        all_models = ollama_models | set(rapid_models.keys())
         if all_models:
             return model in all_models
         return True
+
+    # ---------- auto 虚拟模型：自动分配 ----------
+    # 轮询游标（类级，跨请求共享）；用 itertools.count() 取模保证线程安全递增
+    _auto_cursor = itertools.count()
+
+    @staticmethod
+    def _auto_is_embed(model: str) -> bool:
+        """是否为非对话模型（嵌入/重排），这类模型不能用于 chat。"""
+        m = model.lower()
+        return any(h in m for h in AUTO_EMBED_HINTS)
+
+    @staticmethod
+    def _auto_is_vlm(model: str, host: str) -> bool:
+        """是否具备多模态能力：上游被标为 VLM，或模型名带视觉特征。"""
+        if host in RAPID_MLX_VLM_HOSTS:
+            return True
+        m = model.lower()
+        return any(h in m for h in AUTO_VLM_HINTS)
+
+    @staticmethod
+    def _auto_req_has_image(req: dict) -> bool:
+        """请求是否携带图片（与 _proxy 中的判定口径保持一致）。"""
+        if not isinstance(req, dict):
+            return False
+        for msg in req.get("messages", []) or []:
+            content = msg.get("content") if isinstance(msg, dict) else None
+            if isinstance(content, list) and any(
+                isinstance(p, dict) and p.get("type") in ("image_url", "image", "input_image")
+                for p in content
+            ):
+                return True
+        return bool(req.get("images") or req.get("image"))
+
+    def _auto_candidates(self, path: str, req: dict, cfg: dict) -> Tuple[List[Tuple[str, str]], str]:
+        """构造 auto 候选池，返回 ([(model, upstream_host)], 说明)。
+
+        过滤链：上游可用 → deny/auto 排除 → allow 白名单 → 能力匹配（chat / embeddings / 带图）。
+        候选池按模型名排序，保证轮询顺序稳定、可复现。
+        """
+        ollama_models, rapid_models = self._refresh_model_caches()
+        pool: List[Tuple[str, str]] = [(m, OLLAMA_HOST) for m in sorted(ollama_models)]
+        pool += [(m, h) for m, h in sorted(rapid_models.items())]
+
+        allow = cfg["global"].get("allow_models", ["*"]) or []
+        deny = set(cfg["global"].get("deny_models", []) or [])
+        # allow 里出现 auto 本身即视为"放行 auto 入口"，候选池不受 allow 明细约束（仍受 deny 约束）
+        wide_allow = ("*" in allow) or (AUTO_MODEL_NAME in allow)
+
+        allowed: List[Tuple[str, str]] = []
+        for m, h in pool:
+            if m in deny or m in AUTO_EXCLUDE:
+                continue
+            if not wide_allow and m not in allow:
+                continue
+            allowed.append((m, h))
+
+        if path.endswith("/embeddings"):
+            embed = [(m, h) for m, h in allowed if self._auto_is_embed(m)]
+            if embed:
+                return embed, "嵌入端点，仅限嵌入模型"
+            return [], "嵌入端点但候选池内没有嵌入模型"
+
+        chat = [(m, h) for m, h in allowed if not self._auto_is_embed(m)]
+        if self._auto_req_has_image(req):
+            vlm = [(m, h) for m, h in chat if self._auto_is_vlm(m, h)]
+            if vlm:
+                return vlm, "带图请求，优先多模态模型"
+            return chat, "带图请求但无多模态候选，回退文本模型（图片将被过滤）"
+        return chat, "文本请求"
+
+    def _auto_pick_model(self, path: str, req: dict, cfg: dict) -> Tuple[str, str, str]:
+        """从候选池挑一个模型，返回 (model, upstream_host, 说明)；无候选时 model 为空串。"""
+        cands, note = self._auto_candidates(path, req, cfg)
+        if not cands:
+            return "", "", note
+        if AUTO_STRATEGY == "random":
+            import random
+            idx = random.randrange(len(cands))
+        else:
+            idx = next(self._auto_cursor) % len(cands)
+        model, host = cands[idx]
+        return model, host, note
 
     def _resolve_upstream(self, model: str, path: str = "") -> str:
         """根据模型名决定请求发往哪个上游。"""
@@ -1409,6 +1514,11 @@ iframe{{padding-top:0}}
                                 all_models.append({"id": mid, "object": "model", "created": 0, "owned_by": "rapid-mlx"})
                     except Exception:
                         continue
+                # auto 虚拟模型放在列表末尾：避免改变"客户端默认取第一个模型"的既有行为
+                if AUTO_ENABLED and AUTO_MODEL_NAME not in seen:
+                    all_models.append({"id": AUTO_MODEL_NAME, "object": "model",
+                                       "created": 0, "owned_by": "gateway"})
+                    seen.add(AUTO_MODEL_NAME)
                 body = json.dumps({"object": "list", "data": all_models}).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -1510,6 +1620,7 @@ iframe{{padding-top:0}}
 
     def do_POST(self):
         global active_concurrency
+        self._auto_resolved = None  # 每个请求重置，避免 keep-alive 复用 handler 时残留上次的 auto 结果
         self._normalize_path()
         path = self.path.split("?", 1)[0]
 
@@ -1561,8 +1672,24 @@ iframe{{padding-top:0}}
                 path = "/v1/completions"
                 self.path = path + ("?" + self.path.split("?", 1)[1] if "?" in self.path else "")
 
-        # 模型白名单
-        if model and not self._check_model_allowed(model, cfg):
+        # ---- auto 虚拟模型：从本地可用模型池自动分配 ----
+        # 必须在白名单/存在性检查之前解析成真实模型名：后续上下文窗口、图片过滤、
+        # 上游路由、用量记录全部按真实模型处理，行为与直接指定该模型完全一致。
+        if AUTO_ENABLED and model == AUTO_MODEL_NAME:
+            picked, picked_host, why = self._auto_pick_model(path, req, cfg)
+            if not picked:
+                self._send_error(503, "auto_no_candidate",
+                                 f"auto 暂无可分配模型（{why}）。请确认上游已加载模型，"
+                                 f"或检查 allow_models / deny_models / TG_AUTO_EXCLUDE。")
+                return
+            self._auto_resolved = picked
+            model = picked
+            req["model"] = picked
+            body_bytes = json.dumps(req, ensure_ascii=False).encode("utf-8")
+            log(f"🎲 auto → {picked} @ {picked_host}（{why}）→ {self._real_ip()}")
+
+        # 模型白名单（auto 的候选池已在 _auto_candidates 内按 allow/deny 过滤，此处跳过重复校验）
+        if model and not self._auto_resolved and not self._check_model_allowed(model, cfg):
             self._send_error(403, "model_not_allowed", f"模型 '{model}' 不在白名单中")
             return
 
@@ -1879,6 +2006,10 @@ iframe{{padding-top:0}}
                 self.send_header("X-Quota-Remaining-Monthly",
                                str(max(0, limit_m - used_m) if limit_m else "unlimited"))
                 self.send_header("X-RateLimit-Limit", str(key_cfg.get("qps", DEFAULT_QPS)))
+                # auto 命中时回传实际选中的模型，便于客户端确认与问题定位
+                _auto_hit = getattr(self, "_auto_resolved", None)
+                if _auto_hit:
+                    self.send_header("X-Gateway-Model", _auto_hit)
 
                 self.end_headers()
 

@@ -3,6 +3,7 @@
 `gateway` 是一个**单文件、纯 Python 标准库**实现的 OpenAI 兼容 token 网关，面向**本地局域网 / Tailscale 内网**使用：统一代理 Ollama 与 Rapid-MLX 上游，做 per-key 配额 / QPS / 限流，并提供 Web 管理台与 `/api/admin/*` 管理接口。附带 `mem-guard.mjs` 设备内存守卫。
 
 - **服务端**：`token-gateway.py`（无第三方依赖，Python 3.10+）
+- **auto 虚拟模型**：客户端把 `model` 设为 `auto`，由网关自动从本地模型池分配，免去手动切换（详见 [auto 虚拟模型](#auto-虚拟模型自动分配)）
 - **配置样例**：`config.example.json`（真实 `config.json` 含密钥，被 `.gitignore` 排除）
 - **运维工具**：`mem-guard.mjs` + `com.user.memguard.plist`
 - **推送工具**：`tools/push-via-api.py`（Git Data API，绕过被拦的 `github.com:443`）
@@ -14,6 +15,7 @@
 - [范围 / Scope](#范围--scope)
 - [部署 / Deploy](#部署--deploy)
 - [API 参考](#api-参考)
+- [auto 虚拟模型（自动分配）](#auto-虚拟模型自动分配)
 - [配置字段速查](#配置字段速查)
 - [安全加固](#安全加固)
 - [mem-guard.mjs —— 设备级内存守卫](#mem-guardmjs--设备级内存守卫)
@@ -63,6 +65,9 @@ TG_DISABLE_HTTPS=1 TG_PORT=3000 python3 token-gateway.py
 | TG_RAPID_MLX_VLM_HOSTS | http://127.0.0.1:8088 | 多模态 VLM 专用上游 |
 | TG_MLX_VLM_API_KEY | sk-test | 访问 VLM 上游所需的 key |
 | TG_MODEL_ALIASES | (空) | 模型别名，如 qwen3.5-122b=mlx-community/Qwen3.5-122B-A10B-4bit |
+| TG_AUTO_ENABLED | 1 | `auto` 虚拟模型开关；设 0/false/no/off 关闭 |
+| TG_AUTO_STRATEGY | round-robin | `auto` 分配策略：`round-robin` \| `random` |
+| TG_AUTO_EXCLUDE | (空) | `auto` 额外排除的模型（逗号分隔，叠加在 `deny_models` 之上） |
 | TG_QPS | 5 | 每 key 每秒请求数 |
 | TG_CONCURRENCY | 10 | 全局最大并发 |
 | TG_READ_TIMEOUT | 900 | 上游读取超时（秒） |
@@ -99,7 +104,7 @@ tail -f /tmp/token-gateway.log
 | GET | `/` `/admin` `/admin/` | Web 管理台（浏览器打开） |
 | GET | `/admin/chat` | 管理台内置聊天页 |
 | GET | `/health` `/healthz` | 健康检查 |
-| GET | `/v1/models` | 模型列表（合并 Ollama + Rapid-MLX）；**免鉴权** |
+| GET | `/v1/models` | 模型列表（合并 Ollama + Rapid-MLX，末尾附虚拟模型 `auto`）；**免鉴权** |
 | GET | `/api/tags` | Ollama 兼容模型列表；**免鉴权** |
 
 **`GET /health` 响应**
@@ -107,6 +112,41 @@ tail -f /tmp/token-gateway.log
 {"status": "ok", "version": "1.0.0", "uptime": 2506690}
 ```
 `uptime` 为服务已运行秒数。
+
+### auto 虚拟模型（自动分配）
+
+网关内置一个虚拟模型名 **`auto`**：客户端不必在多个本地模型之间手动切换，网关会在**每次请求**时从「本地可用模型池」自动挑一个真实模型，然后完全按该模型正常路由（上下文窗口、图片过滤、上游选择、用量记录均按真实模型处理，与直接指定该模型等价）。
+
+**启用**：默认开启。`TG_AUTO_ENABLED=0` 关闭后，`auto` 不再出现在 `/v1/models`，传入 `model: "auto"` 会走常规的存在性检查并返回 404。
+
+**候选池规则**（每次请求实时计算；上游模型列表有 30 秒缓存）：
+
+| 请求类型 | 候选池 |
+|---|---|
+| `/v1/chat/completions`、`/v1/completions` | 全部**对话**模型；自动排除名字含 `embed` / `bge` / `mxbai` / `gte-` / `e5-` / `rerank` 的嵌入、重排模型 |
+| 带图请求（`content` 内含 `image_url` / `image` / `input_image`，或顶层 `images`） | 仅**多模态**模型：部署在 `TG_RAPID_MLX_VLM_HOSTS` 上的模型，或名字含 `vl` / `vision` / `llava` / `minicpm-v` 的模型；若无多模态候选，回退文本模型（图片会被网关按既有逻辑过滤） |
+| `/v1/embeddings` | 仅**嵌入**模型；池内没有嵌入模型时返回 `503 auto_no_candidate` |
+
+候选池的过滤顺序是：上游已加载 → `global.deny_models` 与 `TG_AUTO_EXCLUDE` → `global.allow_models` → 能力匹配。若 `allow_models` 中**只写了 `auto`**，视为放行整个池子（仍受 `deny_models` 约束）；否则 `auto` 只能在 `allow_models` 列出的模型中选择。
+
+**分配策略**：默认 `round-robin` —— 候选按模型名排序后轮流使用，覆盖最全、顺序可复现；`TG_AUTO_STRATEGY=random` 改为随机挑选。
+
+**如何确认选中了谁**：
+- 响应头 **`X-Gateway-Model: <真实模型名>`**
+- 响应体的 `model` 字段（上游回显的真实模型名）
+- 服务日志：`🎲 auto → <模型> @ <上游>（<选择理由>）→ <客户端IP>`
+
+**示例**
+```bash
+curl -s http://localhost:3000/v1/chat/completions -D - \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"model":"auto","messages":[{"role":"user","content":"你好"}],"stream":false}'
+# 响应头会带：X-Gateway-Model: gemma4:latest
+```
+
+**注意**
+- `auto` 每次请求独立挑选，**同一会话的连续请求可能落到不同模型**。上下文不会跨模型保持（客户端本来就会带全量 `messages`，功能上不受影响），但输出风格与能力可能变化。需要稳定输出时请显式指定模型。
+- `auto` 只出现在 `/v1/models`，且排在列表**末尾**——不改变「客户端默认取第一个模型」的既有行为；`/api/tags`（Ollama 兼容端点）不含 `auto`。
 
 ### OpenAI 兼容端点
 
