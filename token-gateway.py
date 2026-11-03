@@ -1675,7 +1675,9 @@ iframe{{padding-top:0}}
         # ---- auto 虚拟模型：从本地可用模型池自动分配 ----
         # 必须在白名单/存在性检查之前解析成真实模型名：后续上下文窗口、图片过滤、
         # 上游路由、用量记录全部按真实模型处理，行为与直接指定该模型完全一致。
-        if AUTO_ENABLED and model == AUTO_MODEL_NAME:
+        # deny_models 中显式写入 auto 视为禁用：此时不解析，落到后面的白名单检查返回 403。
+        _auto_denied = AUTO_MODEL_NAME in (cfg["global"].get("deny_models", []) or [])
+        if AUTO_ENABLED and model == AUTO_MODEL_NAME and not _auto_denied:
             picked, picked_host, why = self._auto_pick_model(path, req, cfg)
             if not picked:
                 self._send_error(503, "auto_no_candidate",
