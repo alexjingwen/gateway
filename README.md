@@ -21,6 +21,7 @@
 - [mem-guard.mjs —— 设备级内存守卫](#mem-guardmjs--设备级内存守卫)
 - [故障排查 / 常见问题](#故障排查--常见问题)
 - [运维细节（日志 / 权限 / 轮转）](#运维细节日志--权限--轮转)
+- [变更记录](#变更记录)
 - [推送到 GitHub](#推送到-github)
 - [仓库来源 / Provenance](#仓库来源--provenance)
 
@@ -80,7 +81,9 @@ TG_DISABLE_HTTPS=1 TG_PORT=3000 python3 token-gateway.py
 | TG_READ_TIMEOUT | 900 | 上游读取超时（秒） |
 | TG_VLM_READ_TIMEOUT | 120 | 多模态请求读取超时（秒） |
 | TG_CONNECT_TIMEOUT | 10 | 上游连接超时（秒） |
+| TG_MIN_MAX_TOKENS | 32768 | Rapid-MLX 上游的 `max_tokens` 强制下限（防止客户端给小值被截断）；**VLM 上游不生效**，设 0 关闭 |
 | TG_CONFIG_DIR | ~/.ollama-token-gateway | config.json / certs / logs 所在目录 |
+| TG_LOG_DIR | `$TG_CONFIG_DIR/logs` | 用量日志 `usage.jsonl` 所在目录 |
 
 ### macOS 后台运行（launchd）
 仓库内含 `com.token-gateway.server.plist` 模板：
@@ -390,7 +393,7 @@ curl -X POST http://127.0.0.1:3000/api/admin/keys -H "X-Admin-Token: $ADMIN_TOKE
 
 ## 配置字段速查
 
-`config.json` 顶层三块：`keys` / `global` / `admin`（`_comment` 为自由备注，服务端忽略）。
+`config.json` 顶层三块：`keys` / `global` / `admin`（以 `_comment` 开头的键为自由备注，服务端忽略）。完整样例见 [`config.example.json`](config.example.json)。
 
 ### `keys` —— 键为 API key 明文，值为该 key 的配置
 | 字段 | 类型 | 默认 | 说明 |
@@ -592,6 +595,18 @@ launchctl unload ~/Library/LaunchAgents/com.user.memguard.plist
 | 请求返回 500 | 上游异常 / 代码异常 | 看 `/tmp/token-gateway.log` 与 `/tmp/token-gateway.err.log` |
 | 端口被占用（启动报 `Address already in use`） | 旧实例仍占用 3000 | 停旧实例，或改 `config.json` 的 `listen_port` |
 
+### auto 分配相关
+| 现象 | 可能原因 | 排查 / 处理 |
+|---|---|---|
+| `503 auto_no_candidate` | 候选池为空：上游没加载模型、全被 `deny_models` / `auto_exclude` 排除、或 `allow_models` 里没有可用模型 | `curl 127.0.0.1:11434/api/tags` 确认上游；检查 `global.allow_models`、`global.deny_models`、`global.auto_exclude`、`TG_AUTO_EXCLUDE` |
+| `403 model_not_allowed`（请求 `auto`） | `global.deny_models` 里写了 `"auto"` | 删除该项即恢复；这是显式禁用 `auto` 的开关 |
+| `404` 且提示模型不存在（请求 `auto`） | `auto` 被关闭：`TG_AUTO_ENABLED=0`，或 `allow_models` 不含 `auto`/`*` | 打开 `TG_AUTO_ENABLED`；把 `auto` 加进允许列表 |
+| auto 老是选同一个模型 | 属预期：`balanced` / `quality` 都是确定性策略，同条件下不切换 | 看响应头 `X-Gateway-Auto-Tier` 与日志里的综合分；想分散请用 `TG_AUTO_STRATEGY=round-robin` |
+| 短问题也走了 122B | 轻量档判定没命中：字符数超过 `auto_tier_light_chars`（默认 400）、消息数 > 3，或 `max_tokens` > 1024 | 调大 light 阈值、调高 `tier` 权重，或把 `quality` 降权（见[分档与加权打分](#分档与加权打分balanced-策略)） |
+| 明明空闲却选了较弱的模型 | `TG_AUTO_BUSY_THRESHOLD` 判定为该模型繁忙（网关侧在飞计数 ≥ 阈值） | 日志里搜「跳过 N 个繁忙候选」；需要允许同模型排队就把阈值调大 |
+| 切模型后输出风格变化大 | `auto` 本来就可能落到不同模型 | 需要稳定输出请显式指定 `model`；或用 `global.auto_quality` 收窄候选 |
+| 调整了 `auto_weights` / `auto_tier_*` 但没变化 | 这些配置在**服务启动时**读入内存（`_cfg`），改文件不会热加载；且 plist 里的同名 env 会覆盖 config | 改完 `config.json` 或 plist 后重启：`launchctl kickstart -k gui/$(id -u)/com.token-gateway.server` |
+
 ### GitHub 推送相关
 | 现象 | 可能原因 | 处理 |
 |---|---|---|
@@ -683,6 +698,26 @@ cp ~/.ollama-token-gateway/config.json \
 - **配置/日志目录**：每个实例独立 `TG_CONFIG_DIR`（各自的 `config.json` / `certs/` / `logs/`）。
 - **LaunchAgent 标签**：复制 plist 后改 `Label`（如 `com.token-gateway.server2`）及 `ProgramArguments` / `WorkingDirectory`。
 - **凭据**：不同实例用不同 `admin.token` 与 key 命名空间，避免串用。
+
+## 变更记录
+
+| 日期 | 提交 | 内容 |
+|---|---|---|
+| 2026-11-04 | `319fcbdf` | **auto 新增 `balanced` 策略并设为默认**：请求分档（light/standard/deep）+ 分档与质量**等权**加权（tier 0.35 / quality 0.35 / pref 0.15 / quant 0.10）；新增 `X-Gateway-Auto-Tier` 响应头与 `auto_weights`、`auto_tier_ideals`、`auto_tier_light_chars`、`auto_tier_deep_chars` 配置 |
+| 2026-11-04 | `2c6f20a1` | auto 改为 `quality` 精度优先：参数量 → 量化排序，显式优先表可覆盖；繁忙时让位次优空闲模型 |
+| 2026-11-04 | `bb5c6664` | auto 新增 `least-busy`：按网关侧 in-flight 避让繁忙模型，全繁忙时取最低负载 |
+| 2026-11-03 | `c3d26fb9` | 管理台模型列表展示 `auto` 虚拟条目（`upstream:"gateway"`、`details.virtual:true`） |
+| 2026-11-03 | `3fdf4231` | 修复 `deny_models: ["auto"]` 被静默忽略——现在明确返回 403 |
+| 2026-11-03 | `157b8a79` | 引入 `auto` 虚拟模型：候选池按 allow/deny/能力（chat/embeddings/多模态）过滤，响应头回传 `X-Gateway-Model` |
+| 2026-11-02 | `3b38e7da` | 文档修正：`/v1/models`、`/api/tags` 实为免鉴权的模型发现接口 |
+| 2026-11-02 | `ab78d2fd` | 文档修正管理接口鉴权头为 `X-Admin-Token`；补充 embeddings 示例与用量日志格式 |
+| 2026-11-02 | `c4492f2f` | README 补齐 API 示例、配置优先级、HTTPS 与安全、故障排查 |
+| 2026-11-02 | `65cc0861` | README 补齐 API 概览、配置字段参考、mem-guard LaunchAgent 安装、安全提示归并 |
+| 2026-11-02 | `5e8e83d3` | 部署章节补充 `admin.token` 安全建议 |
+| 2026-11-02 | `18bf916d` | 安全：去掉弱默认 `admin.token`，启动横幅不再打印 token，空 token 时告警 |
+| 2026-11-02 | `307290f6` | 安全：移除 `DEFAULT_CONFIG` 中硬编码的真实 key，改为空字典 fail-closed |
+| 2026-10-18 | `cdd38830` | README 与已 vendor 的服务端源码对齐 |
+| 2026-10-18 | `3b4adc22` | 明确 `config.json` 端口优先于 `TG_*` 环境变量 |
 
 ## 推送到 GitHub
 

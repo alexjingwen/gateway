@@ -1,5 +1,6 @@
 {
-  "_comment": "脱敏样例，仅供结构参考。真实 config.json 含 sk-ollama-*** token 与 TLS 私钥，已被 .gitignore 屏蔽，不会入库。",
+  "_comment": "脱敏样例，仅供结构参考。真实 config.json 含 sk-ollama-*** token 与 TLS 私钥，已被 .gitignore 屏蔽，不会入库。所有字段都可省略，省略时用内置默认值。",
+  "_comment_keys": "键是 API key 明文，值是该 key 的配额/限流配置。生产环境请用长随机串。",
   "keys": {
     "sk-ollama-REPLACE_WITH_REAL_KEY_1": {
       "name": "Alex",
@@ -20,10 +21,24 @@
       "created": "2026-08-03"
     }
   },
+  "_comment_global": "全局运行参数。auto_* 只影响虚拟模型 auto，不影响显式调用具体模型。",
   "global": {
     "max_concurrency": 256,
     "allow_models": ["*"],
     "deny_models": [],
+    "auto_exclude": ["muse-glimmer"],
+    "auto_quality": [],
+    "auto_tier": true,
+    "auto_tier_ideals": [8, 30, 122],
+    "auto_tier_light_chars": 400,
+    "auto_tier_deep_chars": 3000,
+    "auto_weights": {
+      "tier": 0.35,
+      "quality": 0.35,
+      "pref": 0.15,
+      "quant": 0.1,
+      "speed": 0
+    },
     "listen_host": "0.0.0.0",
     "listen_port": 3000
   },
