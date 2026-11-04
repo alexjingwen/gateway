@@ -68,10 +68,48 @@ _MODEL_REVERSE_ALIAS = {v: k for k, v in MODEL_ALIASES.items()}
 # 客户端不必为试不同模型而反复改 model 名。选中结果通过响应头 X-Gateway-Model 回传。
 AUTO_MODEL_NAME = "auto"
 AUTO_ENABLED = os.environ.get("TG_AUTO_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
-# 分配策略：round-robin（默认，轮流用，覆盖最全）| random
-AUTO_STRATEGY = (os.environ.get("TG_AUTO_STRATEGY", "round-robin") or "round-robin").strip().lower()
-# 额外排除的模型（逗号分隔），与 config.json 的 global.deny_models 叠加生效
+# 分配策略：
+#   least-busy（默认）：优先选网关侧 in-flight 最少的模型；全部繁忙时退化为"选负载最低者"，
+#                       全部空闲时行为与 round-robin 完全一致（不改变原有分配观感）
+#   round-robin：纯轮流，忽略负载
+#   random：随机
+AUTO_STRATEGY = (os.environ.get("TG_AUTO_STRATEGY", "least-busy") or "least-busy").strip().lower()
+# 繁忙阈值：某模型在飞请求数 >= 此值即视为繁忙，least-busy 会跳过它（默认 1 = 已经有人用就换）
+try:
+    AUTO_BUSY_THRESHOLD = max(1, int(os.environ.get("TG_AUTO_BUSY_THRESHOLD", "1")))
+except (TypeError, ValueError):
+    AUTO_BUSY_THRESHOLD = 1
+# 额外排除的模型（逗号分隔），与 config.json 的 global.deny_models / global.auto_exclude 叠加生效
 AUTO_EXCLUDE = {m.strip() for m in os.environ.get("TG_AUTO_EXCLUDE", "").split(",") if m.strip()}
+
+
+# 网关侧「每模型在飞请求数」：只在经过本网关的请求上计数，用于 least-busy 选择。
+# 注意：外部客户端直连上游（如直接打 :11434）造成的占用，网关无法感知。
+_model_inflight: Dict[str, int] = {}
+_model_inflight_lock = threading.Lock()
+
+
+def model_inflight_inc(model: str) -> None:
+    if not model:
+        return
+    with _model_inflight_lock:
+        _model_inflight[model] = _model_inflight.get(model, 0) + 1
+
+
+def model_inflight_dec(model: str) -> None:
+    if not model:
+        return
+    with _model_inflight_lock:
+        left = _model_inflight.get(model, 0) - 1
+        if left <= 0:
+            _model_inflight.pop(model, None)
+        else:
+            _model_inflight[model] = left
+
+
+def model_inflight_get(model: str) -> int:
+    with _model_inflight_lock:
+        return _model_inflight.get(model, 0)
 # 非对话模型（嵌入/重排）名字特征：不参与 chat 分配，只服务 /v1/embeddings
 AUTO_EMBED_HINTS = ("embed", "bge", "mxbai", "gte-", "e5-", "rerank")
 # 视觉模型名字特征：带图请求优先选它们（其余候选会被网关按既有逻辑过滤图片）
@@ -1312,12 +1350,14 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
 
         allow = cfg["global"].get("allow_models", ["*"]) or []
         deny = set(cfg["global"].get("deny_models", []) or [])
+        # auto 专用排除：config.json 的 global.auto_exclude（可运行时调整，不影响直接调用该模型）
+        auto_excl = set(cfg["global"].get("auto_exclude", []) or [])
         # allow 里出现 auto 本身即视为"放行 auto 入口"，候选池不受 allow 明细约束（仍受 deny 约束）
         wide_allow = ("*" in allow) or (AUTO_MODEL_NAME in allow)
 
         allowed: List[Tuple[str, str]] = []
         for m, h in pool:
-            if m in deny or m in AUTO_EXCLUDE:
+            if m in deny or m in AUTO_EXCLUDE or m in auto_excl:
                 continue
             if not wide_allow and m not in allow:
                 continue
@@ -1338,16 +1378,40 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         return chat, "文本请求"
 
     def _auto_pick_model(self, path: str, req: dict, cfg: dict) -> Tuple[str, str, str]:
-        """从候选池挑一个模型，返回 (model, upstream_host, 说明)；无候选时 model 为空串。"""
+        """从候选池挑一个模型，返回 (model, upstream_host, 说明)；无候选时 model 为空串。
+
+        least-busy 策略：按网关侧 in-flight 过滤出空闲候选，在空闲集合内轮询。
+        - 有空闲：跳过繁忙候选（说明里标注跳过了几个）
+        - 全繁忙：退化为"选负载最低者"，避免直接 503
+        - 全空闲：等价于 round-robin，不改变原有观感
+        """
         cands, note = self._auto_candidates(path, req, cfg)
         if not cands:
             return "", "", note
+
         if AUTO_STRATEGY == "random":
             import random
             idx = random.randrange(len(cands))
-        else:
-            idx = next(self._auto_cursor) % len(cands)
-        model, host = cands[idx]
+            model, host = cands[idx]
+            return model, host, note
+
+        pool = cands
+        if AUTO_STRATEGY == "least-busy":
+            loads = {m: model_inflight_get(m) for m, _ in cands}
+            idle = [(m, h) for m, h in cands if loads[m] < AUTO_BUSY_THRESHOLD]
+            if idle:
+                skipped = len(cands) - len(idle)
+                if skipped:
+                    busy_names = ", ".join(f"{m}({loads[m]})" for m, _ in cands if loads[m] >= AUTO_BUSY_THRESHOLD)
+                    note += f"；跳过 {skipped} 个繁忙候选: {busy_names}"
+                pool = idle
+            else:
+                lowest = min(loads[m] for m, _ in cands)
+                pool = [(m, h) for m, h in cands if loads[m] == lowest]
+                note += f"；全部候选繁忙，选最低负载 {lowest}"
+
+        idx = next(self._auto_cursor) % len(pool)
+        model, host = pool[idx]
         return model, host, note
 
     def _resolve_upstream(self, model: str, path: str = "") -> str:
@@ -1739,6 +1803,9 @@ iframe{{padding-top:0}}
             _active_reqs[_rid] = {"ts": time.time(), "sock": self.connection, "freed": False}
 
         client_ip = self._real_ip()
+        # 记录该模型在飞请求数：auto 的 least-busy 策略据此判断哪个模型繁忙
+        _inflight_model = model
+        model_inflight_inc(_inflight_model)
         try:
             self._proxy("POST", client_ip, api_key, key_cfg, cfg,
                         body_bytes=body_bytes, original_req=req, model=model)
@@ -1750,6 +1817,7 @@ iframe{{padding-top:0}}
             except Exception:
                 pass
         finally:
+            model_inflight_dec(_inflight_model)
             # 释放槽位；如果 reaper 已经因为"客户端走了"提前回收过，这里就不要再减
             with state_lock:
                 _e = _active_reqs.pop(_rid, None)

@@ -66,8 +66,9 @@ TG_DISABLE_HTTPS=1 TG_PORT=3000 python3 token-gateway.py
 | TG_MLX_VLM_API_KEY | sk-test | 访问 VLM 上游所需的 key |
 | TG_MODEL_ALIASES | (空) | 模型别名，如 qwen3.5-122b=mlx-community/Qwen3.5-122B-A10B-4bit |
 | TG_AUTO_ENABLED | 1 | `auto` 虚拟模型开关；设 0/false/no/off 关闭 |
-| TG_AUTO_STRATEGY | round-robin | `auto` 分配策略：`round-robin` \| `random` |
-| TG_AUTO_EXCLUDE | (空) | `auto` 额外排除的模型（逗号分隔，叠加在 `deny_models` 之上） |
+| TG_AUTO_STRATEGY | least-busy | `auto` 分配策略：`least-busy`（默认，繁忙规避）\| `round-robin` \| `random` |
+| TG_AUTO_BUSY_THRESHOLD | 1 | 繁忙阈值：在飞请求数 ≥ 此值即跳过该模型（默认 1 = 有人正在用就换） |
+| TG_AUTO_EXCLUDE | (空) | `auto` 额外排除的模型（逗号分隔，叠加在 `deny_models` 与 `global.auto_exclude` 之上） |
 | TG_QPS | 5 | 每 key 每秒请求数 |
 | TG_CONCURRENCY | 10 | 全局最大并发 |
 | TG_READ_TIMEOUT | 900 | 上游读取超时（秒） |
@@ -127,9 +128,19 @@ tail -f /tmp/token-gateway.log
 | 带图请求（`content` 内含 `image_url` / `image` / `input_image`，或顶层 `images`） | 仅**多模态**模型：部署在 `TG_RAPID_MLX_VLM_HOSTS` 上的模型，或名字含 `vl` / `vision` / `llava` / `minicpm-v` 的模型；若无多模态候选，回退文本模型（图片会被网关按既有逻辑过滤） |
 | `/v1/embeddings` | 仅**嵌入**模型；池内没有嵌入模型时返回 `503 auto_no_candidate` |
 
-候选池的过滤顺序是：上游已加载 → `global.deny_models` 与 `TG_AUTO_EXCLUDE` → `global.allow_models` → 能力匹配。若 `allow_models` 中**只写了 `auto`**，视为放行整个池子（仍受 `deny_models` 约束）；否则 `auto` 只能在 `allow_models` 列出的模型中选择。
+候选池的过滤顺序是：上游已加载 → `global.deny_models` / `global.auto_exclude` / `TG_AUTO_EXCLUDE` → `global.allow_models` → 能力匹配。若 `allow_models` 中**只写了 `auto`**，视为放行整个池子（仍受 `deny_models` 约束）；否则 `auto` 只能在 `allow_models` 列出的模型中选择。
 
-**分配策略**：默认 `round-robin` —— 候选按模型名排序后轮流使用，覆盖最全、顺序可复现；`TG_AUTO_STRATEGY=random` 改为随机挑选。
+> `global.auto_exclude` 与 `deny_models` 的区别：前者**只影响 `auto` 的候选池**，被排除的模型仍可被客户端显式调用；后者是全局白名单，显式调用也会 403。想「让 auto 别用某个模型」用前者。
+
+**分配策略**：
+
+| 策略 | 行为 |
+|---|---|
+| `least-busy`（默认） | 先按网关侧在飞请求数筛出**空闲**候选，在空闲集合内轮询；全部繁忙时退化为「选负载最低者」，不会直接失败。全部空闲时与 `round-robin` 完全一致 |
+| `round-robin` | 忽略负载，纯轮流（候选按模型名排序，顺序可复现） |
+| `random` | 随机挑选 |
+
+繁忙判定基于**网关侧每模型的在飞请求数**（`TG_AUTO_BUSY_THRESHOLD`，默认 1）。含义是「已经有一个请求在使用该模型，就先换一个」，避免多个请求挤在同一模型上排队。这个计数只统计经过本网关的请求——**外部客户端直连上游（例如直接请求 `:11434`）造成的占用，网关无法感知**。
 
 **如何确认选中了谁**：
 - 响应头 **`X-Gateway-Model: <真实模型名>`**
@@ -146,6 +157,8 @@ curl -s http://localhost:3000/v1/chat/completions -D - \
 
 **注意**
 - `auto` 每次请求独立挑选，**同一会话的连续请求可能落到不同模型**。上下文不会跨模型保持（客户端本来就会带全量 `messages`，功能上不受影响），但输出风格与能力可能变化。需要稳定输出时请显式指定模型。
+- `least-busy` 的「繁忙」是**网关视角**的并发，不是上游的真实队列深度。若某模型被外部进程占满，网关仍会把它当作空闲模型选中，此时表现为该请求变慢而非被跳过。
+- 被 `auto_exclude` 排除的模型**不会**从 `/v1/models` 或管理台消失——它们仍然可用，只是 `auto` 不再分配。这样既避免 `auto` 命中不合适的模型，又不影响显式调用。
 - `auto` 只出现在 `/v1/models`，且排在列表**末尾**——不改变「客户端默认取第一个模型」的既有行为；`/api/tags`（Ollama 兼容端点）不含 `auto`。
 - Web 管理台的「模型管理」页会额外显示一条 `auto`（紫色 `🎲 auto` 徽章、大小显示为 `—`），它来自 `/api/admin/models` 的虚拟条目，**不可拉取、不可删除**。
 
@@ -298,7 +311,8 @@ curl -X POST http://127.0.0.1:3000/api/admin/keys -H "X-Admin-Token: $ADMIN_TOKE
 |---|---|---|---|
 | `max_concurrency` | int | `10`（`TG_CONCURRENCY`） | 全局最大并发请求数 |
 | `allow_models` | string[] | `["*"]` | 允许的模型；`*` = 全部 |
-| `deny_models` | string[] | `[]` | 拒绝的模型 |
+| `deny_models` | string[] | `[]` | 拒绝的模型（全局生效，显式调用也 403） |
+| `auto_exclude` | string[] | `[]` | 仅从 `auto` 候选池排除；不影响显式调用（需重启或 admin 操作后重载生效） |
 | `listen_host` | string | `0.0.0.0` | 监听地址 |
 | `listen_port` | int | `3000` | 监听端口（优先于 `TG_PORT`） |
 
