@@ -3,7 +3,7 @@
 `gateway` 是一个**单文件、纯 Python 标准库**实现的 OpenAI 兼容 token 网关，面向**本地局域网 / Tailscale 内网**使用：统一代理 Ollama 与 Rapid-MLX 上游，做 per-key 配额 / QPS / 限流，并提供 Web 管理台与 `/api/admin/*` 管理接口。附带 `mem-guard.mjs` 设备内存守卫。
 
 - **服务端**：`token-gateway.py`（无第三方依赖，Python 3.10+）
-- **auto 虚拟模型**：客户端把 `model` 设为 `auto`，由网关按**模型精度**从本地池里挑最强的那个（被占用时自动让位给次优），免去手动切换（详见 [auto 虚拟模型](#auto-虚拟模型自动分配)）
+- **auto 虚拟模型**：客户端把 `model` 设为 `auto`，由网关按**请求分档 + 多维加权**从本地池里挑最合适的模型（短问答走小模型、复杂任务上大模型，被占用时自动让位），免去手动切换（详见 [auto 虚拟模型](#auto-虚拟模型自动分配)）
 - **配置样例**：`config.example.json`（真实 `config.json` 含密钥，被 `.gitignore` 排除）
 - **运维工具**：`mem-guard.mjs` + `com.user.memguard.plist`
 - **推送工具**：`tools/push-via-api.py`（Git Data API，绕过被拦的 `github.com:443`）
@@ -66,8 +66,13 @@ TG_DISABLE_HTTPS=1 TG_PORT=3000 python3 token-gateway.py
 | TG_MLX_VLM_API_KEY | sk-test | 访问 VLM 上游所需的 key |
 | TG_MODEL_ALIASES | (空) | 模型别名，如 qwen3.5-122b=mlx-community/Qwen3.5-122B-A10B-4bit |
 | TG_AUTO_ENABLED | 1 | `auto` 虚拟模型开关；设 0/false/no/off 关闭 |
-| TG_AUTO_STRATEGY | quality | `auto` 分配策略：`quality`（默认，按精度选最强）\| `least-busy`（繁忙规避轮询）\| `round-robin` \| `random` |
-| TG_AUTO_QUALITY | (空) | 显式质量优先顺序（逗号分隔，从高到低），覆盖参数量启发式；允许写别名 |
+| TG_AUTO_STRATEGY | balanced | `auto` 分配策略：`balanced`（默认，分档+加权综合）\| `quality`（纯精度选最强）\| `least-busy`（繁忙规避轮询）\| `round-robin` \| `random` |
+| TG_AUTO_TIER | 1 | `balanced` 的请求分档开关；设 0/false/no/off 关闭后等价于纯加权质量排序 |
+| TG_AUTO_TIER_IDEALS | 8,30,122 | 轻量/常规/深度三档的理想参数量（B），用于计算分档适配度 |
+| TG_AUTO_TIER_LIGHT_CHARS | 400 | 轻量档的输入字符上限（小于此值且轮次少 → 轻量档） |
+| TG_AUTO_TIER_DEEP_CHARS | 3000 | 深度档的输入字符阈值（大于此值 → 深度档） |
+| TG_AUTO_WEIGHTS | tier=0.35,quality=0.35,pref=0.15,quant=0.10,speed=0 | 综合打分权重；`tier`（分档）与 `quality`（质量）默认等权 |
+| TG_AUTO_QUALITY | (空) | 显式优先顺序（逗号分隔，从高到低）；表内模型优先于表外，表内再按加权排序；允许写别名 |
 | TG_AUTO_BUSY_THRESHOLD | 1 | 繁忙阈值：在飞请求数 ≥ 此值即跳过该模型（默认 1 = 有人正在用就换） |
 | TG_AUTO_EXCLUDE | (空) | `auto` 额外排除的模型（逗号分隔，叠加在 `deny_models` 与 `global.auto_exclude` 之上） |
 | TG_QPS | 5 | 每 key 每秒请求数 |
@@ -137,12 +142,75 @@ tail -f /tmp/token-gateway.log
 
 | 策略 | 行为 |
 |---|---|
-| `quality`（默认） | 按**模型精度**排序，**每次都用当前最强的模型**，不轮询、不随机，结果稳定可预期；最优质的被占用时让位给次优的空闲模型 |
+| `balanced`（默认） | 先按 prompt 规模给请求**分档**（轻量/常规/深度），再把「分档适配」与「绝对质量」按**等权**加权，加上显式偏好、量化保真算出综合分，取最高分。结果稳定可预期，短问答走小模型、复杂任务上大模型 |
+| `quality` | 纯**模型精度**降序（参数量 → 量化），忽略请求体量，一律用最强模型；最优质的被占用时让位给次优的空闲模型 |
 | `least-busy` | 先按网关侧在飞请求数筛出**空闲**候选，在空闲集合内轮询；全部繁忙时退化为「选负载最低者」，不会直接失败 |
 | `round-robin` | 忽略负载与质量，纯轮流（候选按模型名排序，顺序可复现） |
 | `random` | 随机挑选 |
 
 繁忙判定基于**网关侧每模型的在飞请求数**（`TG_AUTO_BUSY_THRESHOLD`，默认 1）。含义是「已经有一个请求在使用该模型，就先换一个」，避免多个请求挤在同一模型上排队。这个计数只统计经过本网关的请求——**外部客户端直连上游（例如直接请求 `:11434`）造成的占用，网关无法感知**。
+
+#### 分档与加权打分（`balanced` 策略）
+
+**第一步：给请求分档**（只看请求体，不调用模型）：
+
+| 档位 | 判定条件（任一深度信号命中即深度；否则满足全部轻量条件即轻量；其余常规） | 理想参数量 |
+|---|---|---|
+| `light` 轻量 | 文本 ≤ `auto_tier_light_chars`（默认 400 字符）且消息 ≤ 3 条且 `max_tokens` ≤ 1024（或不填） | 8B |
+| `standard` 常规 | 不满足轻量，也没有深度信号 | 30B |
+| `deep` 深度 | 带图、带 `tools`/`functions`、文本 ≥ `auto_tier_deep_chars`（默认 3000 字符）、`max_tokens` ≥ 2048、消息 ≥ 8 条 | 122B |
+
+**第二步：加权求和**，取综合分最高的空闲模型：
+
+```
+score = Σ (wᵢ × fᵢ) / Σ wᵢ
+```
+
+| 因子 | 含义 | 默认权重 | 打分方式（0~1） |
+|---|---|---|---|
+| `tier` | **分档适配** | **0.35** | 模型参数量与本档理想值的**对数距离高斯衰减** `exp(-d²/2σ²)`，σ = 0.35/0.55/0.70（轻/常/深）；深度档只惩罚「偏小」，更大的模型同样算贴合 |
+| `quality` | **绝对质量** | **0.35** | 参数量在候选池内的对数位置归一化；参数量取 Ollama `details.parameter_size`，缺失时解析模型名（`A10B` 激活参数会被忽略） |
+| `pref` | 显式优先 | 0.15 | `global.auto_quality` 表内第 1 位 1.0，之后 `0.85^i`；未配置该表时此因子整体剔除 |
+| `quant` | 量化保真 | 0.10 | `F32/BF16/F16 = 1.0 → Q8 ≈ 0.67 → Q4 ≈ 0.17 → Q3/Q2 = 0` |
+| `speed` | 速度收益 | 0（关闭） | `1 − quality`。与 `quality` 是同一根轴的两端，默认关掉，否则会隐式稀释质量权重 |
+
+要点：
+
+- **分档与质量严格等权**，不存在「先按档位筛掉一批、再按质量挑」的硬顺序，两者各自独立打分后加权求和。权重只影响结果，不改变流程。
+- 权重为 0 的因子、未配置的因子会从分母里剔除，不会拉低总分（所以配了 `pref` 表时其余因子会等比例放大）。
+- **负载是硬约束**：先排除在飞请求数 ≥ `TG_AUTO_BUSY_THRESHOLD` 的候选，再在空闲集合内比综合分；全部繁忙时在负载最低的一撮里比综合分，不会直接 503。
+- 参数量的对数尺度让 8B 与 122B 相差约 1.18 个数量级，跨档能拉开足够差距；`tier` 与 `quality` 同权时，**轻量档由分档项主导选小模型，常规/深度档由质量项主导选大模型**。
+
+按 prompt 规模会实际发生什么（以 `gemma4:latest` 8B、`qwen3.5-122b` 122B 为例）：
+
+| 请求 | 档位 | 选中 | 实测耗时 |
+|---|---|---|---|
+| 「只回复两个字：收到」（6 字符，`max_tokens=16`） | light | `gemma4:latest` | 0.46s |
+| 约 500 字符的常规提问 | standard | `qwen3.5-122b` | ~1.3s |
+| 4000+ 字符长文总结 / 带 tools / 带图 | deep | `qwen3.5-122b` | ~4s |
+
+想调整倾向，直接改权重即可（env 与 config 二选一，config 优先且无需改 plist）：
+
+```json
+{
+  "global": {
+    "auto_weights": {"tier": 0.5, "quality": 0.3, "quant": 0.1, "pref": 0.1},
+    "auto_tier_ideals": [8, 30, 122],
+    "auto_tier_light_chars": 600,
+    "auto_tier_deep_chars": 3000
+  }
+}
+```
+
+```bash
+# 等价的环境变量写法（适合写进 launchd plist）
+TG_AUTO_WEIGHTS="tier=0.5,quality=0.3,quant=0.1,pref=0.1"
+TG_AUTO_TIER_LIGHT_CHARS=600
+```
+
+- 想更省时间：调高 `tier`、调大 `auto_tier_light_chars`，让更多请求落进轻量档。
+- 想一律用最强：`quality` 调到 0.8 以上，或直接 `TG_AUTO_STRATEGY=quality`。
+- 想走速度优先：把 `speed` 提到 0.3~0.5（此时它与 `quality` 对冲，等价于「同档优先小模型」）。
 
 #### 质量排序规则（`quality` 策略）
 
@@ -161,7 +229,7 @@ tail -f /tmp/token-gateway.log
 3. 取剩余里的**第一个**，即最强的空闲模型；
 4. 全部繁忙时，在**负载最低**的候选里取质量最高者——不会因为繁忙直接返回 503，也不会无脑降级到最弱模型。
 
-如果你认为参数量不能代表实际效果，可以直接指定顺序（别名会被自动展开）：
+`balanced` 策略同样尊重这张表：**表内模型只要在候选池里，就只在表内挑**（表内再按综合分排序），避免被分档或质量分反超；表内模型全部不可用时才回落全量候选。如果你认为参数量不能代表实际效果，可以直接指定顺序（别名会被自动展开）：
 
 ```json
 {
@@ -173,19 +241,21 @@ tail -f /tmp/token-gateway.log
 
 **如何确认选中了谁**：
 - 响应头 **`X-Gateway-Model: <真实模型名>`**
+- 响应头 **`X-Gateway-Auto-Tier: light|standard|deep`**（本次决策使用的请求档位）
 - 响应体的 `model` 字段（上游回显的真实模型名）
-- 服务日志：`🎲 auto → <模型> @ <上游>（<选择理由>）→ <客户端IP>`
+- 服务日志：`🎲 auto → <模型> @ <上游>（<选择理由：档位 + 综合分 + 各因子得分>）→ <客户端IP>`
 
 **示例**
 ```bash
 curl -s http://localhost:3000/v1/chat/completions -D - \
   -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
   -d '{"model":"auto","messages":[{"role":"user","content":"你好"}],"stream":false}'
-# 响应头会带：X-Gateway-Model: <实际选中的最强模型>
+# 响应头会带：X-Gateway-Model: <实际选中的模型>、X-Gateway-Auto-Tier: light
 ```
 
 **注意**
-- 默认 `quality` 策略下，**同一条件下的连续请求会稳定命中同一个模型**（不会一会儿一个）。只有在最强模型被占用、或请求能力不同（带图 / embeddings）时才会切换，切换原因会写进服务日志。需要绝对固定的输出风格时，仍建议显式指定模型。
+- 默认 `balanced` 策略下，**同一条件下（同样的 prompt 规模与能力要求）连续请求会稳定命中同一个模型**（不会一会儿一个）。只有跨档（输入变长变短）、能力变化（带图 / tools / embeddings）或最优候选被占用时才会切换，切换原因与各因子得分都会写进服务日志。需要绝对固定的输出风格时，仍建议显式指定模型。
+- 分档只看**请求特征**（字符数、消息条数、`max_tokens`、是否带图/工具），不做语义理解：一段 300 字的深奥问题仍会归入轻量档。如果任务对精度敏感，把 `auto_tier_light_chars` 调小（例如 120），或直接显式指定模型。
 - 「繁忙」是**网关视角**的并发，不是上游的真实队列深度。若某模型被外部进程占满，网关仍会把它当作空闲模型选中，此时表现为该请求变慢而非被跳过。想更保守，可把 `TG_AUTO_BUSY_THRESHOLD` 调大。
 - 被 `auto_exclude` 排除的模型**不会**从 `/v1/models` 或管理台消失——它们仍然可用，只是 `auto` 不再分配。这样既避免 `auto` 命中不合适的模型，又不影响显式调用。
 - `auto` 只出现在 `/v1/models`，且排在列表**末尾**——不改变「客户端默认取第一个模型」的既有行为；`/api/tags`（Ollama 兼容端点）不含 `auto`。
@@ -342,7 +412,12 @@ curl -X POST http://127.0.0.1:3000/api/admin/keys -H "X-Admin-Token: $ADMIN_TOKE
 | `allow_models` | string[] | `["*"]` | 允许的模型；`*` = 全部 |
 | `deny_models` | string[] | `[]` | 拒绝的模型（全局生效，显式调用也 403） |
 | `auto_exclude` | string[] | `[]` | 仅从 `auto` 候选池排除；不影响显式调用（需重启或 admin 操作后重载生效） |
-| `auto_quality` | string[] | `[]` | `auto` 的显式质量优先顺序（从高到低），覆盖参数量启发式；允许写别名（需重启生效） |
+| `auto_quality` | string[] | `[]` | `auto` 的显式优先顺序（从高到低）；表内模型优先于表外，表内再按综合分排序；允许写别名 |
+| `auto_tier` | bool | `true` | `balanced` 的请求分档开关；`false` 时不做分档，退化为纯加权质量排序 |
+| `auto_tier_ideals` | number[] | `[8, 30, 122]` | 轻量/常规/深度三档的理想参数量（B） |
+| `auto_tier_light_chars` | int | `400` | 轻量档输入字符上限 |
+| `auto_tier_deep_chars` | int | `3000` | 深度档输入字符阈值 |
+| `auto_weights` | object \| string | `{tier:0.35, quality:0.35, pref:0.15, quant:0.10, speed:0}` | 综合打分权重，可写对象或 `"tier=0.5,quality=0.3"` 字符串；分档与质量默认等权 |
 | `listen_host` | string | `0.0.0.0` | 监听地址 |
 | `listen_port` | int | `3000` | 监听端口（优先于 `TG_PORT`） |
 

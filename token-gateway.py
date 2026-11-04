@@ -16,6 +16,7 @@ import socketserver
 import urllib.request
 import urllib.error
 import json
+import math
 import os
 import re
 import itertools
@@ -70,13 +71,15 @@ _MODEL_REVERSE_ALIAS = {v: k for k, v in MODEL_ALIASES.items()}
 AUTO_MODEL_NAME = "auto"
 AUTO_ENABLED = os.environ.get("TG_AUTO_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
 # 分配策略：
-#   quality（默认）：按模型精度排序，优先用最强的模型（参数量 → 量化精度）。被占用时让位给
-#                    次优的空闲模型，而不是降级到弱模型
+#   balanced（默认）：先给请求分档（轻量/常规/深度），再把"分档适配"与"绝对质量"按**等权**
+#                    和其他因子（显式偏好/量化保真）加权求和选模型。短问答给小模型
+#                    （快、省），长上下文/工具调用上大模型。负载是硬约束（先排除繁忙者）
+#   quality：纯质量降序（参数量 → 量化精度），忽略请求体量，一律用最强模型
 #   least-busy：优先选网关侧 in-flight 最少的模型；全部繁忙时退化为"选负载最低者"，
 #               全部空闲时行为与 round-robin 完全一致
 #   round-robin：纯轮流，忽略负载与质量
 #   random：随机
-AUTO_STRATEGY = (os.environ.get("TG_AUTO_STRATEGY", "quality") or "quality").strip().lower()
+AUTO_STRATEGY = (os.environ.get("TG_AUTO_STRATEGY", "balanced") or "balanced").strip().lower()
 # 显式质量优先顺序（从高到低，逗号分隔）。列出的模型优先于任何启发式，未列出的按参数量排在后面。
 # 也可在 config.json 的 global.auto_quality（数组）里配置，两者会合并（env 在前）。允许写别名。
 AUTO_QUALITY = [m.strip() for m in os.environ.get("TG_AUTO_QUALITY", "").split(",") if m.strip()]
@@ -92,6 +95,82 @@ except (TypeError, ValueError):
     AUTO_BUSY_THRESHOLD = 1
 # 额外排除的模型（逗号分隔），与 config.json 的 global.deny_models / global.auto_exclude 叠加生效
 AUTO_EXCLUDE = {m.strip() for m in os.environ.get("TG_AUTO_EXCLUDE", "").split(",") if m.strip()}
+
+# ---- 分档优先（balanced 策略） ----
+# 把请求按"体量/复杂度"归为三档，每档有理想参数量：轻量档用 8B 级模型够用且快，
+# 常规档 30B 级均衡，深度档（长上下文/工具调用/带图）才上 122B 级。
+AUTO_TIER_ENABLED = os.environ.get("TG_AUTO_TIER", "1").strip().lower() not in ("0", "false", "no", "off")
+AUTO_TIER_NAMES = ("light", "standard", "deep")
+AUTO_TIER_LABELS = {"light": "轻量", "standard": "常规", "deep": "深度"}
+
+
+def _parse_float_list(raw, default: List[float]) -> List[float]:
+    """解析 '8,30,122' / [8, 30, 122] 为浮点列表；非法项忽略，空结果返回 default。"""
+    if isinstance(raw, (list, tuple)):
+        items = list(raw)
+    else:
+        items = str(raw or "").split(",")
+    out: List[float] = []
+    for x in items:
+        try:
+            v = float(str(x).strip())
+        except (TypeError, ValueError):
+            continue
+        if v > 0:
+            out.append(v)
+    return out or list(default)
+
+
+def _parse_weight_map(raw, default: Dict[str, float]) -> Dict[str, float]:
+    """解析权重：支持 dict 或 'tier=0.3,quality=0.3' 字符串；只覆盖已知键。"""
+    out = dict(default)
+    if not raw:
+        return out
+    if isinstance(raw, dict):
+        pairs = raw.items()
+    else:
+        pairs = []
+        for part in str(raw).split(","):
+            if "=" in part:
+                k, v = part.split("=", 1)
+                pairs.append((k, v))
+    for k, v in pairs:
+        key = str(k).strip().lower()
+        if key not in out:
+            continue
+        try:
+            w = float(v)
+        except (TypeError, ValueError):
+            continue
+        if w >= 0:
+            out[key] = w
+    return out
+
+
+# 各档理想参数量（B），可用 TG_AUTO_TIER_IDEALS / config global.auto_tier_ideals 覆盖
+AUTO_TIER_IDEALS = _parse_float_list(os.environ.get("TG_AUTO_TIER_IDEALS", ""), [8.0, 30.0, 122.0])
+# 分档阈值：短于 light 字符数视为轻量；长于 deep 字符数视为深度
+try:
+    AUTO_TIER_LIGHT_CHARS = max(1, int(os.environ.get("TG_AUTO_TIER_LIGHT_CHARS", "400")))
+except (TypeError, ValueError):
+    AUTO_TIER_LIGHT_CHARS = 400
+try:
+    AUTO_TIER_DEEP_CHARS = max(1, int(os.environ.get("TG_AUTO_TIER_DEEP_CHARS", "3000")))
+except (TypeError, ValueError):
+    AUTO_TIER_DEEP_CHARS = 3000
+# 综合打分权重（balanced）：
+#   tier    分档适配（prompt 规模 → 合适参数量）  默认 0.35
+#   quality 绝对质量（参数量/量化）                默认 0.35
+#   pref    显式优先表内排序                       默认 0.15
+#   quant   量化保真                               默认 0.10
+#   speed   速度收益（越小越快）                   默认 0（关闭）
+# 分档与质量默认严格等权：谁都不是隐含前提，最终按加权求和决定。
+# speed 默认关闭是因为它与 quality 是同一根轴的两端，同时开启会隐式稀释 quality 的权重；
+# 想走"速度优先"再手动把它调高即可。显式优先表为空时 pref 自动剔除，其余权重归一化。
+AUTO_WEIGHTS = _parse_weight_map(
+    os.environ.get("TG_AUTO_WEIGHTS", ""),
+    {"tier": 0.35, "quality": 0.35, "pref": 0.15, "quant": 0.10, "speed": 0.0},
+)
 
 
 # 网关侧「每模型在飞请求数」：只在经过本网关的请求上计数，用于 least-busy 选择。
@@ -1369,6 +1448,91 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
                 return True
         return bool(req.get("images") or req.get("image"))
 
+    # ---- 请求分档：轻量 / 常规 / 深度 ----
+    @staticmethod
+    def _auto_req_text_len(req: dict) -> int:
+        """请求文本总字符数（含 system/user/assistant 与多段 content 的 text 部分）。"""
+        if not isinstance(req, dict):
+            return 0
+        total = 0
+        for msg in req.get("messages", []) or []:
+            if not isinstance(msg, dict):
+                continue
+            content = msg.get("content")
+            if isinstance(content, str):
+                total += len(content)
+            elif isinstance(content, list):
+                for p in content:
+                    if isinstance(p, dict) and isinstance(p.get("text"), str):
+                        total += len(p["text"])
+        if isinstance(req.get("prompt"), str):
+            total += len(req["prompt"])
+        return total
+
+    def _auto_policy(self, cfg: dict) -> dict:
+        """读取分档/权重策略：env 默认值 + config.json global 覆盖（可运行时调整）。"""
+        g = cfg.get("global") or {}
+
+        tier_on = g.get("auto_tier", AUTO_TIER_ENABLED)
+        if isinstance(tier_on, str):
+            tier_on = tier_on.strip().lower() not in ("0", "false", "no", "off")
+        else:
+            tier_on = bool(tier_on)
+
+        ideals = _parse_float_list(g.get("auto_tier_ideals"), AUTO_TIER_IDEALS)
+        while len(ideals) < 3:  # 补足三档，避免下标越界
+            ideals.append(AUTO_TIER_IDEALS[len(ideals) % len(AUTO_TIER_IDEALS)])
+
+        def _int_opt(key: str, default: int) -> int:
+            try:
+                v = int(g.get(key) or default)
+            except (TypeError, ValueError):
+                return default
+            return v if v > 0 else default
+
+        return {
+            "tier": tier_on,
+            "ideals": ideals[:3],
+            "weights": _parse_weight_map(g.get("auto_weights"), AUTO_WEIGHTS),
+            "light_chars": _int_opt("auto_tier_light_chars", AUTO_TIER_LIGHT_CHARS),
+            "deep_chars": _int_opt("auto_tier_deep_chars", AUTO_TIER_DEEP_CHARS),
+        }
+
+    def _auto_req_tier(self, path: str, req: dict, policy: dict) -> Tuple[int, str]:
+        """给请求分档，返回 (0=轻量 | 1=常规 | 2=深度, 判定依据)。
+
+        深度信号（任一命中即深度）：带图、工具调用、长输入、要求长输出、多轮长会话。
+        轻量信号（全部满足）：短输入 + 短输出 + 轮次少。
+        两者都不满足归为常规档。
+        """
+        if not policy.get("tier", True):
+            return 1, "分档已关闭"
+        if path.endswith("/embeddings"):
+            return 1, "嵌入请求，不参与分档"
+        if not isinstance(req, dict):
+            return 1, "无请求体"
+
+        n_msgs = len(req.get("messages", []) or [])
+        chars = self._auto_req_text_len(req)
+        try:
+            max_tokens = int(req.get("max_tokens") or req.get("max_completion_tokens") or 0)
+        except (TypeError, ValueError):
+            max_tokens = 0
+
+        if self._auto_req_has_image(req):
+            return 2, "带图请求"
+        if req.get("tools") or req.get("functions"):
+            return 2, "工具调用"
+        if chars >= policy["deep_chars"]:
+            return 2, f"长输入 {chars} 字符"
+        if max_tokens >= 2048:
+            return 2, f"长输出 max_tokens={max_tokens}"
+        if n_msgs >= 8:
+            return 2, f"多轮会话 {n_msgs} 条消息"
+        if chars <= policy["light_chars"] and n_msgs <= 3 and (max_tokens == 0 or max_tokens <= 1024):
+            return 0, f"短问答 {chars} 字符"
+        return 1, f"{chars} 字符 / {n_msgs} 条消息"
+
     # ---- 质量排序：给候选算一个"精度分"，越大越优质 ----
     @staticmethod
     def _parse_size_to_b(s: str) -> Optional[float]:
@@ -1464,6 +1628,66 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         quant = info.get("quant") or ""
         return f"{pb:g}B" + (f" {quant}" if quant else "")
 
+    # ---- 分档适配与综合打分 ----
+    @staticmethod
+    def _auto_tier_fit(pb: Optional[float], tier: int, ideals: List[float]) -> float:
+        """模型参数量与该档"理想参数量"的贴合度，1.0 = 正好，0 = 差一个数量级以上。
+
+        在对数尺度上用高斯衰减：8B vs 122B 相差约 1.18 个数量级，单档 sigma 取
+        0.35（轻量，贴合更严格）/ 0.55（常规）/ 0.70（深度），保证跨档能拉开差距。
+        深度档只惩罚"偏小"，比理想值更大的模型同样算贴合（1.0）。
+        """
+        if not pb or pb <= 0:
+            return 0.35  # 参数量未知：给中性偏低分，避免它靠别的因子冒头
+        tier = max(0, min(2, int(tier)))
+        ideal = ideals[tier] if tier < len(ideals) else ideals[-1]
+        x, target = math.log10(pb), math.log10(max(1e-3, ideal))
+        d = (target - x) if tier == 2 else abs(x - target)
+        d = max(0.0, d)
+        sigma = (0.35, 0.55, 0.70)[tier]
+        return math.exp(-(d * d) / (2.0 * sigma * sigma))
+
+    def _auto_balanced_score(self, model: str, host: str, pb: Optional[float], tier: int,
+                             policy: dict, prio: List[str],
+                             ctx: dict) -> Tuple[float, str]:
+        """多维加权综合打分（0~1，越大越好），返回 (分数, 各因子明细)。
+
+        因子（默认权重见 AUTO_WEIGHTS）：
+          tier    分档适配：模型大小是否符合本档理想值（轻量档偏好小模型）   0.35
+          quality 绝对质量：候选池内参数量的对数位置（越大越强）             0.35
+          pref    显式偏好：config global.auto_quality 表内位置（越靠前越高）0.15
+          quant   量化保真：F32/BF16 > Q8 > Q6 > Q5 > Q4 > Q3/Q2            0.10
+          speed   速度收益：越小越快（默认 0，与 quality 同轴故不叠加）
+
+        **分档与质量等权**：两者各自独立打分、按权重求和，不存在"先按档位筛选再按质量选"的
+        硬顺序。权重全部可由 config global.auto_weights / TG_AUTO_WEIGHTS 调整。
+        未启用的因子（权重 0 或未配置偏好表）从分母中剔除，不会拉低分数。
+        """
+        fit = self._auto_tier_fit(pb, tier, policy["ideals"])
+
+        lo, hi = ctx.get("lo"), ctx.get("hi")
+        if not pb or pb <= 0 or lo is None or hi is None:
+            qual, speed = 0.35, 0.40
+        elif hi - lo < 1e-9:
+            qual, speed = 0.75, 0.75  # 候选只有一个尺寸：两个因子都给中性值
+        else:
+            qual = max(0.0, min(1.0, (math.log10(pb) - lo) / (hi - lo)))
+            speed = 1.0 - qual
+
+        quant = min(1.0, max(0.0, self._auto_quant_rank(model, host)) / 6.0)
+
+        factors = {"tier": fit, "quality": qual, "speed": speed, "quant": quant}
+        if prio:
+            factors["pref"] = (0.85 ** prio.index(model)) if model in prio else 0.0
+        weights = policy.get("weights") or AUTO_WEIGHTS
+        total_w = sum(max(0.0, weights.get(k, 0.0)) for k in factors)
+        if total_w <= 0:
+            total_w = float(len(factors)) or 1.0
+            weights = {k: 1.0 for k in factors}
+        score = sum(max(0.0, weights.get(k, 0.0)) * v for k, v in factors.items()) / total_w
+        detail = " ".join(f"{k}={v:.2f}" for k, v in factors.items() if weights.get(k, 0.0) > 0)
+        return max(0.0, min(1.0, score)), detail
+
     def _auto_candidates(self, path: str, req: dict, cfg: dict) -> Tuple[List[Tuple[str, str]], str]:
         """构造 auto 候选池，返回 ([(model, upstream_host)], 说明)。
 
@@ -1506,10 +1730,12 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
     def _auto_pick_model(self, path: str, req: dict, cfg: dict) -> Tuple[str, str, str]:
         """从候选池挑一个模型，返回 (model, upstream_host, 说明)；无候选时 model 为空串。
 
-        quality（默认）：按精度排序，取最优质的那个，不轮询、不随机。
-          - 多个候选空闲：直接取质量最高的，结果稳定可预期
-          - 最优质的被占用：让位给次优的空闲模型，而不是降级到弱模型
-          - 全部繁忙：在负载最低的候选里取质量最高者，避免直接 503
+        balanced（默认）：先给请求分档（轻量/常规/深度），再按多维综合打分择优。
+          - 短问答给 8B 级模型（快、省），长上下文/工具调用/带图才上大模型
+          - 显式优先表权重最高，其次分档适配与绝对质量，速度/量化用于细分
+          - 最贴合的模型被占用：让位给次优的空闲模型，而不是降级到弱模型
+          - 全部繁忙：在负载最低的候选里取综合分最高者，避免直接 503
+        quality：纯质量降序（tier → 参数量/表内位次 → 量化），忽略请求体量。
         least-busy：按网关侧 in-flight 过滤出空闲候选，在空闲集合内轮询。
         """
         cands, note = self._auto_candidates(path, req, cfg)
@@ -1522,26 +1748,66 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             model, host = cands[idx]
             return model, host, note
 
-        if AUTO_STRATEGY == "quality":
+        if AUTO_STRATEGY in ("balanced", "quality"):
             prio = self._auto_priority_list(cfg)
-            scored = [(m, h, self._auto_quality_key(m, h, prio)) for m, h in cands]
-            # 质量降序（tier → 参数/表内位次 → 量化），同分按模型名保证稳定
-            scored.sort(key=lambda x: (-x[2][0], -x[2][1], -x[2][2], x[0]))
-            loads = {m: model_inflight_get(m) for m, _, _ in scored}
-            idle = [x for x in scored if loads[x[0]] < AUTO_BUSY_THRESHOLD]
-            busy = [x for x in scored if loads[x[0]] >= AUTO_BUSY_THRESHOLD]
+            # 显式优先表是"用户指定的强偏好"：表内模型只要在候选池里，就只在表内挑，
+            # 避免被分档/质量分反超；表内模型全部不可用时才回落到全量候选。
+            if prio:
+                in_prio = [(m, h) for m, h in cands if m in prio]
+                if in_prio:
+                    cands = in_prio
+                    note += f"；命中显式优先表（{len(in_prio)} 个候选）"
+            policy = self._auto_policy(cfg)
+            tier, tier_why = self._auto_req_tier(path, req, policy)
+            self._auto_tier_label = AUTO_TIER_NAMES[tier]
+            loads = {m: model_inflight_get(m) for m, _ in cands}
+
+            entries = []
+            if AUTO_STRATEGY == "balanced":
+                sizes = [self._auto_param_b(m, h) for m, h in cands]
+                logs = [math.log10(s) for s in sizes if s and s > 0]
+                ctx = {"lo": min(logs) if logs else None, "hi": max(logs) if logs else None}
+                for (m, h), pb in zip(cands, sizes):
+                    score, brk = self._auto_balanced_score(m, h, pb, tier, policy, prio, ctx)
+                    entries.append({"m": m, "h": h, "score": score, "desc": brk})
+                entries.sort(key=lambda e: (-e["score"], e["m"]))
+            else:
+                for m, h in cands:
+                    entries.append({"m": m, "h": h,
+                                    "rank": self._auto_quality_key(m, h, prio),
+                                    "desc": self._auto_quality_desc(m, h, prio)})
+                entries.sort(key=lambda e: (-e["rank"][0], -e["rank"][1], -e["rank"][2], e["m"]))
+
+            idle = [e for e in entries if loads[e["m"]] < AUTO_BUSY_THRESHOLD]
+            busy = [e for e in entries if loads[e["m"]] >= AUTO_BUSY_THRESHOLD]
             if busy:
-                busy_desc = ", ".join(f"{m}({loads[m]})" for m, _, _ in busy)
+                busy_desc = ", ".join(f"{e['m']}({loads[e['m']]})" for e in busy)
                 note += f"；跳过 {len(busy)} 个繁忙候选: {busy_desc}"
+
+            if policy.get("tier"):
+                tag = f"分档 {AUTO_TIER_LABELS.get(AUTO_TIER_NAMES[tier], tier_why)}（{tier_why}）"
+            else:
+                tag = tier_why
+
             if idle:
-                m, h, _ = idle[0]
-                note += f"；质量优先 {self._auto_quality_desc(m, h, prio)}"
-                return m, h, note
-            lowest = min(loads[m] for m, _, _ in scored)
-            pick = [x for x in scored if loads[x[0]] == lowest][0]
-            note += (f"；全部候选繁忙，在最低负载 {lowest} 中取质量最高者 "
-                     f"{self._auto_quality_desc(pick[0], pick[1], prio)}")
-            return pick[0], pick[1], note
+                pick = idle[0]
+                if AUTO_STRATEGY == "balanced":
+                    note += (f"；{tag} 综合 {pick['score']:.3f} 择优 "
+                             f"{self._auto_quality_desc(pick['m'], pick['h'], prio)}"
+                             f"（{pick['desc']}）")
+                else:
+                    note += f"；{tag}；质量优先 {pick['desc']}"
+                return pick["m"], pick["h"], note
+
+            lowest = min(loads[e["m"]] for e in entries)
+            pick = [e for e in entries if loads[e["m"]] == lowest][0]
+            if AUTO_STRATEGY == "balanced":
+                note += (f"；全部候选繁忙，在最低负载 {lowest} 中取综合分最高者 "
+                         f"{self._auto_quality_desc(pick['m'], pick['h'], prio)}"
+                         f"（{pick['score']:.3f}）")
+            else:
+                note += f"；全部候选繁忙，在最低负载 {lowest} 中取质量最高者 {pick['desc']}"
+            return pick["m"], pick["h"], note
 
         pool = cands
         if AUTO_STRATEGY == "least-busy":
@@ -1837,6 +2103,7 @@ iframe{{padding-top:0}}
     def do_POST(self):
         global active_concurrency
         self._auto_resolved = None  # 每个请求重置，避免 keep-alive 复用 handler 时残留上次的 auto 结果
+        self._auto_tier_label = ""  # 同上：本次 auto 选择使用的请求分档（light/standard/deep）
         self._normalize_path()
         path = self.path.split("?", 1)[0]
 
@@ -2232,6 +2499,9 @@ iframe{{padding-top:0}}
                 _auto_hit = getattr(self, "_auto_resolved", None)
                 if _auto_hit:
                     self.send_header("X-Gateway-Model", _auto_hit)
+                    _tier = getattr(self, "_auto_tier_label", "")
+                    if _tier:
+                        self.send_header("X-Gateway-Auto-Tier", _tier)
 
                 self.end_headers()
 
