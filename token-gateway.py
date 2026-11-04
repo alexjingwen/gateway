@@ -17,6 +17,7 @@ import urllib.request
 import urllib.error
 import json
 import os
+import re
 import itertools
 import sys
 import time
@@ -69,11 +70,21 @@ _MODEL_REVERSE_ALIAS = {v: k for k, v in MODEL_ALIASES.items()}
 AUTO_MODEL_NAME = "auto"
 AUTO_ENABLED = os.environ.get("TG_AUTO_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
 # 分配策略：
-#   least-busy（默认）：优先选网关侧 in-flight 最少的模型；全部繁忙时退化为"选负载最低者"，
-#                       全部空闲时行为与 round-robin 完全一致（不改变原有分配观感）
-#   round-robin：纯轮流，忽略负载
+#   quality（默认）：按模型精度排序，优先用最强的模型（参数量 → 量化精度）。被占用时让位给
+#                    次优的空闲模型，而不是降级到弱模型
+#   least-busy：优先选网关侧 in-flight 最少的模型；全部繁忙时退化为"选负载最低者"，
+#               全部空闲时行为与 round-robin 完全一致
+#   round-robin：纯轮流，忽略负载与质量
 #   random：随机
-AUTO_STRATEGY = (os.environ.get("TG_AUTO_STRATEGY", "least-busy") or "least-busy").strip().lower()
+AUTO_STRATEGY = (os.environ.get("TG_AUTO_STRATEGY", "quality") or "quality").strip().lower()
+# 显式质量优先顺序（从高到低，逗号分隔）。列出的模型优先于任何启发式，未列出的按参数量排在后面。
+# 也可在 config.json 的 global.auto_quality（数组）里配置，两者会合并（env 在前）。允许写别名。
+AUTO_QUALITY = [m.strip() for m in os.environ.get("TG_AUTO_QUALITY", "").split(",") if m.strip()]
+# 量化精度档位（同参数量时的次级排序，值越大越精确）
+AUTO_QUANT_RANK = (
+    ("F32", 6), ("BF16", 5), ("FP16", 5), ("F16", 5),
+    ("Q8", 4), ("Q6", 3), ("Q5", 2), ("Q4", 1), ("Q3", 0), ("Q2", 0), ("IQ", 0),
+)
 # 繁忙阈值：某模型在飞请求数 >= 此值即视为繁忙，least-busy 会跳过它（默认 1 = 已经有人用就换）
 try:
     AUTO_BUSY_THRESHOLD = max(1, int(os.environ.get("TG_AUTO_BUSY_THRESHOLD", "1")))
@@ -1245,14 +1256,34 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
     # 多上游模型列表缓存（30 秒）
     _ollama_models_cache = {"ts": 0.0, "models": set()}
     _rapid_mlx_models_cache = {"ts": 0.0, "models": {}}  # {model_id: host}
+    # ollama 模型元数据（parameter_size / quantization_level），供 auto 质量排序使用
+    _ollama_meta_cache = {"ts": 0.0, "meta": {}}
     _models_cache_lock = threading.Lock()
 
     def _fetch_ollama_models(self) -> set:
+        """拉取 ollama 模型名集合；顺带缓存 details（参数量/量化）供 auto 质量排序使用。"""
         try:
             r = urllib.request.urlopen(f"{OLLAMA_HOST}/api/tags", timeout=3)
             if r.status == 200:
                 data = json.loads(r.read())
-                return {m["name"] for m in data.get("models", [])}
+                models = set()
+                meta = {}
+                for m in data.get("models", []):
+                    name = m.get("name")
+                    if not name:
+                        continue
+                    models.add(name)
+                    det = m.get("details") or {}
+                    meta[name] = {
+                        "param": det.get("parameter_size") or "",
+                        "quant": det.get("quantization_level") or "",
+                        "family": det.get("family") or "",
+                        "size_gb": round((m.get("size") or 0) / 1e9, 2),
+                    }
+                if meta:
+                    self._ollama_meta_cache["meta"] = meta
+                    self._ollama_meta_cache["ts"] = time.time()
+                return models
         except Exception:
             pass
         return set()
@@ -1338,6 +1369,101 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
                 return True
         return bool(req.get("images") or req.get("image"))
 
+    # ---- 质量排序：给候选算一个"精度分"，越大越优质 ----
+    @staticmethod
+    def _parse_size_to_b(s: str) -> Optional[float]:
+        """把 '8.0B' / '137M' / '1.2T' 解析成以 B 为单位的浮点数。"""
+        if not s:
+            return None
+        m = re.match(r"^(\d+(?:\.\d+)?)\s*([KMBT])?$", str(s).strip().upper())
+        if not m:
+            return None
+        unit = m.group(2) or "B"
+        return float(m.group(1)) * {"K": 1e-6, "M": 1e-3, "B": 1.0, "T": 1e3}[unit]
+
+    @staticmethod
+    def _param_b_from_name(model: str) -> Optional[float]:
+        """从模型名解析参数量（B），取最大的一处。
+
+        取最大值可把 'Qwen3.5-122B-A10B' 定位到总参 122B，而 'A10B'（激活参数）
+        因前面紧邻字母被负向前瞻排除，不会误判成 10B。
+        """
+        best = None
+        for m in re.finditer(r"(?<![A-Za-z0-9.])(\d+(?:\.\d+)?)\s*[Bb](?![A-Za-z])", model):
+            try:
+                v = float(m.group(1))
+            except ValueError:
+                continue
+            if best is None or v > best:
+                best = v
+        return best
+
+    def _auto_param_b(self, model: str, host: str) -> Optional[float]:
+        """模型参数量（B）：优先用上游元数据，其次从名字推断。"""
+        if host == OLLAMA_HOST:
+            info = (self._ollama_meta_cache.get("meta") or {}).get(model)
+            if info:
+                v = self._parse_size_to_b(info.get("param", ""))
+                if v is not None:
+                    return v
+        return self._param_b_from_name(model)
+
+    def _auto_quant_rank(self, model: str, host: str) -> int:
+        """量化精度档位（越大越精确），参数量相同时用它做次级排序。"""
+        q = ""
+        if host == OLLAMA_HOST:
+            info = (self._ollama_meta_cache.get("meta") or {}).get(model)
+            if info:
+                q = (info.get("quant") or "").upper()
+        if not q:
+            q = model.upper()
+        for token, rank in AUTO_QUANT_RANK:
+            if token in q:
+                return rank
+        return 1  # 未知按 Q4 档处理
+
+    def _auto_priority_list(self, cfg: dict) -> List[str]:
+        """显式质量优先顺序（高→低）：env TG_AUTO_QUALITY 在前，config global.auto_quality 在后。"""
+        raw: List[str] = list(AUTO_QUALITY)
+        cfg_list = (cfg.get("global") or {}).get("auto_quality") or []
+        if isinstance(cfg_list, str):
+            cfg_list = [x.strip() for x in cfg_list.split(",")]
+        for x in cfg_list:
+            if isinstance(x, str) and x.strip():
+                raw.append(x.strip())
+        out: List[str] = []
+        for m in raw:
+            real = MODEL_ALIASES.get(m, m)  # 允许用别名书写
+            if real not in out:
+                out.append(real)
+        return out
+
+    def _auto_quality_key(self, model: str, host: str, prio: List[str]) -> Tuple[int, float, int]:
+        """(tier, rank, quant)，降序排序即"越优质越靠前"。
+
+        tier 2 = 在显式优先表内（rank 越大越靠前）
+        tier 1 = 有参数量（rank = 参数量 B）
+        tier 0 = 参数量未知，排最后（同 tier 再比量化）
+        """
+        quant = self._auto_quant_rank(model, host)
+        if model in prio:
+            return (2, float(len(prio) - prio.index(model)), quant)
+        pb = self._auto_param_b(model, host)
+        if pb is not None:
+            return (1, pb, quant)
+        return (0, 0.0, quant)
+
+    def _auto_quality_desc(self, model: str, host: str, prio: List[str]) -> str:
+        """人类可读的选择理由，写进日志。"""
+        if model in prio:
+            return f"显式优先 #{prio.index(model) + 1}"
+        pb = self._auto_param_b(model, host)
+        if pb is None:
+            return "参数量未知"
+        info = (self._ollama_meta_cache.get("meta") or {}).get(model) or {}
+        quant = info.get("quant") or ""
+        return f"{pb:g}B" + (f" {quant}" if quant else "")
+
     def _auto_candidates(self, path: str, req: dict, cfg: dict) -> Tuple[List[Tuple[str, str]], str]:
         """构造 auto 候选池，返回 ([(model, upstream_host)], 说明)。
 
@@ -1380,10 +1506,11 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
     def _auto_pick_model(self, path: str, req: dict, cfg: dict) -> Tuple[str, str, str]:
         """从候选池挑一个模型，返回 (model, upstream_host, 说明)；无候选时 model 为空串。
 
-        least-busy 策略：按网关侧 in-flight 过滤出空闲候选，在空闲集合内轮询。
-        - 有空闲：跳过繁忙候选（说明里标注跳过了几个）
-        - 全繁忙：退化为"选负载最低者"，避免直接 503
-        - 全空闲：等价于 round-robin，不改变原有观感
+        quality（默认）：按精度排序，取最优质的那个，不轮询、不随机。
+          - 多个候选空闲：直接取质量最高的，结果稳定可预期
+          - 最优质的被占用：让位给次优的空闲模型，而不是降级到弱模型
+          - 全部繁忙：在负载最低的候选里取质量最高者，避免直接 503
+        least-busy：按网关侧 in-flight 过滤出空闲候选，在空闲集合内轮询。
         """
         cands, note = self._auto_candidates(path, req, cfg)
         if not cands:
@@ -1394,6 +1521,27 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             idx = random.randrange(len(cands))
             model, host = cands[idx]
             return model, host, note
+
+        if AUTO_STRATEGY == "quality":
+            prio = self._auto_priority_list(cfg)
+            scored = [(m, h, self._auto_quality_key(m, h, prio)) for m, h in cands]
+            # 质量降序（tier → 参数/表内位次 → 量化），同分按模型名保证稳定
+            scored.sort(key=lambda x: (-x[2][0], -x[2][1], -x[2][2], x[0]))
+            loads = {m: model_inflight_get(m) for m, _, _ in scored}
+            idle = [x for x in scored if loads[x[0]] < AUTO_BUSY_THRESHOLD]
+            busy = [x for x in scored if loads[x[0]] >= AUTO_BUSY_THRESHOLD]
+            if busy:
+                busy_desc = ", ".join(f"{m}({loads[m]})" for m, _, _ in busy)
+                note += f"；跳过 {len(busy)} 个繁忙候选: {busy_desc}"
+            if idle:
+                m, h, _ = idle[0]
+                note += f"；质量优先 {self._auto_quality_desc(m, h, prio)}"
+                return m, h, note
+            lowest = min(loads[m] for m, _, _ in scored)
+            pick = [x for x in scored if loads[x[0]] == lowest][0]
+            note += (f"；全部候选繁忙，在最低负载 {lowest} 中取质量最高者 "
+                     f"{self._auto_quality_desc(pick[0], pick[1], prio)}")
+            return pick[0], pick[1], note
 
         pool = cands
         if AUTO_STRATEGY == "least-busy":

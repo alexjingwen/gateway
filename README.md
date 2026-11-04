@@ -3,7 +3,7 @@
 `gateway` 是一个**单文件、纯 Python 标准库**实现的 OpenAI 兼容 token 网关，面向**本地局域网 / Tailscale 内网**使用：统一代理 Ollama 与 Rapid-MLX 上游，做 per-key 配额 / QPS / 限流，并提供 Web 管理台与 `/api/admin/*` 管理接口。附带 `mem-guard.mjs` 设备内存守卫。
 
 - **服务端**：`token-gateway.py`（无第三方依赖，Python 3.10+）
-- **auto 虚拟模型**：客户端把 `model` 设为 `auto`，由网关自动从本地模型池分配，免去手动切换（详见 [auto 虚拟模型](#auto-虚拟模型自动分配)）
+- **auto 虚拟模型**：客户端把 `model` 设为 `auto`，由网关按**模型精度**从本地池里挑最强的那个（被占用时自动让位给次优），免去手动切换（详见 [auto 虚拟模型](#auto-虚拟模型自动分配)）
 - **配置样例**：`config.example.json`（真实 `config.json` 含密钥，被 `.gitignore` 排除）
 - **运维工具**：`mem-guard.mjs` + `com.user.memguard.plist`
 - **推送工具**：`tools/push-via-api.py`（Git Data API，绕过被拦的 `github.com:443`）
@@ -66,7 +66,8 @@ TG_DISABLE_HTTPS=1 TG_PORT=3000 python3 token-gateway.py
 | TG_MLX_VLM_API_KEY | sk-test | 访问 VLM 上游所需的 key |
 | TG_MODEL_ALIASES | (空) | 模型别名，如 qwen3.5-122b=mlx-community/Qwen3.5-122B-A10B-4bit |
 | TG_AUTO_ENABLED | 1 | `auto` 虚拟模型开关；设 0/false/no/off 关闭 |
-| TG_AUTO_STRATEGY | least-busy | `auto` 分配策略：`least-busy`（默认，繁忙规避）\| `round-robin` \| `random` |
+| TG_AUTO_STRATEGY | quality | `auto` 分配策略：`quality`（默认，按精度选最强）\| `least-busy`（繁忙规避轮询）\| `round-robin` \| `random` |
+| TG_AUTO_QUALITY | (空) | 显式质量优先顺序（逗号分隔，从高到低），覆盖参数量启发式；允许写别名 |
 | TG_AUTO_BUSY_THRESHOLD | 1 | 繁忙阈值：在飞请求数 ≥ 此值即跳过该模型（默认 1 = 有人正在用就换） |
 | TG_AUTO_EXCLUDE | (空) | `auto` 额外排除的模型（逗号分隔，叠加在 `deny_models` 与 `global.auto_exclude` 之上） |
 | TG_QPS | 5 | 每 key 每秒请求数 |
@@ -136,11 +137,39 @@ tail -f /tmp/token-gateway.log
 
 | 策略 | 行为 |
 |---|---|
-| `least-busy`（默认） | 先按网关侧在飞请求数筛出**空闲**候选，在空闲集合内轮询；全部繁忙时退化为「选负载最低者」，不会直接失败。全部空闲时与 `round-robin` 完全一致 |
-| `round-robin` | 忽略负载，纯轮流（候选按模型名排序，顺序可复现） |
+| `quality`（默认） | 按**模型精度**排序，**每次都用当前最强的模型**，不轮询、不随机，结果稳定可预期；最优质的被占用时让位给次优的空闲模型 |
+| `least-busy` | 先按网关侧在飞请求数筛出**空闲**候选，在空闲集合内轮询；全部繁忙时退化为「选负载最低者」，不会直接失败 |
+| `round-robin` | 忽略负载与质量，纯轮流（候选按模型名排序，顺序可复现） |
 | `random` | 随机挑选 |
 
 繁忙判定基于**网关侧每模型的在飞请求数**（`TG_AUTO_BUSY_THRESHOLD`，默认 1）。含义是「已经有一个请求在使用该模型，就先换一个」，避免多个请求挤在同一模型上排队。这个计数只统计经过本网关的请求——**外部客户端直连上游（例如直接请求 `:11434`）造成的占用，网关无法感知**。
+
+#### 质量排序规则（`quality` 策略）
+
+评分按三级比较，越靠前越优先：
+
+| 优先级 | 依据 | 说明 |
+|---|---|---|
+| 1 | **显式优先表** | `global.auto_quality` / `TG_AUTO_QUALITY` 列出的模型按列表顺序优先，可覆盖任何启发式 |
+| 2 | **参数量** | 优先取上游元数据（Ollama `/api/tags` 的 `details.parameter_size`，如 `8.0B`）；取不到时从模型名解析（`122B`）。名字里 `A10B` 这类**激活参数**会被忽略，只认总参 |
+| 3 | **量化精度** | 参数量相同时比较量化档位：`F32 > BF16/F16 > Q8 > Q6 > Q5 > Q4 > Q3/Q2` |
+
+选择逻辑：
+
+1. 候选按上述三项**降序**排序；
+2. 跳过在飞请求数 ≥ `TG_AUTO_BUSY_THRESHOLD` 的模型；
+3. 取剩余里的**第一个**，即最强的空闲模型；
+4. 全部繁忙时，在**负载最低**的候选里取质量最高者——不会因为繁忙直接返回 503，也不会无脑降级到最弱模型。
+
+如果你认为参数量不能代表实际效果，可以直接指定顺序（别名会被自动展开）：
+
+```json
+{
+  "global": {
+    "auto_quality": ["qwen3.5-122b", "gemma4:latest", "qwen2.5vl:3b"]
+  }
+}
+```
 
 **如何确认选中了谁**：
 - 响应头 **`X-Gateway-Model: <真实模型名>`**
@@ -152,12 +181,12 @@ tail -f /tmp/token-gateway.log
 curl -s http://localhost:3000/v1/chat/completions -D - \
   -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
   -d '{"model":"auto","messages":[{"role":"user","content":"你好"}],"stream":false}'
-# 响应头会带：X-Gateway-Model: gemma4:latest
+# 响应头会带：X-Gateway-Model: <实际选中的最强模型>
 ```
 
 **注意**
-- `auto` 每次请求独立挑选，**同一会话的连续请求可能落到不同模型**。上下文不会跨模型保持（客户端本来就会带全量 `messages`，功能上不受影响），但输出风格与能力可能变化。需要稳定输出时请显式指定模型。
-- `least-busy` 的「繁忙」是**网关视角**的并发，不是上游的真实队列深度。若某模型被外部进程占满，网关仍会把它当作空闲模型选中，此时表现为该请求变慢而非被跳过。
+- 默认 `quality` 策略下，**同一条件下的连续请求会稳定命中同一个模型**（不会一会儿一个）。只有在最强模型被占用、或请求能力不同（带图 / embeddings）时才会切换，切换原因会写进服务日志。需要绝对固定的输出风格时，仍建议显式指定模型。
+- 「繁忙」是**网关视角**的并发，不是上游的真实队列深度。若某模型被外部进程占满，网关仍会把它当作空闲模型选中，此时表现为该请求变慢而非被跳过。想更保守，可把 `TG_AUTO_BUSY_THRESHOLD` 调大。
 - 被 `auto_exclude` 排除的模型**不会**从 `/v1/models` 或管理台消失——它们仍然可用，只是 `auto` 不再分配。这样既避免 `auto` 命中不合适的模型，又不影响显式调用。
 - `auto` 只出现在 `/v1/models`，且排在列表**末尾**——不改变「客户端默认取第一个模型」的既有行为；`/api/tags`（Ollama 兼容端点）不含 `auto`。
 - Web 管理台的「模型管理」页会额外显示一条 `auto`（紫色 `🎲 auto` 徽章、大小显示为 `—`），它来自 `/api/admin/models` 的虚拟条目，**不可拉取、不可删除**。
@@ -313,6 +342,7 @@ curl -X POST http://127.0.0.1:3000/api/admin/keys -H "X-Admin-Token: $ADMIN_TOKE
 | `allow_models` | string[] | `["*"]` | 允许的模型；`*` = 全部 |
 | `deny_models` | string[] | `[]` | 拒绝的模型（全局生效，显式调用也 403） |
 | `auto_exclude` | string[] | `[]` | 仅从 `auto` 候选池排除；不影响显式调用（需重启或 admin 操作后重载生效） |
+| `auto_quality` | string[] | `[]` | `auto` 的显式质量优先顺序（从高到低），覆盖参数量启发式；允许写别名（需重启生效） |
 | `listen_host` | string | `0.0.0.0` | 监听地址 |
 | `listen_port` | int | `3000` | 监听端口（优先于 `TG_PORT`） |
 
