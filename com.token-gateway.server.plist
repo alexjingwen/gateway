@@ -26,10 +26,14 @@
 		<string>5</string>
 		<key>TG_CONCURRENCY</key>
 		<string>10</string>
+		<!-- 单次静默预算：5 万 token 上下文预填充本身就要 100~150s，240 会把长上下文误判超时 -->
 		<key>TG_READ_TIMEOUT</key>
-		<string>240</string>
+		<string>600</string>
 		<key>TG_VLM_READ_TIMEOUT</key>
 		<string>150</string>
+		<!-- 非流式先缓冲完整响应再发送：上游失败时能返回真实 5xx 与 Content-Length，而不是截断的 200 -->
+		<key>TG_BUFFER_NONSTREAM</key>
+		<string>1</string>
 	</dict>
 	<key>KeepAlive</key>
 	<true/>

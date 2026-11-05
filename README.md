@@ -21,6 +21,7 @@
 - [mem-guard.mjs —— 设备级内存守卫](#mem-guardmjs--设备级内存守卫)
 - [故障排查 / 常见问题](#故障排查--常见问题)
 - [运维细节（日志 / 权限 / 轮转）](#运维细节日志--权限--轮转)
+- [自测 / Tests](#自测--tests)
 - [变更记录](#变更记录)
 - [推送到 GitHub](#推送到-github)
 - [仓库来源 / Provenance](#仓库来源--provenance)
@@ -806,6 +807,25 @@ APC self-check ok mode=exact schema=v1 layers=48 ...
 # 判读：若"完全相同"那次仍接近冷启动耗时，说明 APC 未生效，
 # 先确认运行中的进程真的拿到了 APC_ENABLED
 ```
+
+## 自测 / Tests
+
+`tests/` 下是**自包含**回归用例：每个脚本自己在临时端口起一个真实网关实例（独立 config 与日志目录），并配一个本地 stub 上游，**不碰线上实例、不加载任何真实模型**。
+
+```bash
+python3 tests/test_ctx_trunc.py    # 超出上下文窗口被截短时不得 500（4 项）
+python3 tests/test_timeout.py      # 静默预算 / 缓冲发送 / 504·502 语义 / 流式错误事件（27 项）
+```
+
+两者都可通过环境变量改指向：
+
+| 变量 | 作用 |
+|---|---|
+| `TG_SRC` | 被测网关文件，默认仓库根的 `token-gateway.py` |
+| `TG_PY` | 启动网关用的解释器，默认当前解释器 |
+| `TG_SRC_OLD` | 仅 `test_ctx_trunc.py`：给出旧版本文件时，额外跑「旧代码必返回 500 + 日志含 `KeyError`」的对照断言 |
+
+> `test_timeout.py` 把静默预算压到 8s（生产 600s）以便快速跑完，断言针对**语义**而非具体秒数；`test_ctx_trunc.py` 会构造约 24 万字符的请求，单次约 10s。
 
 ## 变更记录
 
