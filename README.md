@@ -811,6 +811,7 @@ APC self-check ok mode=exact schema=v1 layers=48 ...
 
 | 日期 | 提交 | 内容 |
 |---|---|---|
+| 2026-11-05 | `21d14d3b` | **修复 `500 internal_error`（`KeyError: 'max_tokens'`）**：122B 上游属 VLM 组 → `TG_MIN_MAX_TOKENS` 对其实效为 0 → 网关不补写 `max_tokens`；客户端也未传；超上下文窗口进入"截短历史"分支时日志无条件下标读取该键即崩。改为统一用局部变量、加类型兜底，并让兜底异常记录完整堆栈 |
 | 2026-11-05 | `4902de3e` | **上游开启 APC（prefix cache）**：mlx_vlm 的 `APC_ENABLED` 默认 0，导致 agent 每轮重发 6 万上下文全量 prefill（实测 62,105 P / 67 C 耗时 247.8s）；开启后 29.7k 上下文相同前缀 14.3s → 0.29s、追加一轮 0.50s。README 新增「上游加速」章节，并修正 launchd EIO 误报的处理方式 |
 | 2026-11-05 | `17c183d0` | **长上下文不再"被取消"**：`TG_READ_TIMEOUT` 明确为单次静默预算；非流式改为缓冲后发送并带 `Content-Length`；超时返回 504 `upstream_timeout`、断流/未收全返回 502 `upstream_broken`；超时不重试；新增 `TG_BUFFER_NONSTREAM`；修复 auto 繁忙计数释放时机（上游读完即释放，避免误判繁忙跳到弱模型） |
 | 2026-11-04 | `319fcbdf` | **auto 新增 `balanced` 策略并设为默认**：请求分档（light/standard/deep）+ 分档与质量**等权**加权（tier 0.35 / quality 0.35 / pref 0.15 / quant 0.10）；新增 `X-Gateway-Auto-Tier` 响应头与 `auto_weights`、`auto_tier_ideals`、`auto_tier_light_chars`、`auto_tier_deep_chars` 配置 |
