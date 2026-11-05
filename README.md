@@ -350,6 +350,7 @@ curl http://127.0.0.1:3000/v1/embeddings \
 | 404 | `key_not_found` | 删除 key 时无匹配 |
 | **504** | `upstream_timeout` | 上游在静默预算（`TG_READ_TIMEOUT`）内没返回任何字节 |
 | **502** | `upstream_broken` | 上游中途断连，或声明了 `Content-Length` 却没发全 |
+| **500** | `internal_error` | 网关内部未捕获异常；日志会带完整堆栈（`❌ do_POST 未捕获异常`） |
 
 > 响应头会暴露用量（CORS `Expose-Headers`）：`X-Token-Usage`、`X-Quota-Remaining`、`X-RateLimit-Limit`。
 
@@ -631,6 +632,7 @@ launchctl unload ~/Library/LaunchAgents/com.user.memguard.plist
 | 响应头到了、正文迟迟不来 | 非流式请求在等上游完整生成（缓冲模式），属预期 | 看日志 `⏱️ 上游超时` 与 `📊 ... 用时`；对首字节敏感可设 `TG_BUFFER_NONSTREAM=0` |
 | `504 upstream_timeout` | 上游在静默预算内没给任何字节 | 重试；或换更小的模型 / 缩短上下文；确认 122B 未被其他客户端占满 |
 | `502 upstream_broken` | 上游中途断连或声明了 `Content-Length` 却没收全 | 看 `⚠️ 读取上游响应中断` 后的具体异常；通常是上游 OOM 或进程重启 |
+| `500 internal_error`（日志 `KeyError: 'max_tokens'`） | 请求超过上下文窗口、走"截短历史"分支时，客户端未传 `max_tokens`，旧版日志语句直接下标读取该字段 | 已在 2026-11-05 修复（改用局部变量）。确认版本 ≥ `144dbf9a`；升级后同样场景返回 200 并在日志留下 `✂️ 截短历史消息` |
 
 ### auto 分配相关
 | 现象 | 可能原因 | 排查 / 处理 |

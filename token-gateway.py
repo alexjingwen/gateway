@@ -23,6 +23,7 @@ import re
 import itertools
 import sys
 import time
+import traceback
 import threading
 import socket
 import select
@@ -2229,7 +2230,10 @@ iframe{{padding-top:0}}
                         body_bytes=body_bytes, original_req=req, model=model)
         except Exception as e:
             # 兜底：所有未预期异常都不应让并发计数泄漏
-            log(f"❌ do_POST 未捕获异常: {type(e).__name__}: {e}")
+            # 记录完整堆栈：仅打 type+message 时（如 KeyError: 'max_tokens'）无法定位到行号，
+            # 曾因此多花一轮排查。堆栈只写本地日志，不返回给客户端。
+            log(f"❌ do_POST 未捕获异常: {type(e).__name__}: {e}\n"
+                f"{traceback.format_exc()}")
             try:
                 self._send_error(500, "internal_error", "服务器内部错误")
             except Exception:
@@ -2313,7 +2317,14 @@ iframe{{padding-top:0}}
         if upstream_host in RAPID_MLX_HOSTS and original_req and self.path.startswith("/v1/chat"):
             _cw = _MODEL_CONTEXT_WINDOWS.get(model, _MODEL_CONTEXT_WINDOWS.get("*", 262144))
             _msgs = original_req.get("messages", [])
-            _max_tokens = original_req.get("max_tokens", 4096)
+            # 统一用局部变量 `_max_tokens` 表示"本次实际生效的输出上限"。
+            # 早期版本在下述几处日志里直接读 original_req['max_tokens']，一旦客户端未传该
+            # 字段（IDE 类客户端常见）且本轮又没有写过它，就会抛 KeyError: 'max_tokens'
+            # ——表现为 500 internal_error。此处同时做类型兜底，避免字符串型值参与比较。
+            try:
+                _max_tokens = int(original_req.get("max_tokens") or 4096)
+            except (TypeError, ValueError):
+                _max_tokens = 4096
             # 强制最小 max_tokens，防止 dsh 等客户端发送过小的 max_tokens 导致回复被截断。
             # 可用 TG_MIN_MAX_TOKENS 覆盖；**VLM 上游（多模态）一律不强制** ——
             # 视觉调用要的是"短结构化输出 + 低延迟"，把 200 抬到 32768 会让模型长篇胡写，
@@ -2342,28 +2353,30 @@ iframe{{padding-top:0}}
 
             # 硬限制: max_tokens 绝不能超过 _hard_max
             if _max_tokens > _hard_max:
-                original_req["max_tokens"] = int(_hard_max)
+                _max_tokens = int(_hard_max)
+                original_req["max_tokens"] = _max_tokens
                 _truncated = True
-                log(f"✂️  max_tokens 硬限制: {_max_tokens} → {original_req['max_tokens']} (context={_cw}, 硬上限={_hard_max}) → {client_ip}")
-                _max_tokens = original_req["max_tokens"]
+                log(f"✂️  max_tokens 硬限制 → {_max_tokens} (context={_cw}, 硬上限={_hard_max}) → {client_ip}")
 
             _total_est = _prompt_tokens + _max_tokens
             if _total_est > _cw - _safety:
                 _room = _cw - _prompt_tokens - _safety
                 if _room > 1024:
                     if _max_tokens > _room:
-                        original_req["max_tokens"] = max(512, int(_room))
+                        _max_tokens = max(512, int(_room))
+                        original_req["max_tokens"] = _max_tokens
                         _truncated = True
-                        log(f"✂️  自动降 max_tokens: {_max_tokens} → {original_req['max_tokens']} (prompt~{int(_prompt_tokens)}, context={_cw}) → {client_ip}")
+                        log(f"✂️  自动降 max_tokens → {_max_tokens} (prompt~{int(_prompt_tokens)}, context={_cw}) → {client_ip}")
                 else:
                     while len(_msgs) > 2 and _prompt_tokens + _safety > _cw:
                         _rm = _msgs.pop(1)
                         _prompt_tokens -= _est_msg_tokens(_rm)
                         _truncated = True
                     if _prompt_tokens + _max_tokens > _cw - _safety:
-                        original_req["max_tokens"] = max(256, int(_cw - _prompt_tokens - _safety))
+                        _max_tokens = max(256, int(_cw - _prompt_tokens - _safety))
+                        original_req["max_tokens"] = _max_tokens
                     if _truncated:
-                        log(f"✂️  截短历史消息 + 降 max_tokens → prompt~{int(_prompt_tokens)}, max={original_req['max_tokens']} → {client_ip}")
+                        log(f"✂️  截短历史消息 + 降 max_tokens → prompt~{int(_prompt_tokens)}, max={_max_tokens} → {client_ip}")
             if _truncated:
                 body_bytes = json.dumps(original_req, ensure_ascii=False).encode("utf-8")
 
