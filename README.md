@@ -809,6 +809,7 @@ APC self-check ok mode=exact schema=v1 layers=48 ...
 
 | 日期 | 提交 | 内容 |
 |---|---|---|
+| 2026-11-05 | `4902de3e` | **上游开启 APC（prefix cache）**：mlx_vlm 的 `APC_ENABLED` 默认 0，导致 agent 每轮重发 6 万上下文全量 prefill（实测 62,105 P / 67 C 耗时 247.8s）；开启后 29.7k 上下文相同前缀 14.3s → 0.29s、追加一轮 0.50s。README 新增「上游加速」章节，并修正 launchd EIO 误报的处理方式 |
 | 2026-11-05 | `17c183d0` | **长上下文不再"被取消"**：`TG_READ_TIMEOUT` 明确为单次静默预算；非流式改为缓冲后发送并带 `Content-Length`；超时返回 504 `upstream_timeout`、断流/未收全返回 502 `upstream_broken`；超时不重试；新增 `TG_BUFFER_NONSTREAM`；修复 auto 繁忙计数释放时机（上游读完即释放，避免误判繁忙跳到弱模型） |
 | 2026-11-04 | `319fcbdf` | **auto 新增 `balanced` 策略并设为默认**：请求分档（light/standard/deep）+ 分档与质量**等权**加权（tier 0.35 / quality 0.35 / pref 0.15 / quant 0.10）；新增 `X-Gateway-Auto-Tier` 响应头与 `auto_weights`、`auto_tier_ideals`、`auto_tier_light_chars`、`auto_tier_deep_chars` 配置 |
 | 2026-11-04 | `2c6f20a1` | auto 改为 `quality` 精度优先：参数量 → 量化排序，显式优先表可覆盖；繁忙时让位次优空闲模型 |
