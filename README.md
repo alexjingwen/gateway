@@ -78,8 +78,9 @@ TG_DISABLE_HTTPS=1 TG_PORT=3000 python3 token-gateway.py
 | TG_AUTO_EXCLUDE | (空) | `auto` 额外排除的模型（逗号分隔，叠加在 `deny_models` 与 `global.auto_exclude` 之上） |
 | TG_QPS | 5 | 每 key 每秒请求数 |
 | TG_CONCURRENCY | 10 | 全局最大并发 |
-| TG_READ_TIMEOUT | 900 | 上游读取超时（秒） |
-| TG_VLM_READ_TIMEOUT | 120 | 多模态请求读取超时（秒） |
+| TG_READ_TIMEOUT | 900 | **单次静默上限**（秒），不是整段耗时上限：等上游响应头、以及每次读取响应体，连续这么久没有任何字节才判超时。5 万 token 上下文的预填充本身就要 100~150s，生产建议 ≥600 |
+| TG_VLM_READ_TIMEOUT | 120 | 多模态（带图）请求的单次静默上限（秒） |
+| TG_BUFFER_NONSTREAM | 1 | 非流式请求**先缓冲完整响应再回给客户端**：上游失败时能返回真实 5xx 与 `Content-Length`，而不是"截断的 200"。设 0 退回旧行为（立即发头、边读边转发，失败即断流） |
 | TG_CONNECT_TIMEOUT | 10 | 上游连接超时（秒） |
 | TG_MIN_MAX_TOKENS | 32768 | Rapid-MLX 上游的 `max_tokens` 强制下限（防止客户端给小值被截断）；**VLM 上游不生效**，设 0 关闭 |
 | TG_CONFIG_DIR | ~/.ollama-token-gateway | config.json / certs / logs 所在目录 |
@@ -336,8 +337,29 @@ curl http://127.0.0.1:3000/v1/embeddings \
 | 429 | `quota_exceeded` | 超出每日/每月 token 配额 |
 | 429 | `too_many_requests` | 全局并发已满，请稍后重试 |
 | 404 | `key_not_found` | 删除 key 时无匹配 |
+| **504** | `upstream_timeout` | 上游在静默预算（`TG_READ_TIMEOUT`）内没返回任何字节 |
+| **502** | `upstream_broken` | 上游中途断连，或声明了 `Content-Length` 却没发全 |
 
 > 响应头会暴露用量（CORS `Expose-Headers`）：`X-Token-Usage`、`X-Quota-Remaining`、`X-RateLimit-Limit`。
+
+#### 转发与超时语义（长上下文为什么会"被取消"）
+
+网关对上游的读取**不是整段计时**：`TG_READ_TIMEOUT` 是"连续多久没有任何字节"的静默上限。理解这一点对排查长上下文失败很关键。
+
+| 场景 | 网关行为 |
+|---|---|
+| 流式（`stream: true`） | 收到上游响应头就立即转发，正文边读边发；上游失败时补一条 `data: {"error":...}` 事件（**不发 `[DONE]`**，避免被当成正常结束） |
+| 非流式（默认） | **先缓冲完整正文，读完再发**，并带上 `Content-Length`。成功 = 完整 JSON；失败 = 明确的 5xx，而不是一个"看起来正常但内容不完整"的 200 |
+| 上游声明 `Content-Length` 但没收全 | 判为 `upstream_broken`（502），不会把半截内容当成功返回 |
+| 上游在预算内一个字节都没给 | `upstream_timeout`（504），日志记 `⏱️ 上游超时 Ns（静默预算 Xs）` |
+| 读取超时 | **不重试**：重试只会把已经等过的预算再翻一倍，5 万 token 的生成也没必要跑两遍 |
+
+> 为什么要缓冲：旧版连上上游就先把 200 响应头发给客户端，之后若读取超时只能断流——客户端收到的是"截断的 200"，多数客户端会把它显示成"用户已取消 / 请求被取消"。缓冲后同样的故障会变成明确的 504，客户端能正确提示并重试。
+>
+> 代价是**首字节时间 = 上游完整生成时间**（非流式请求本来就拿不到增量）。若某个客户端对首字节延迟敏感（例如自带 300s 首包超时），可设 `TG_BUFFER_NONSTREAM=0` 退回旧行为。
+
+**容量参考**（本机 122B 4-bit，M 系列 256GB）：5 万 token 上下文的预填充约 100~150s，加生成约 2~4 分钟；两条大请求排队时会成倍增长。这就是生产环境把 `TG_READ_TIMEOUT` 设为 **600** 的原因。
+
 
 ### 管理端点（`/api/admin/*`）
 
@@ -594,6 +616,10 @@ launchctl unload ~/Library/LaunchAgents/com.user.memguard.plist
 | `/health` 正常但 `/v1/models` 为空 | 上游不可达 | `curl 127.0.0.1:11434/api/tags`；检查 `TG_RAPID_MLX_HOSTS` |
 | 请求返回 500 | 上游异常 / 代码异常 | 看 `/tmp/token-gateway.log` 与 `/tmp/token-gateway.err.log` |
 | 端口被占用（启动报 `Address already in use`） | 旧实例仍占用 3000 | 停旧实例，或改 `config.json` 的 `listen_port` |
+| **长上下文请求"用到一半"变`用户已取消` / 请求被取消** | `TG_READ_TIMEOUT` 太小，上游还在预填充就被判超时，连接被截断；旧版先发 200 头再断流，客户端只能理解为"被取消" | 确认日志有 `⏱️ 上游超时` 或 `读取上游响应中断`；把 `TG_READ_TIMEOUT` 调大（生产用 600）。5 万 token 在 122B 上预填充约 100~150s，排队时更久。现版本超时会返回 **504 `upstream_timeout`**，不再是无提示断流 |
+| 响应头到了、正文迟迟不来 | 非流式请求在等上游完整生成（缓冲模式），属预期 | 看日志 `⏱️ 上游超时` 与 `📊 ... 用时`；对首字节敏感可设 `TG_BUFFER_NONSTREAM=0` |
+| `504 upstream_timeout` | 上游在静默预算内没给任何字节 | 重试；或换更小的模型 / 缩短上下文；确认 122B 未被其他客户端占满 |
+| `502 upstream_broken` | 上游中途断连或声明了 `Content-Length` 却没收全 | 看 `⚠️ 读取上游响应中断` 后的具体异常；通常是上游 OOM 或进程重启 |
 
 ### auto 分配相关
 | 现象 | 可能原因 | 排查 / 处理 |

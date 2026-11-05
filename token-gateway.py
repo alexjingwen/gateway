@@ -12,6 +12,7 @@ Ollama Token Gateway - 多设备 Token 服务网关
 """
 
 import http.server
+import http.client
 import socketserver
 import urllib.request
 import urllib.error
@@ -2221,6 +2222,8 @@ iframe{{padding-top:0}}
         # 记录该模型在飞请求数：auto 的 least-busy 策略据此判断哪个模型繁忙
         _inflight_model = model
         model_inflight_inc(_inflight_model)
+        self._inflight_model = _inflight_model
+        self._inflight_released = False
         try:
             self._proxy("POST", client_ip, api_key, key_cfg, cfg,
                         body_bytes=body_bytes, original_req=req, model=model)
@@ -2232,7 +2235,9 @@ iframe{{padding-top:0}}
             except Exception:
                 pass
         finally:
-            model_inflight_dec(_inflight_model)
+            # _proxy 通常已经在上游读完时释放过；这里只兜底真正漏掉的情况
+            if not getattr(self, "_inflight_released", False):
+                model_inflight_dec(_inflight_model)
             # 释放槽位；如果 reaper 已经因为"客户端走了"提前回收过，这里就不要再减
             with state_lock:
                 _e = _active_reqs.pop(_rid, None)
@@ -2388,13 +2393,14 @@ iframe{{padding-top:0}}
         if upstream_host in RAPID_MLX_VLM_HOSTS:
             upstream_headers["Authorization"] = f"Bearer {MLX_VLM_API_KEY}"
 
-        # 分级超时：连接超时短（快速失败），整体超时可配（大模型加载慢）。
-        # read_timeout 是"一个并发槽位最多被占多久"的上界：客户端提前断开时，网关线程
-        # 仍会一直阻塞读到这个超时才会走 finally 释放额度，所以它是全局 429 的兜底闸门。
-        # **多模态（带图）请求单独用更短的 TG_VLM_READ_TIMEOUT**：视觉决策是"看一眼答一小段
-        # JSON"，正常 10~30s 就回；而挂机客户端有自己的步进预算，超时就走人 —— 留一个
-        # 900s 的槽位给它，等于把全局并发额度和一个已经没人要的请求绑死。文本客户端
-        # （dsh 等）仍用 TG_READ_TIMEOUT，行为不变。
+        # 超时语义：TG_READ_TIMEOUT 是**单次静默上限**，不是整段耗时上限。
+        # 5 万 token 上下文的预填充本身就要 100~150s，旧版把 240s 当整段上限，
+        # 时间一到就砍连接，客户端只看到"用户已取消"（连接被截断）。
+        # 现在它同时作用于两处：等上游响应头、以及每次读取响应体（阻塞读的内部计时）。
+        # 注意：http.client 的响应对象在**一次 socket 超时后不可复用**
+        # （报 "cannot read from timed out object"），所以不能把读切成小段轮询，
+        # 一旦超时只能整条放弃——这也正是这里必须给足预算的原因。
+        # 多模态（带图）请求单独用更短的 TG_VLM_READ_TIMEOUT：视觉决策正常 10~30s 就回。
         connect_timeout = int(os.environ.get("TG_CONNECT_TIMEOUT", "10"))
         read_timeout = int(os.environ.get("TG_READ_TIMEOUT", "900"))
         _req_has_image = False
@@ -2428,6 +2434,10 @@ iframe{{padding-top:0}}
                 break
             except (urllib.error.URLError, ConnectionError, TimeoutError, OSError) as e:
                 last_exc = e
+                # 超时 ≠ 连接抖动：重试只会把已经等过的预算再翻一倍，
+                # 5 万 token 的生成也没必要跑两遍。直接判定超时。
+                if isinstance(e, TimeoutError) or isinstance(getattr(e, "reason", None), TimeoutError):
+                    break
                 if attempt == 0 and resp is None:
                     # 首次连接失败，等 1 秒后重试一次
                     log(f"⚠️ 上游连接失败，1秒后重试: {e}")
@@ -2461,6 +2471,20 @@ iframe{{padding-top:0}}
                 err_preview = err_body.decode("utf-8", errors="replace")[:300] if err_body else ""
                 log(f"⚠️ 上游 Ollama 错误 {e.code}: {e.reason} | 路径:{self.path} | 来自:{client_ip} | 响应:{err_preview}")
             else:
+                _to = (isinstance(last_exc, TimeoutError)
+                       or isinstance(getattr(last_exc, "reason", None), TimeoutError))
+                if _to:
+                    # 上游连响应头都没给：明确 504，别让客户端当成"自己取消的"
+                    log(f"⏱️ 上游超时 {elapsed:.1f}s（静默预算 {read_timeout}s）"
+                        f" | 路径:{self.path} | 来自:{client_ip}")
+                    try:
+                        self._send_error(
+                            504, "upstream_timeout",
+                            f"上游 {elapsed:.0f}s 未返回任何响应（静默预算 {read_timeout}s）；"
+                            f"可重试，或改用更小的模型 / 更短的上下文")
+                    except self._CLIENT_GONE_ERRORS:
+                        pass
+                    return
                 log(f"❌ Ollama 连接失败 ({elapsed:.1f}s): {last_exc}")
                 try:
                     self._send_error(502, "bad_gateway",
@@ -2469,63 +2493,146 @@ iframe{{padding-top:0}}
                     pass
             return
 
+        # socket 轮询：把大块阻塞读切成 poll_s 小段，用于实现"静默预算"和流式心跳。
+        # 注意：这里刻意**不**改动已建立连接的 socket 超时。http.client 的响应对象
+        # 一旦发生 socket 超时就会被标记为不可读，改造超时会让我们失去重试/继续读取的可能，
+        # 因此读取策略是"一次阻塞读到数据或超时"，超时即整条放弃。
+        _up_clen = resp.headers.get("Content-Length")
+
         # 成功连接，处理响应
         client_gone = False
+        upstream_fault = ""          # 非空 = 上游读取失败，用于对外返回明确错误
+        _timed_out = False           # True = 静默预算耗尽（504），否则按连接故障（502）
         response_data = bytearray()
+        last_data_at = time.time()
+
+        def _send_upstream_headers(content_length=None):
+            self.send_response(resp.status)
+            # 透传响应头
+            for k, v in resp.headers.items():
+                kl = k.lower()
+                if kl in ("content-length", "transfer-encoding", "connection"):
+                    continue
+                self.send_header(k, v)
+            self._cors()
+
+            # 用量头
+            today = get_today()
+            month = today[:7]
+            used_d = tracker.daily[api_key].get(today, 0)
+            used_m = tracker.monthly[api_key].get(month, 0)
+            limit_d = key_cfg.get("daily_tokens", 0)
+            limit_m = key_cfg.get("monthly_tokens", 0)
+            self.send_header("X-Quota-Remaining-Daily",
+                           str(max(0, limit_d - used_d) if limit_d else "unlimited"))
+            self.send_header("X-Quota-Remaining-Monthly",
+                           str(max(0, limit_m - used_m) if limit_m else "unlimited"))
+            self.send_header("X-RateLimit-Limit", str(key_cfg.get("qps", DEFAULT_QPS)))
+            # auto 命中时回传实际选中的模型，便于客户端确认与问题定位
+            _auto_hit = getattr(self, "_auto_resolved", None)
+            if _auto_hit:
+                self.send_header("X-Gateway-Model", _auto_hit)
+                _tier = getattr(self, "_auto_tier_label", "")
+                if _tier:
+                    self.send_header("X-Gateway-Auto-Tier", _tier)
+            # 非流式补 Content-Length：客户端可据此判断响应是否收全（截断会直接报错，
+            # 而不是悄悄当成一次"被取消"的请求）
+            if content_length is not None:
+                self.send_header("Content-Length", str(content_length))
+            self.end_headers()
+
         try:
             with resp:
-                self.send_response(resp.status)
-                # 透传响应头
-                for k, v in resp.headers.items():
-                    kl = k.lower()
-                    if kl in ("content-length", "transfer-encoding", "connection"):
-                        continue
-                    self.send_header(k, v)
-                self._cors()
+                # 流式：头必须先发，客户端才能尽早拿到首个 token；
+                # 非流式默认（TG_BUFFER_NONSTREAM=1）等读完再发：上游失败时才能给出
+                # 真实的 5xx 和 Content-Length，而不是"截断的 200"。
+                # 若某客户端对首字节延迟极敏感，可设 TG_BUFFER_NONSTREAM=0 退回旧行为。
+                _buffer_ns = os.environ.get("TG_BUFFER_NONSTREAM", "1") not in ("0", "false", "no", "off")
+                _early = stream or not _buffer_ns
+                if _early:
+                    _send_upstream_headers()
+                    try:
+                        self.wfile.flush()
+                    except self._CLIENT_GONE_ERRORS:
+                        client_gone = True
 
-                # 用量头
-                today = get_today()
-                month = today[:7]
-                used_d = tracker.daily[api_key].get(today, 0)
-                used_m = tracker.monthly[api_key].get(month, 0)
-                limit_d = key_cfg.get("daily_tokens", 0)
-                limit_m = key_cfg.get("monthly_tokens", 0)
-                self.send_header("X-Quota-Remaining-Daily",
-                               str(max(0, limit_d - used_d) if limit_d else "unlimited"))
-                self.send_header("X-Quota-Remaining-Monthly",
-                               str(max(0, limit_m - used_m) if limit_m else "unlimited"))
-                self.send_header("X-RateLimit-Limit", str(key_cfg.get("qps", DEFAULT_QPS)))
-                # auto 命中时回传实际选中的模型，便于客户端确认与问题定位
-                _auto_hit = getattr(self, "_auto_resolved", None)
-                if _auto_hit:
-                    self.send_header("X-Gateway-Model", _auto_hit)
-                    _tier = getattr(self, "_auto_tier_label", "")
-                    if _tier:
-                        self.send_header("X-Gateway-Auto-Tier", _tier)
-
-                self.end_headers()
-
-                # 读取响应（同时处理流式和非流式）
-                while True:
+                # 读取响应（流式/早发头：边读边转发；缓冲模式：只累积）
+                while not client_gone:
                     try:
                         chunk = resp.read(8192)
-                    except (TimeoutError, ConnectionError, OSError) as e:
-                        log(f"⚠️ 读取上游响应中断: {e}")
+                    except (TimeoutError, ConnectionError, OSError,
+                            http.client.HTTPException) as e:
+                        silent = time.time() - last_data_at
+                        if isinstance(e, TimeoutError):
+                            _timed_out = True
+                            upstream_fault = (f"上游 {silent:.0f}s 无新数据"
+                                              f"（静默预算 {read_timeout}s）")
+                        else:
+                            upstream_fault = f"{type(e).__name__}: {e}"
+                        log(f"⚠️ 读取上游响应中断: {upstream_fault} | 已收 "
+                            f"{len(response_data)} bytes | 用时 {time.time() - t0:.1f}s")
                         break
                     if not chunk:
                         break
-                    try:
-                        self.wfile.write(chunk)
-                    except self._CLIENT_GONE_ERRORS:
-                        # 客户端已断开，停止写入但仍记录已收到的用量
-                        client_gone = True
-                        break
+                    last_data_at = time.time()
                     response_data.extend(chunk)
+                    if _early:
+                        try:
+                            self.wfile.write(chunk)
+                            self.wfile.flush()
+                        except self._CLIENT_GONE_ERRORS:
+                            client_gone = True
+                            break
+
+                # 完整性校验：上游声明了 Content-Length 却没收全 → 连接被截断，按故障处理
+                if not upstream_fault and not _early and _up_clen:
+                    try:
+                        if int(_up_clen) != len(response_data):
+                            upstream_fault = (f"上游响应不完整（收到 {len(response_data)} / "
+                                              f"声明 {_up_clen} bytes）")
+                            log(f"⚠️ {upstream_fault}")
+                    except ValueError:
+                        pass
+
+                if not _early and not client_gone:
+                    if upstream_fault:
+                        # 明确告知是网关侧上游故障，避免客户端把它显示成"用户已取消"
+                        _status = 504 if _timed_out else 502
+                        _code = "upstream_timeout" if _timed_out else "upstream_broken"
+                        try:
+                            self._send_error(
+                                _status, _code,
+                                upstream_fault + "；可重试，或改用更小的模型 / 更短的上下文")
+                        except self._CLIENT_GONE_ERRORS:
+                            client_gone = True
+                    else:
+                        _send_upstream_headers(content_length=len(response_data))
+                        self.wfile.write(bytes(response_data))
+                elif _early and upstream_fault and not client_gone:
+                    if stream:
+                        # 已发出部分内容：补一个错误事件（不发 [DONE]，避免被当成正常结束）
+                        try:
+                            evt = {"error": {"message": upstream_fault,
+                                             "type": "upstream_timeout",
+                                             "code": "upstream_timeout"}}
+                            self.wfile.write(("data: " + json.dumps(evt, ensure_ascii=False)
+                                              + "\n\n").encode("utf-8"))
+                            self.wfile.flush()
+                        except self._CLIENT_GONE_ERRORS:
+                            client_gone = True
 
         except self._CLIENT_GONE_ERRORS:
             client_gone = True
         except Exception as e:
             log(f"⚠️ 转发过程异常: {type(e).__name__}: {e}")
+
+        # 上游已经读完（或已放弃），模型不再被占用 —— 在这里就释放 auto 的繁忙计数，
+        # 而不是等客户端把响应体收完。否则"客户端刚收到响应、立刻发下一条"的瞬间会被
+        # 误判为该模型繁忙，auto 会跳到更弱的模型（同名同输入却不稳定）。
+        _im = getattr(self, "_inflight_model", None)
+        if _im and not getattr(self, "_inflight_released", False):
+            model_inflight_dec(_im)
+            self._inflight_released = True
 
         # ========= Rapid-MLX 熔断状态更新 =========
         if upstream_host in RAPID_MLX_HOSTS and not client_gone:
