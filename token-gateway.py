@@ -3199,6 +3199,13 @@ def print_banner():
     print(f"  🔐 API Key 数:  {key_count}")
     print(f"  📊 日志文件:    {USAGE_LOG}")
     print(f"  ⚙️  配置文件:    {CONFIG_FILE}")
+    # 把实际生效的超时/转发模式打出来：这些值来自 launchd 注入的 env，
+    # 改 plist 后若只做 kickstart，launchd 会沿用**加载时**的旧值，
+    # 打印出来才能一眼看出"配置改没生效"。
+    _rt = os.environ.get("TG_READ_TIMEOUT", "900")
+    _vt = os.environ.get("TG_VLM_READ_TIMEOUT", "120")
+    _bn = "缓冲" if os.environ.get("TG_BUFFER_NONSTREAM", "1") not in ("0", "false", "no", "off") else "直通"
+    print(f"  ⏱️  静默预算:    文本 {_rt}s / 带图 {_vt}s   非流式转发: {_bn}")
     if use_https:
         print(f"  📜 证书文件:    {CERT_FILE}")
     print("")
