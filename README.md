@@ -666,6 +666,11 @@ launchctl unload ~/Library/LaunchAgents/com.token-gateway.server.plist
 launchctl load   ~/Library/LaunchAgents/com.token-gateway.server.plist
 # 5) 错误日志
 tail -n 50 /tmp/token-gateway.err.log
+# 6) 报 "Bootstrap failed: 5: Input/output error" 不等于没起来
+#    launchd 有时会误报 EIO，作业其实已经启动。先查端口再重试，
+#    否则可能起两个实例抢同一个端口
+lsof -nP -iTCP:3000 -sTCP:LISTEN
+launchctl print gui/$(id -u)/com.token-gateway.server | grep -E "state = |pid = "
 ```
 
 ### mem-guard 相关
@@ -735,6 +740,70 @@ cp ~/.ollama-token-gateway/config.json \
 - **配置/日志目录**：每个实例独立 `TG_CONFIG_DIR`（各自的 `config.json` / `certs/` / `logs/`）。
 - **LaunchAgent 标签**：复制 plist 后改 `Label`（如 `com.token-gateway.server2`）及 `ProgramArguments` / `WorkingDirectory`。
 - **凭据**：不同实例用不同 `admin.token` 与 key 命名空间，避免串用。
+
+## 上游加速：开启 prefix cache（APC）
+
+网关本身**不缓存 KV**，每轮请求的 prefill 全部由上游承担。agent 类客户端每轮都会重发完整上下文（实测同一会话 58k → 62k tokens 递增），若上游不复用前缀，6 万 token 就要完整重算一遍。
+
+### 现象与根因
+
+mlx_vlm 内置 APC（Automatic Prefix Caching），但**默认关闭**——`apc.from_env()` 在 `APC_ENABLED` 未设置时直接返回 `None`。表现为每轮耗时与上下文长度同阶，而输出 token 极少：
+
+```
+📊 Model:Qwen3.5-122B Tokens:62172 (P:62105+C:67) 用时:247.8s
+```
+
+6 万 prompt token、67 个输出 token、247.8 秒——时间几乎全在 prefill，且每轮重复。
+
+一条可复现的判据：同一 prompt 连发两次，若第二次耗时与第一次基本相同，就是没有缓存。
+
+### 开启方式
+
+在**上游**的 LaunchAgent 注入环境变量（网关侧无需改动）：
+
+```xml
+<key>EnvironmentVariables</key>
+<dict>
+    <key>APC_ENABLED</key><string>1</string>
+    <key>APC_EXACT_CACHE_ENTRIES</key><string>4</string>
+</dict>
+```
+
+重启上游后，启动日志应出现：
+
+```
+APC enabled (block_size=16, num_blocks=2048, hash=fast, disk=False)
+APC self-check ok mode=exact schema=v1 layers=48 ...
+```
+
+`mode=exact` 表示该模型被判为混合架构（linear attention + full attention），走"整前缀快照"路径；`mode=block` 则是逐块 KV 复用。
+
+### 实测收益（29,716 token 上下文，`max_tokens=1`）
+
+| 场景 | 开启前 | 开启后 | 加速 |
+|---|---|---|---|
+| 冷启动（首次全量 prefill） | 51.2s | 51.2s | — |
+| 完全相同前缀 | 14.3s | **0.29s** | 49× |
+| 追加一轮（agent 形态） | 14.4s | **0.50s** | 29× |
+| 经网关端到端（`auto`→122B） | — | **0.30s** | — |
+
+预填充约 581 tok/s，6 万 token 冷启动约 103s；命中后只算新增的几百 token，耗时降到亚秒级。
+
+### 关键约束
+
+1. **前缀必须完全一致**。APC 按 token 序列做前缀匹配，任何前缀扰动（system prompt 里塞时间戳、工具定义顺序变化、历史被编辑或摘要）都会让命中点前移甚至归零。
+2. **混合架构走 exact 快照**，按整个 `prompt_cache` 复制，内存随上下文线性增长（本例 12 个 full-attention 层，约 24 KB/token，6 万 token ≈ 1.4 GB/快照）。`APC_EXACT_CACHE_ENTRIES` 控制保留几份，建议不小于 `--max-num-seqs`。
+3. 非流式缓冲模式下**首字节时间 = 完整生成时间**；只有 prefill 接近归零，这个代价才真正可接受。
+4. 冷启动那一轮无法避免（模型刚加载、权重未热），第一次请求仍按全量计费。
+
+### 验证方法
+
+同一前缀连发两次，第二次应显著变快：
+
+```python
+# 判读：若"完全相同"那次仍接近冷启动耗时，说明 APC 未生效，
+# 先确认运行中的进程真的拿到了 APC_ENABLED
+```
 
 ## 变更记录
 
