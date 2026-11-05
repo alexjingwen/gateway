@@ -58,6 +58,7 @@ TG_DISABLE_HTTPS=1 TG_PORT=3000 python3 token-gateway.py
 ### 环境变量（TG_*）
 | 变量 | 默认 | 说明 |
 |---|---|---|
+| 2026-11-05 | `67e5c773` | **回归用例入库 + 部署模板纠偏**：新增 `tests/test_ctx_trunc.py`（超窗截短不得 500）与 `tests/test_timeout.py`（静默预算 / 缓冲发送 / 504·502 / 流式错误事件，27 项），两者自包含、用临时端口与 stub 上游，不碰线上实例；`com.token-gateway.server.plist` 的 `TG_READ_TIMEOUT` 240 → 600 并补 `TG_BUFFER_NONSTREAM=1`，与生产一致 |
 | TG_HOST | 0.0.0.0 | 监听地址 |
 | TG_PORT | 3000 | 监听端口（`config.json` 的 `listen_port` 优先） |
 | TG_DISABLE_HTTPS | (空) | 设为 1 关闭 HTTPS（走明文 HTTP） |
