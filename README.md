@@ -99,6 +99,17 @@ launchctl list | grep token-gateway
 tail -f /tmp/token-gateway.log
 ```
 
+**改了 plist 里的环境变量后，只做 `kickstart -k` 是不够的**——launchd 会沿用**加载时**记录的那份作业定义，进程重启了但 env 还是旧值（本仓库曾因此出现"把 `TG_READ_TIMEOUT` 改成 600 却仍报 240s"）。必须重新装载：
+
+```bash
+launchctl bootout gui/$(id -u)/com.token-gateway.server 2>/dev/null
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.token-gateway.server.plist
+```
+
+> 注：`bootstrap` 偶尔会返回 `Bootstrap failed: 5: Input/output error` 但作业其实已经起来了——先 `curl :3000/health` 确认，别急着重试成两个实例。
+>
+> 验证是否真的生效：看启动横幅里的 `⏱️ 静默预算: 文本 600s / 带图 150s  非流式转发: 缓冲`，或 `launchctl print gui/$(id -u)/com.token-gateway.server | grep TG_`。只改 Python 代码不需要重新装载，`kickstart -k` 即可。
+
 ## API 参考
 
 所有 `/v1/*` 接口兼容 OpenAI 客户端。鉴权方式：
