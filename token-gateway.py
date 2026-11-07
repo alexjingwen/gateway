@@ -29,7 +29,7 @@ import socket
 import select
 import ssl
 from pathlib import Path
-from collections import defaultdict
+from collections import defaultdict, deque
 from typing import Dict, List, Optional, Tuple
 
 # ========== 配置 ==========
@@ -165,13 +165,13 @@ except (TypeError, ValueError):
 #   quality 绝对质量（参数量/量化）                默认 0.35
 #   pref    显式优先表内排序                       默认 0.15
 #   quant   量化保真                               默认 0.10
-#   speed   速度收益（越小越快）                   默认 0（关闭）
-# 分档与质量默认严格等权：谁都不是隐含前提，最终按加权求和决定。
-# speed 默认关闭是因为它与 quality 是同一根轴的两端，同时开启会隐式稀释 quality 的权重；
-# 想走"速度优先"再手动把它调高即可。显式优先表为空时 pref 自动剔除，其余权重归一化。
+#   speed   速度收益（实测耗时越短越高）           默认 0.30
+# **分档、质量、速度三者等权**：没有任何一项是隐含前提，最终按加权求和决定。
+# speed 用实测耗时而非参数量——实测 122B 在 3k~20k 上下文比 8B 快，参数量反推会给出反向结论。
+# 未启用的因子（权重 0 或未配置偏好表）从分母中剔除，不会拉低分数。
 AUTO_WEIGHTS = _parse_weight_map(
     os.environ.get("TG_AUTO_WEIGHTS", ""),
-    {"tier": 0.35, "quality": 0.35, "pref": 0.15, "quant": 0.10, "speed": 0.0},
+    {"tier": 0.30, "quality": 0.30, "speed": 0.30, "pref": 0.15, "quant": 0.10},
 )
 
 
@@ -1130,6 +1130,118 @@ def get_month() -> str:
     return time.strftime("%Y-%m")
 
 
+# ---------- 实测耗时统计（balanced 的 speed 因子数据源） ----------
+# 速度必须用**实测耗时**度量，不能用参数量反推：实测 122B（MLX + APC）在 3k~20k
+# 上下文区间比 gemma4 8B（Ollama，无前缀缓存）快约 2.7 倍，"小模型一定更快"在这里不成立。
+# 按 prompt 规模分桶记录真实耗时取中位数；样本不足时返回 None，由调用方给中性分，
+# 避免用两三条样本决定路由。
+SPEED_BUCKET_EDGES = (3000, 20000)          # prompt token 分桶边界
+SPEED_BUCKET_N = len(SPEED_BUCKET_EDGES) + 1
+try:
+    SPEED_WINDOW = max(10, int(os.environ.get("TG_SPEED_WINDOW", "200")))
+except (TypeError, ValueError):
+    SPEED_WINDOW = 200
+try:
+    SPEED_MIN_SAMPLES = max(2, int(os.environ.get("TG_SPEED_MIN_SAMPLES", "12")))
+except (TypeError, ValueError):
+    SPEED_MIN_SAMPLES = 12
+# 字符→token 的粗略换算（中英混排实测约 0.5），只用于选桶，不参与计费
+try:
+    TOKENS_PER_CHAR = float(os.environ.get("TG_TOKENS_PER_CHAR", "0.5"))
+except (TypeError, ValueError):
+    TOKENS_PER_CHAR = 0.5
+# 速度软映射的参考耗时：speed = tau/(tau+t)。用绝对值而非"相对最快者"，
+# 否则池内一个极快的微模型（如 0.2s 的视觉微调用）会把其余候选统一压到 0.05 下限。
+try:
+    SPEED_TAU = max(0.5, float(os.environ.get("TG_SPEED_TAU", "10")))
+except (TypeError, ValueError):
+    SPEED_TAU = 10.0
+
+
+class LatencyStats:
+    """按 (模型, prompt 桶) 记录真实耗时，供 speed 因子取中位数。"""
+
+    def __init__(self):
+        self._data: Dict[str, List[deque]] = {}
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def bucket_of(prompt_tokens: int) -> int:
+        pt = max(0, int(prompt_tokens or 0))
+        for i, edge in enumerate(SPEED_BUCKET_EDGES):
+            if pt < edge:
+                return i
+        return SPEED_BUCKET_N - 1
+
+    def record(self, model: str, prompt_tokens: int, elapsed_s: float):
+        if not model or elapsed_s is None or elapsed_s <= 0:
+            return
+        b = self.bucket_of(prompt_tokens)
+        with self._lock:
+            buckets = self._data.get(model)
+            if buckets is None:
+                buckets = [deque(maxlen=SPEED_WINDOW) for _ in range(SPEED_BUCKET_N)]
+                self._data[model] = buckets
+            buckets[b].append(float(elapsed_s))
+
+    def estimate(self, model: str, prompt_tokens: int) -> Optional[float]:
+        """该模型在给定 prompt 规模下的典型耗时（秒）；该桶样本不足返回 None。
+
+        不做跨桶回退：不同规模量级的耗时不可互换，用别的桶顶替等于编造一个数字
+        （实测 8B 在 3k~20k 桶无样本时曾被 0.5s 的短请求样本"冒充"成 1.24s）。
+        宁可返回 None 让上游给中性分，也不拿不可比的样本充数。
+        """
+        if not model:
+            return None
+        b = self.bucket_of(prompt_tokens)
+        with self._lock:
+            buckets = self._data.get(model)
+            if not buckets:
+                return None
+            samples = list(buckets[b])
+        if len(samples) < SPEED_MIN_SAMPLES:
+            return None
+        samples.sort()
+        return samples[len(samples) // 2]
+
+    def seed_from_usage(self, path: Path, max_rows: int = 20000) -> int:
+        """启动时用最近的用量日志预热，避免重启后 speed 因子失明。"""
+        if not path.exists():
+            return 0
+        try:
+            with open(path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                block = min(size, 8 * 1024 * 1024)
+                f.seek(max(0, size - block))
+                tail = f.read().decode("utf-8", "replace").splitlines()[-max_rows:]
+        except Exception:
+            return 0
+        n = 0
+        for line in tail:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                r = json.loads(line)
+            except Exception:
+                continue
+            self.record(r.get("model", ""), r.get("prompt_tokens", 0), r.get("elapsed_s") or 0)
+            n += 1
+        return n
+
+    def snapshot(self) -> Dict[str, List[int]]:
+        """每个模型的样本数，供 /stats 与排查用。"""
+        out: Dict[str, List[int]] = {}
+        with self._lock:
+            for m, buckets in self._data.items():
+                out[m] = [len(q) for q in buckets]
+        return out
+
+
+MODEL_LATENCY = LatencyStats()
+
+
 class UsageTracker:
     """跟踪每个 Key 的用量，内存统计 + JSONL 持久化"""
 
@@ -1171,6 +1283,12 @@ class UsageTracker:
                client_ip: str, stream: bool):
         today = get_today()
         month = today[:7]
+
+        # 速度因子数据源：同时按上游 id 与别名记账，保证 auto 候选池按别名能查到
+        MODEL_LATENCY.record(model, prompt_tokens, elapsed_s)
+        _alias = _MODEL_REVERSE_ALIAS.get(model)
+        if _alias and _alias != model:
+            MODEL_LATENCY.record(_alias, prompt_tokens, elapsed_s)
 
         with state_lock:
             self.daily[api_key][today] += total_tokens
@@ -1651,34 +1769,38 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
 
     def _auto_balanced_score(self, model: str, host: str, pb: Optional[float], tier: int,
                              policy: dict, prio: List[str],
-                             ctx: dict) -> Tuple[float, str]:
+                             ctx: dict, speed: Optional[float] = None) -> Tuple[float, str]:
         """多维加权综合打分（0~1，越大越好），返回 (分数, 各因子明细)。
 
         因子（默认权重见 AUTO_WEIGHTS）：
-          tier    分档适配：模型大小是否符合本档理想值（轻量档偏好小模型）   0.35
-          quality 绝对质量：候选池内参数量的对数位置（越大越强）             0.35
+          tier    分档适配：模型大小是否符合本档理想值（轻量档偏好小模型）   0.30
+          quality 绝对质量：候选池内参数量的对数位置（越大越强）             0.30
+          speed   速度收益：**实测耗时**归一化（越快越高，见 LatencyStats）  0.30
           pref    显式偏好：config global.auto_quality 表内位置（越靠前越高）0.15
           quant   量化保真：F32/BF16 > Q8 > Q6 > Q5 > Q4 > Q3/Q2            0.10
-          speed   速度收益：越小越快（默认 0，与 quality 同轴故不叠加）
 
-        **分档与质量等权**：两者各自独立打分、按权重求和，不存在"先按档位筛选再按质量选"的
-        硬顺序。权重全部可由 config global.auto_weights / TG_AUTO_WEIGHTS 调整。
+        **三项主因子等权**：分档、质量、速度各自独立打分、按权重求和，不存在"先按档位
+        筛选再按质量选"的硬顺序。权重可由 config global.auto_weights / TG_AUTO_WEIGHTS 调整。
+        speed 由调用方按实测耗时做绝对软映射（tau/(tau+t)）后传入；缺测时给中性分，
+        不用参数量猜——实测 122B 在 3k~20k 上下文比 8B 快，"小模型更快"并不成立。
         未启用的因子（权重 0 或未配置偏好表）从分母中剔除，不会拉低分数。
         """
         fit = self._auto_tier_fit(pb, tier, policy["ideals"])
 
         lo, hi = ctx.get("lo"), ctx.get("hi")
         if not pb or pb <= 0 or lo is None or hi is None:
-            qual, speed = 0.35, 0.40
+            qual = 0.35
         elif hi - lo < 1e-9:
-            qual, speed = 0.75, 0.75  # 候选只有一个尺寸：两个因子都给中性值
+            qual = 0.75  # 候选只有一个尺寸：中性值
         else:
             qual = max(0.0, min(1.0, (math.log10(pb) - lo) / (hi - lo)))
-            speed = 1.0 - qual
+
+        # 速度因子由实测耗时得出；无样本时 0.40（略低于中位，避免无数据的模型白占便宜）
+        speed_v = 0.40 if speed is None else max(0.0, min(1.0, speed))
 
         quant = min(1.0, max(0.0, self._auto_quant_rank(model, host)) / 6.0)
 
-        factors = {"tier": fit, "quality": qual, "speed": speed, "quant": quant}
+        factors = {"tier": fit, "quality": qual, "speed": speed_v, "quant": quant}
         if prio:
             factors["pref"] = (0.85 ** prio.index(model)) if model in prio else 0.0
         weights = policy.get("weights") or AUTO_WEIGHTS
@@ -1769,9 +1891,21 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
                 sizes = [self._auto_param_b(m, h) for m, h in cands]
                 logs = [math.log10(s) for s in sizes if s and s > 0]
                 ctx = {"lo": min(logs) if logs else None, "hi": max(logs) if logs else None}
+                # 速度因子：按本请求预估的 prompt 规模取各候选的实测中位耗时，
+                # 再用软映射 tau/(tau+t) 转成 0~1（越快越高），与候选池构成无关
+                p_hat = int(self._auto_req_text_len(req) * TOKENS_PER_CHAR)
+                t_est = {}
+                for (m, _h) in cands:
+                    t = MODEL_LATENCY.estimate(m, p_hat)
+                    if t is not None:
+                        t_est[m] = t
                 for (m, h), pb in zip(cands, sizes):
-                    score, brk = self._auto_balanced_score(m, h, pb, tier, policy, prio, ctx)
-                    entries.append({"m": m, "h": h, "score": score, "desc": brk})
+                    speed_v = None
+                    if m in t_est:
+                        speed_v = SPEED_TAU / (SPEED_TAU + t_est[m])
+                    score, brk = self._auto_balanced_score(m, h, pb, tier, policy, prio, ctx, speed_v)
+                    entries.append({"m": m, "h": h, "score": score, "desc": brk,
+                                    "t_est": t_est.get(m)})
                 entries.sort(key=lambda e: (-e["score"], e["m"]))
             else:
                 for m, h in cands:
@@ -3233,6 +3367,9 @@ def print_banner():
     _vt = os.environ.get("TG_VLM_READ_TIMEOUT", "120")
     _bn = "缓冲" if os.environ.get("TG_BUFFER_NONSTREAM", "1") not in ("0", "false", "no", "off") else "直通"
     print(f"  ⏱️  静默预算:    文本 {_rt}s / 带图 {_vt}s   非流式转发: {_bn}")
+    _lat = MODEL_LATENCY.snapshot()
+    print(f"  🚀 速度因子:    窗口内样本 {sum(sum(v) for v in _lat.values())} 条 / {len(_lat)} 个模型"
+          f"（window={SPEED_WINDOW}, min={SPEED_MIN_SAMPLES}, 权重 {AUTO_WEIGHTS.get('speed', 0):.2f}, tau={SPEED_TAU:g}s）")
     if use_https:
         print(f"  📜 证书文件:    {CERT_FILE}")
     print("")
@@ -3277,6 +3414,10 @@ auth_result_ok = None
 
 
 def main():
+    # 速度因子预热：用最近的用量日志回填实测耗时，避免重启后 speed 因子失明
+    _seeded = MODEL_LATENCY.seed_from_usage(USAGE_LOG)
+    if _seeded:
+        log(f"🚀 速度因子已预热 {_seeded} 条实测耗时（{len(MODEL_LATENCY.snapshot())} 个模型）")
     port = _cfg["global"]["listen_port"]
     host = _cfg["global"]["listen_host"]
     # 双栈监听：IPv4 的 0.0.0.0 转成 IPv6 的 :: （配合 IPV6_V6ONLY=0 可同时收 IPv4/IPv6）

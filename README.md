@@ -58,8 +58,6 @@ TG_DISABLE_HTTPS=1 TG_PORT=3000 python3 token-gateway.py
 ### 环境变量（TG_*）
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| 2026-11-07 | `aa5f4aec` | **修复工具调用被输出预算截断导致的 `Empty stream`**：上游把整个 `tool_call` 放在单个 chunk 里下发，客户端固定 `max_tokens=2048` 时命中「VLM 上游不强制」豁免 → 预算耗尽只回半截 JSON（`chunks=1`、`finish_reason=length`）→ 客户端判定零模型 token 并重试。豁免改为按请求类型判定：带图仍不强制，纯文本 + tools 抬到 `TG_MIN_MAX_TOKENS_TOOLS`（默认 8192）；新增 `tests/test_tools_budget.py` |
-| 2026-11-05 | `67e5c773` | **回归用例入库 + 部署模板纠偏**：新增 `tests/test_ctx_trunc.py`（超窗截短不得 500）与 `tests/test_timeout.py`（静默预算 / 缓冲发送 / 504·502 / 流式错误事件，27 项），两者自包含、用临时端口与 stub 上游，不碰线上实例；`com.token-gateway.server.plist` 的 `TG_READ_TIMEOUT` 240 → 600 并补 `TG_BUFFER_NONSTREAM=1`，与生产一致 |
 | TG_HOST | 0.0.0.0 | 监听地址 |
 | TG_PORT | 3000 | 监听端口（`config.json` 的 `listen_port` 优先） |
 | TG_DISABLE_HTTPS | (空) | 设为 1 关闭 HTTPS（走明文 HTTP） |
@@ -75,7 +73,11 @@ TG_DISABLE_HTTPS=1 TG_PORT=3000 python3 token-gateway.py
 | TG_AUTO_TIER_IDEALS | 8,30,122 | 轻量/常规/深度三档的理想参数量（B），用于计算分档适配度 |
 | TG_AUTO_TIER_LIGHT_CHARS | 400 | 轻量档的输入字符上限（小于此值且轮次少 → 轻量档） |
 | TG_AUTO_TIER_DEEP_CHARS | 3000 | 深度档的输入字符阈值（大于此值 → 深度档） |
-| TG_AUTO_WEIGHTS | tier=0.35,quality=0.35,pref=0.15,quant=0.10,speed=0 | 综合打分权重；`tier`（分档）与 `quality`（质量）默认等权 |
+| TG_AUTO_WEIGHTS | tier=0.30,quality=0.30,speed=0.30,pref=0.15,quant=0.10 | 综合打分权重；`tier`/`quality`/`speed` 三项默认**等权** |
+| TG_SPEED_WINDOW | 200 | 速度统计的滑动窗口：每个模型每个 prompt 桶保留的样本数 |
+| TG_SPEED_MIN_SAMPLES | 12 | 速度统计的最小样本数；桶内不足此值视为「无实测」，该因子给中性分 0.40 |
+| TG_SPEED_TAU | 10 | 速度软映射的时间常数（秒）：`speed = tau/(tau+耗时)`，越大越宽容 |
+| TG_TOKENS_PER_CHAR | 0.5 | 字符→token 的粗略换算，仅用于把请求映射到速度桶，不参与计费 |
 | TG_AUTO_QUALITY | (空) | 显式优先顺序（逗号分隔，从高到低）；表内模型优先于表外，表内再按加权排序；允许写别名 |
 | TG_AUTO_BUSY_THRESHOLD | 1 | 繁忙阈值：在飞请求数 ≥ 此值即跳过该模型（默认 1 = 有人正在用就换） |
 | TG_AUTO_EXCLUDE | (空) | `auto` 额外排除的模型（逗号分隔，叠加在 `deny_models` 与 `global.auto_exclude` 之上） |
@@ -161,7 +163,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.token-gateway.server
 
 | 策略 | 行为 |
 |---|---|
-| `balanced`（默认） | 先按 prompt 规模给请求**分档**（轻量/常规/深度），再把「分档适配」与「绝对质量」按**等权**加权，加上显式偏好、量化保真算出综合分，取最高分。结果稳定可预期，短问答走小模型、复杂任务上大模型 |
+| `balanced`（默认） | 先按 prompt 规模给请求**分档**（轻量/常规/深度），再把「分档适配」「绝对质量」「实测速度」按**等权**加权，加上显式偏好、量化保真算出综合分，取最高分。结果稳定可预期，短问答走小模型、复杂任务上大模型 |
 | `quality` | 纯**模型精度**降序（参数量 → 量化），忽略请求体量，一律用最强模型；最优质的被占用时让位给次优的空闲模型 |
 | `least-busy` | 先按网关侧在飞请求数筛出**空闲**候选，在空闲集合内轮询；全部繁忙时退化为「选负载最低者」，不会直接失败 |
 | `round-robin` | 忽略负载与质量，纯轮流（候选按模型名排序，顺序可复现） |
@@ -187,15 +189,18 @@ score = Σ (wᵢ × fᵢ) / Σ wᵢ
 
 | 因子 | 含义 | 默认权重 | 打分方式（0~1） |
 |---|---|---|---|
-| `tier` | **分档适配** | **0.35** | 模型参数量与本档理想值的**对数距离高斯衰减** `exp(-d²/2σ²)`，σ = 0.35/0.55/0.70（轻/常/深）；深度档只惩罚「偏小」，更大的模型同样算贴合 |
-| `quality` | **绝对质量** | **0.35** | 参数量在候选池内的对数位置归一化；参数量取 Ollama `details.parameter_size`，缺失时解析模型名（`A10B` 激活参数会被忽略） |
+| `tier` | **分档适配** | **0.30** | 模型参数量与本档理想值的**对数距离高斯衰减** `exp(-d²/2σ²)`，σ = 0.35/0.55/0.70（轻/常/深）；深度档只惩罚「偏小」，更大的模型同样算贴合 |
+| `quality` | **绝对质量** | **0.30** | 参数量在候选池内的对数位置归一化；参数量取 Ollama `details.parameter_size`，缺失时解析模型名（`A10B` 激活参数会被忽略） |
 | `pref` | 显式优先 | 0.15 | `global.auto_quality` 表内第 1 位 1.0，之后 `0.85^i`；未配置该表时此因子整体剔除 |
 | `quant` | 量化保真 | 0.10 | `F32/BF16/F16 = 1.0 → Q8 ≈ 0.67 → Q4 ≈ 0.17 → Q3/Q2 = 0` |
-| `speed` | 速度收益 | 0（关闭） | `1 − quality`。与 `quality` 是同一根轴的两端，默认关掉，否则会隐式稀释质量权重 |
+| `speed` | **实测速度** | **0.30** | `tau/(tau+t)`，t 为该模型在**同 prompt 规模桶**内的实测耗时中位数（`tau` 默认 10s）；桶内不足 12 条样本时返回中性 0.40，**不用参数量猜** |
 
 要点：
 
-- **分档与质量严格等权**，不存在「先按档位筛掉一批、再按质量挑」的硬顺序，两者各自独立打分后加权求和。权重只影响结果，不改变流程。
+- **分档、质量、速度三项严格等权**，不存在「先按档位筛掉一批、再按质量挑」的硬顺序，三者各自独立打分后加权求和。权重只影响结果，不改变流程。
+- **速度必须用实测，不能用参数量反推**：实测 122B（MLX + 前缀缓存）在 3k~20k 上下文区间比 8B（Ollama，无前缀缓存）快约 2.7 倍（12.1s vs 32.6s），「小模型一定更快」在本机并不成立。旧的 `speed = 1 − quality` 写法与质量完全共线，等价于把质量权重抵消掉一半。
+- 速度按 prompt 规模分桶（<3k / 3k~20k / ≥20k token），**不做跨桶回退**：不同量级的耗时不可互换，拿短请求样本顶替长请求等于编造数字。
+- 速度软映射用**绝对时间**而非「相对最快者」：池内一个 0.2s 的微模型会把其余候选统一压到下限，使速度因子失去分辨力。
 - 权重为 0 的因子、未配置的因子会从分母里剔除，不会拉低总分（所以配了 `pref` 表时其余因子会等比例放大）。
 - **负载是硬约束**：先排除在飞请求数 ≥ `TG_AUTO_BUSY_THRESHOLD` 的候选，再在空闲集合内比综合分；全部繁忙时在负载最低的一撮里比综合分，不会直接 503。
 - 参数量的对数尺度让 8B 与 122B 相差约 1.18 个数量级，跨档能拉开足够差距；`tier` 与 `quality` 同权时，**轻量档由分档项主导选小模型，常规/深度档由质量项主导选大模型**。
@@ -227,9 +232,10 @@ TG_AUTO_WEIGHTS="tier=0.5,quality=0.3,quant=0.1,pref=0.1"
 TG_AUTO_TIER_LIGHT_CHARS=600
 ```
 
-- 想更省时间：调高 `tier`、调大 `auto_tier_light_chars`，让更多请求落进轻量档。
-- 想一律用最强：`quality` 调到 0.8 以上，或直接 `TG_AUTO_STRATEGY=quality`。
-- 想走速度优先：把 `speed` 提到 0.3~0.5（此时它与 `quality` 对冲，等价于「同档优先小模型」）。
+- 想更省时间：调高 `speed`（默认已与质量等权），或调大 `auto_tier_light_chars` 让更多请求落进轻量档。
+- 想一律用最强：`quality` 调到 0.8 以上并把 `speed` 降到 0，或直接 `TG_AUTO_STRATEGY=quality`。
+- 想更偏向实测最快的模型：把 `speed` 提到 0.5 以上；反过来把 `speed` 设为 0 即完全忽略实测耗时。
+- 速度样本冷启动（新部署、新模型）：窗口内不足 `TG_SPEED_MIN_SAMPLES` 条时该因子给中性 0.40，运行 `TG_SPEED_MIN_SAMPLES` 次后会自然校准；也可调大 `TG_SPEED_TAU` 让速度分更平缓。
 
 #### 质量排序规则（`quality` 策略）
 
@@ -458,7 +464,7 @@ curl -X POST http://127.0.0.1:3000/api/admin/keys -H "X-Admin-Token: $ADMIN_TOKE
 | `auto_tier_ideals` | number[] | `[8, 30, 122]` | 轻量/常规/深度三档的理想参数量（B） |
 | `auto_tier_light_chars` | int | `400` | 轻量档输入字符上限 |
 | `auto_tier_deep_chars` | int | `3000` | 深度档输入字符阈值 |
-| `auto_weights` | object \| string | `{tier:0.35, quality:0.35, pref:0.15, quant:0.10, speed:0}` | 综合打分权重，可写对象或 `"tier=0.5,quality=0.3"` 字符串；分档与质量默认等权 |
+| `auto_weights` | object \| string | `{tier:0.30, quality:0.30, speed:0.30, pref:0.15, quant:0.10}` | 综合打分权重，可写对象或 `"tier=0.5,quality=0.3"` 字符串；分档/质量/速度默认等权 |
 | `listen_host` | string | `0.0.0.0` | 监听地址 |
 | `listen_port` | int | `3000` | 监听端口（优先于 `TG_PORT`） |
 
@@ -828,9 +834,10 @@ APC self-check ok mode=exact schema=v1 layers=48 ...
 python3 tests/test_ctx_trunc.py     # 超出上下文窗口被截短时不得 500（4 项）
 python3 tests/test_timeout.py       # 静默预算 / 缓冲发送 / 504·502 语义 / 流式错误事件（27 项）
 python3 tests/test_tools_budget.py  # 工具调用请求的输出预算下限（9 项）
+python3 tests/test_speed_weight.py  # speed 因子：权重结构 / 分档分派 / 无样本不占便宜 / 单调性
 ```
 
-三者都可通过环境变量改指向：
+四个脚本都可通过环境变量改指向：
 
 | 变量 | 作用 |
 |---|---|
@@ -844,6 +851,8 @@ python3 tests/test_tools_budget.py  # 工具调用请求的输出预算下限（
 
 | 日期 | 提交 | 内容 |
 |---|---|---|
+| 2026-11-07 | `aa5f4aec` | **修复工具调用被输出预算截断导致的 `Empty stream`**：上游把整个 `tool_call` 放在单个 chunk 里下发，客户端固定 `max_tokens=2048` 时命中「VLM 上游不强制」豁免 → 预算耗尽只回半截 JSON（`chunks=1`、`finish_reason=length`）→ 客户端判定零模型 token 并重试。豁免改为按请求类型判定：带图仍不强制，纯文本 + tools 抬到 `TG_MIN_MAX_TOKENS_TOOLS`（默认 8192）；新增 `tests/test_tools_budget.py` |
+| 2026-11-05 | `67e5c773` | **回归用例入库 + 部署模板纠偏**：新增 `tests/test_ctx_trunc.py`（超窗截短不得 500）与 `tests/test_timeout.py`（静默预算 / 缓冲发送 / 504·502 / 流式错误事件，27 项），两者自包含、用临时端口与 stub 上游，不碰线上实例；`com.token-gateway.server.plist` 的 `TG_READ_TIMEOUT` 240 → 600 并补 `TG_BUFFER_NONSTREAM=1`，与生产一致 |
 | 2026-11-05 | `21d14d3b` | **修复 `500 internal_error`（`KeyError: 'max_tokens'`）**：122B 上游属 VLM 组 → `TG_MIN_MAX_TOKENS` 对其实效为 0 → 网关不补写 `max_tokens`；客户端也未传；超上下文窗口进入"截短历史"分支时日志无条件下标读取该键即崩。改为统一用局部变量、加类型兜底，并让兜底异常记录完整堆栈 |
 | 2026-11-05 | `4902de3e` | **上游开启 APC（prefix cache）**：mlx_vlm 的 `APC_ENABLED` 默认 0，导致 agent 每轮重发 6 万上下文全量 prefill（实测 62,105 P / 67 C 耗时 247.8s）；开启后 29.7k 上下文相同前缀 14.3s → 0.29s、追加一轮 0.50s。README 新增「上游加速」章节，并修正 launchd EIO 误报的处理方式 |
 | 2026-11-05 | `17c183d0` | **长上下文不再"被取消"**：`TG_READ_TIMEOUT` 明确为单次静默预算；非流式改为缓冲后发送并带 `Content-Length`；超时返回 504 `upstream_timeout`、断流/未收全返回 502 `upstream_broken`；超时不重试；新增 `TG_BUFFER_NONSTREAM`；修复 auto 繁忙计数释放时机（上游读完即释放，避免误判繁忙跳到弱模型） |
