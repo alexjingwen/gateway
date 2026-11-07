@@ -58,6 +58,7 @@ TG_DISABLE_HTTPS=1 TG_PORT=3000 python3 token-gateway.py
 ### 环境变量（TG_*）
 | 变量 | 默认 | 说明 |
 |---|---|---|
+| 2026-11-07 | `4511ddf2` | **speed 因子改为实测耗时并与分档/质量等权**：旧的 `speed = 1 - quality` 与质量完全共线（开启等于抵消一半质量权重），故长期为 0；实测 122B 在 3k~20k 上下文比 8B 快 2.7 倍，参数量不能当速度代理。新增 LatencyStats 按 (模型, prompt 桶) 记录真实耗时并取中位数，`speed = tau/(tau+t)` 绝对软映射；样本不足给中性 0.40、不做跨桶回退；权重改为 tier/quality/speed 各 0.30 |
 | TG_HOST | 0.0.0.0 | 监听地址 |
 | TG_PORT | 3000 | 监听端口（`config.json` 的 `listen_port` 优先） |
 | TG_DISABLE_HTTPS | (空) | 设为 1 关闭 HTTPS（走明文 HTTP） |
