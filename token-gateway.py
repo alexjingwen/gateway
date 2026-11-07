@@ -2326,15 +2326,29 @@ iframe{{padding-top:0}}
             except (TypeError, ValueError):
                 _max_tokens = 4096
             # 强制最小 max_tokens，防止 dsh 等客户端发送过小的 max_tokens 导致回复被截断。
-            # 可用 TG_MIN_MAX_TOKENS 覆盖；**VLM 上游（多模态）一律不强制** ——
+            # 可用 TG_MIN_MAX_TOKENS 覆盖；**VLM 上游的多模态请求不强制** ——
             # 视觉调用要的是"短结构化输出 + 低延迟"，把 200 抬到 32768 会让模型长篇胡写，
             # 单次请求从 ~30s 涨到 10 分钟，期间一直占着 global 并发额度。
             # 实测：10 个槽位被这类挂死请求占满 → 所有客户端（含挂机 bot）收到瞬时 429。
+            #
+            # 但豁免必须按**请求类型**而不是按主机判定：122B 同时挂在 RAPID_MLX_HOSTS
+            # 与 RAPID_MLX_VLM_HOSTS 上，纯文本的 agent 请求同样会命中这条豁免。
+            # 而 IDE 客户端通常固定 max_tokens=2048，工具调用又是**整块下发**的：
+            # 预算耗尽时上游只回一个 finish_reason=length 的半截 tool_call，
+            # 客户端解析不出完整调用 → 报 "Empty stream ... chunks=1"（已实测复现）。
+            # 所以：带图 → 0（维持原语义）；纯文本 + 工具 → TG_MIN_MAX_TOKENS_TOOLS。
             _MIN_MAX_TOKENS = int(os.environ.get("TG_MIN_MAX_TOKENS", "32768"))
+            _has_tools = bool(original_req.get("tools") or original_req.get("functions"))
             if upstream_host in RAPID_MLX_VLM_HOSTS:
-                _MIN_MAX_TOKENS = 0
+                if self._auto_req_has_image(original_req):
+                    _MIN_MAX_TOKENS = 0
+                elif _has_tools:
+                    _MIN_MAX_TOKENS = int(os.environ.get("TG_MIN_MAX_TOKENS_TOOLS", "8192"))
+                else:
+                    _MIN_MAX_TOKENS = 0
             if _MIN_MAX_TOKENS and _max_tokens < _MIN_MAX_TOKENS:
-                log(f"⬆️  提升 max_tokens: {_max_tokens} → {_MIN_MAX_TOKENS} (强制最小值) → {client_ip}")
+                _why = "工具调用预算" if _has_tools else "强制最小值"
+                log(f"⬆️  提升 max_tokens: {_max_tokens} → {_MIN_MAX_TOKENS} ({_why}) → {client_ip}")
                 original_req["max_tokens"] = _MIN_MAX_TOKENS
                 _max_tokens = _MIN_MAX_TOKENS
                 body_bytes = json.dumps(original_req, ensure_ascii=False).encode("utf-8")

@@ -84,7 +84,8 @@ TG_DISABLE_HTTPS=1 TG_PORT=3000 python3 token-gateway.py
 | TG_VLM_READ_TIMEOUT | 120 | 多模态（带图）请求的单次静默上限（秒） |
 | TG_BUFFER_NONSTREAM | 1 | 非流式请求**先缓冲完整响应再回给客户端**：上游失败时能返回真实 5xx 与 `Content-Length`，而不是"截断的 200"。设 0 退回旧行为（立即发头、边读边转发，失败即断流） |
 | TG_CONNECT_TIMEOUT | 10 | 上游连接超时（秒） |
-| TG_MIN_MAX_TOKENS | 32768 | Rapid-MLX 上游的 `max_tokens` 强制下限（防止客户端给小值被截断）；**VLM 上游不生效**，设 0 关闭 |
+| TG_MIN_MAX_TOKENS | 32768 | Rapid-MLX 上游的 `max_tokens` 强制下限（防止客户端给小值被截断）；**VLM 上游的多模态请求不生效**，设 0 关闭 |
+| TG_MIN_MAX_TOKENS_TOOLS | 8192 | **纯文本 + 工具调用**请求的 `max_tokens` 下限（即使上游属 VLM 组也生效）。工具调用是整块下发的，预算不足时上游只回半截 `tool_call` + `finish_reason=length`，客户端会报 `Empty stream`；设 0 关闭该下限 |
 | TG_CONFIG_DIR | ~/.ollama-token-gateway | config.json / certs / logs 所在目录 |
 | TG_LOG_DIR | `$TG_CONFIG_DIR/logs` | 用量日志 `usage.jsonl` 所在目录 |
 
@@ -648,6 +649,15 @@ launchctl unload ~/Library/LaunchAgents/com.user.memguard.plist
 | 切模型后输出风格变化大 | `auto` 本来就可能落到不同模型 | 需要稳定输出请显式指定 `model`；或用 `global.auto_quality` 收窄候选 |
 | 调整了 `auto_weights` / `auto_tier_*` 但没变化 | 这些配置在**服务启动时**读入内存（`_cfg`），改文件不会热加载；且 plist 里的同名 env 会覆盖 config | 改完 `config.json` 或 plist 后重启：`launchctl kickstart -k gui/$(id -u)/com.token-gateway.server` |
 
+### 客户端报 `Empty stream ... finish_reason=length`
+
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| IDE 报 `Empty stream: upstream ended the turn with finish_reason=length before emitting any model token (chunks=1, bytes=…)` | **工具调用被输出预算截断**：上游把整个 `tool_call` 放在**一个 chunk** 里下发，预算耗尽时该 chunk 只有半截 JSON，客户端解析不出完整调用，于是判定「没有任何模型 token」 | 网关默认把「纯文本 + `tools`」请求的 `max_tokens` 抬到 `TG_MIN_MAX_TOKENS_TOOLS`（8192），日志可见 `⬆️ 提升 max_tokens: 2048 → 8192 (工具调用预算)`。若仍复现，说明单次工具调用的载荷本身超过 8192，需在客户端调大输出上限或减少单次写入量 |
+
+> 复现方式：带 `tools` 的请求传 `max_tokens=48`，会看到一个 chunk（约 444 bytes）、`finish_reason=length`、既无 `content` 也无完整 `tool_calls` —— 与客户端报错的 `chunks=1, bytes=1139` 同形。
+> 注意这不是网关丢包：网关是逐帧转发的，截断发生在上游的 `max_tokens` 边界上。
+
 ### GitHub 推送相关
 | 现象 | 可能原因 | 处理 |
 |---|---|---|
@@ -814,11 +824,12 @@ APC self-check ok mode=exact schema=v1 layers=48 ...
 `tests/` 下是**自包含**回归用例：每个脚本自己在临时端口起一个真实网关实例（独立 config 与日志目录），并配一个本地 stub 上游，**不碰线上实例、不加载任何真实模型**。
 
 ```bash
-python3 tests/test_ctx_trunc.py    # 超出上下文窗口被截短时不得 500（4 项）
-python3 tests/test_timeout.py      # 静默预算 / 缓冲发送 / 504·502 语义 / 流式错误事件（27 项）
+python3 tests/test_ctx_trunc.py     # 超出上下文窗口被截短时不得 500（4 项）
+python3 tests/test_timeout.py       # 静默预算 / 缓冲发送 / 504·502 语义 / 流式错误事件（27 项）
+python3 tests/test_tools_budget.py  # 工具调用请求的输出预算下限（9 项）
 ```
 
-两者都可通过环境变量改指向：
+三者都可通过环境变量改指向：
 
 | 变量 | 作用 |
 |---|---|
