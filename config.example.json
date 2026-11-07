@@ -33,11 +33,11 @@
     "auto_tier_light_chars": 400,
     "auto_tier_deep_chars": 3000,
     "auto_weights": {
-      "tier": 0.35,
-      "quality": 0.35,
+      "tier": 0.3,
+      "quality": 0.3,
+      "speed": 0.3,
       "pref": 0.15,
-      "quant": 0.1,
-      "speed": 0
+      "quant": 0.1
     },
     "listen_host": "0.0.0.0",
     "listen_port": 3000

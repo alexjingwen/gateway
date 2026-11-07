@@ -58,7 +58,6 @@ TG_DISABLE_HTTPS=1 TG_PORT=3000 python3 token-gateway.py
 ### 环境变量（TG_*）
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| 2026-11-07 | `4511ddf2` | **speed 因子改为实测耗时并与分档/质量等权**：旧的 `speed = 1 - quality` 与质量完全共线（开启等于抵消一半质量权重），故长期为 0；实测 122B 在 3k~20k 上下文比 8B 快 2.7 倍，参数量不能当速度代理。新增 LatencyStats 按 (模型, prompt 桶) 记录真实耗时并取中位数，`speed = tau/(tau+t)` 绝对软映射；样本不足给中性 0.40、不做跨桶回退；权重改为 tier/quality/speed 各 0.30 |
 | TG_HOST | 0.0.0.0 | 监听地址 |
 | TG_PORT | 3000 | 监听端口（`config.json` 的 `listen_port` 优先） |
 | TG_DISABLE_HTTPS | (空) | 设为 1 关闭 HTTPS（走明文 HTTP） |
@@ -90,6 +89,11 @@ TG_DISABLE_HTTPS=1 TG_PORT=3000 python3 token-gateway.py
 | TG_CONNECT_TIMEOUT | 10 | 上游连接超时（秒） |
 | TG_MIN_MAX_TOKENS | 32768 | Rapid-MLX 上游的 `max_tokens` 强制下限（防止客户端给小值被截断）；**VLM 上游的多模态请求不生效**，设 0 关闭 |
 | TG_MIN_MAX_TOKENS_TOOLS | 8192 | **纯文本 + 工具调用**请求的 `max_tokens` 下限（即使上游属 VLM 组也生效）。工具调用是整块下发的，预算不足时上游只回半截 `tool_call` + `finish_reason=length`，客户端会报 `Empty stream`；设 0 关闭该下限 |
+
+> **数值型变量写错不会让服务挂掉**：端口、并发、超时、预算、速度参数统一走 `_env_num()` 解析。
+> 空串、带单位（`TG_READ_TIMEOUT=600s`）、非数字（`TG_MIN_MAX_TOKENS=32k`）一律**回退内置默认值**并打印
+> `⚠️ 环境变量 XXX='600s' 非法，已回退默认值 900`；超出安全区间的值（如 `TG_SPEED_TAU=0`）夹到下限。
+> 启动横幅打印的是**实际生效值**，不是原始字符串——所以看到 `文本 900s` 就说明 `600s` 没被采信。
 | TG_CONFIG_DIR | ~/.ollama-token-gateway | config.json / certs / logs 所在目录 |
 | TG_LOG_DIR | `$TG_CONFIG_DIR/logs` | 用量日志 `usage.jsonl` 所在目录 |
 
@@ -643,6 +647,7 @@ launchctl unload ~/Library/LaunchAgents/com.user.memguard.plist
 | 响应头到了、正文迟迟不来 | 非流式请求在等上游完整生成（缓冲模式），属预期 | 看日志 `⏱️ 上游超时` 与 `📊 ... 用时`；对首字节敏感可设 `TG_BUFFER_NONSTREAM=0` |
 | `504 upstream_timeout` | 上游在静默预算内没给任何字节 | 重试；或换更小的模型 / 缩短上下文；确认 122B 未被其他客户端占满 |
 | `502 upstream_broken` | 上游中途断连或声明了 `Content-Length` 却没收全 | 看 `⚠️ 读取上游响应中断` 后的具体异常；通常是上游 OOM 或进程重启 |
+| `500 internal_error`（无堆栈、无上游错误）且**每个请求都 500** | 环境变量写法非法（如 `TG_READ_TIMEOUT=600s`、plist 里留空串），旧版在请求路径上裸 `int()` 解析抛 `ValueError` | 已修复（统一 `_env_num()` 兜底）：日志会出现 `⚠️ 环境变量 XXX=... 非法，已回退默认值`；确认版本 ≥ `4ce1cc0f` |
 | `500 internal_error`（日志 `KeyError: 'max_tokens'`） | 请求超过上下文窗口、走"截短历史"分支时，客户端未传 `max_tokens`，旧版日志语句直接下标读取该字段 | 已在 2026-11-05 修复（改用局部变量）。确认版本 ≥ `144dbf9a`；升级后同样场景返回 200 并在日志留下 `✂️ 截短历史消息` |
 
 ### auto 分配相关
@@ -836,9 +841,10 @@ python3 tests/test_ctx_trunc.py     # 超出上下文窗口被截短时不得 50
 python3 tests/test_timeout.py       # 静默预算 / 缓冲发送 / 504·502 语义 / 流式错误事件（27 项）
 python3 tests/test_tools_budget.py  # 工具调用请求的输出预算下限（9 项）
 python3 tests/test_speed_weight.py  # speed 因子：权重结构 / 分档分派 / 无样本不占便宜 / 单调性
+python3 tests/test_env_guard.py     # 数值型环境变量写坏时降级不崩（静态断言 + 导入期回退 + 请求期 200，21 项）
 ```
 
-四个脚本都可通过环境变量改指向：
+五个脚本都可通过环境变量改指向：
 
 | 变量 | 作用 |
 |---|---|
@@ -852,6 +858,7 @@ python3 tests/test_speed_weight.py  # speed 因子：权重结构 / 分档分派
 
 | 日期 | 提交 | 内容 |
 |---|---|---|
+| 2026-11-07 | `4511ddf2` | **speed 因子改为实测耗时并与分档/质量等权**：旧的 `speed = 1 - quality` 与质量完全共线（开启等于抵消一半质量权重），故长期为 0；实测 122B 在 3k~20k 上下文比 8B 快 2.7 倍，参数量不能当速度代理。新增 LatencyStats 按 (模型, prompt 桶) 记录真实耗时并取中位数，`speed = tau/(tau+t)` 绝对软映射；样本不足给中性 0.40、不做跨桶回退；权重改为 tier/quality/speed 各 0.30 |
 | 2026-11-07 | `aa5f4aec` | **修复工具调用被输出预算截断导致的 `Empty stream`**：上游把整个 `tool_call` 放在单个 chunk 里下发，客户端固定 `max_tokens=2048` 时命中「VLM 上游不强制」豁免 → 预算耗尽只回半截 JSON（`chunks=1`、`finish_reason=length`）→ 客户端判定零模型 token 并重试。豁免改为按请求类型判定：带图仍不强制，纯文本 + tools 抬到 `TG_MIN_MAX_TOKENS_TOOLS`（默认 8192）；新增 `tests/test_tools_budget.py` |
 | 2026-11-05 | `67e5c773` | **回归用例入库 + 部署模板纠偏**：新增 `tests/test_ctx_trunc.py`（超窗截短不得 500）与 `tests/test_timeout.py`（静默预算 / 缓冲发送 / 504·502 / 流式错误事件，27 项），两者自包含、用临时端口与 stub 上游，不碰线上实例；`com.token-gateway.server.plist` 的 `TG_READ_TIMEOUT` 240 → 600 并补 `TG_BUFFER_NONSTREAM=1`，与生产一致 |
 | 2026-11-05 | `21d14d3b` | **修复 `500 internal_error`（`KeyError: 'max_tokens'`）**：122B 上游属 VLM 组 → `TG_MIN_MAX_TOKENS` 对其实效为 0 → 网关不补写 `max_tokens`；客户端也未传；超上下文窗口进入"截短历史"分支时日志无条件下标读取该键即崩。改为统一用局部变量、加类型兜底，并让兜底异常记录完整堆栈 |

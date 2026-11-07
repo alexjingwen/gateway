@@ -32,6 +32,35 @@ from pathlib import Path
 from collections import defaultdict, deque
 from typing import Dict, List, Optional, Tuple
 
+
+def _env_num(name: str, default, cast=int, minimum=None, maximum=None):
+    """读取数值型环境变量；非法值退回默认值，**绝不在请求路径抛异常**。
+
+    为什么必须兜底：`do_POST` 里会实时读取 TG_READ_TIMEOUT / TG_MIN_MAX_TOKENS
+    等变量。若部署脚本写成 `TG_READ_TIMEOUT=600s`，或在 plist 里留成空字符串，
+    裸 `int()` 会抛 ValueError，被最外层兜底捕获后变成**每个请求 500**
+    ——服务看着是 up 的（/health 正常），但所有对话全挂，且日志只有一句
+    internal_error，极难定位。启动期的同名错误更糟：进程直接起不来，launchd 反复重启。
+
+    这里用直接 print 而不是 log()：本函数在模块导入期就会被调用，
+    而 log() 定义在文件更后面的位置。
+    """
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        v = cast(str(raw).strip())
+    except (TypeError, ValueError):
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{ts}] ⚠️ 环境变量 {name}={raw!r} 非法，已回退默认值 {default}", flush=True)
+        return default
+    if minimum is not None and v < minimum:
+        return minimum
+    if maximum is not None and v > maximum:
+        return maximum
+    return v
+
+
 # ========== 配置 ==========
 CONFIG_DIR = Path(os.environ.get("TG_CONFIG_DIR", Path.home() / ".ollama-token-gateway"))
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -91,10 +120,7 @@ AUTO_QUANT_RANK = (
     ("Q8", 4), ("Q6", 3), ("Q5", 2), ("Q4", 1), ("Q3", 0), ("Q2", 0), ("IQ", 0),
 )
 # 繁忙阈值：某模型在飞请求数 >= 此值即视为繁忙，least-busy 会跳过它（默认 1 = 已经有人用就换）
-try:
-    AUTO_BUSY_THRESHOLD = max(1, int(os.environ.get("TG_AUTO_BUSY_THRESHOLD", "1")))
-except (TypeError, ValueError):
-    AUTO_BUSY_THRESHOLD = 1
+AUTO_BUSY_THRESHOLD = _env_num("TG_AUTO_BUSY_THRESHOLD", 1, minimum=1)
 # 额外排除的模型（逗号分隔），与 config.json 的 global.deny_models / global.auto_exclude 叠加生效
 AUTO_EXCLUDE = {m.strip() for m in os.environ.get("TG_AUTO_EXCLUDE", "").split(",") if m.strip()}
 
@@ -152,17 +178,11 @@ def _parse_weight_map(raw, default: Dict[str, float]) -> Dict[str, float]:
 # 各档理想参数量（B），可用 TG_AUTO_TIER_IDEALS / config global.auto_tier_ideals 覆盖
 AUTO_TIER_IDEALS = _parse_float_list(os.environ.get("TG_AUTO_TIER_IDEALS", ""), [8.0, 30.0, 122.0])
 # 分档阈值：短于 light 字符数视为轻量；长于 deep 字符数视为深度
-try:
-    AUTO_TIER_LIGHT_CHARS = max(1, int(os.environ.get("TG_AUTO_TIER_LIGHT_CHARS", "400")))
-except (TypeError, ValueError):
-    AUTO_TIER_LIGHT_CHARS = 400
-try:
-    AUTO_TIER_DEEP_CHARS = max(1, int(os.environ.get("TG_AUTO_TIER_DEEP_CHARS", "3000")))
-except (TypeError, ValueError):
-    AUTO_TIER_DEEP_CHARS = 3000
+AUTO_TIER_LIGHT_CHARS = _env_num("TG_AUTO_TIER_LIGHT_CHARS", 400, minimum=1)
+AUTO_TIER_DEEP_CHARS = _env_num("TG_AUTO_TIER_DEEP_CHARS", 3000, minimum=1)
 # 综合打分权重（balanced）：
-#   tier    分档适配（prompt 规模 → 合适参数量）  默认 0.35
-#   quality 绝对质量（参数量/量化）                默认 0.35
+#   tier    分档适配（prompt 规模 → 合适参数量）  默认 0.30
+#   quality 绝对质量（参数量/量化）                默认 0.30
 #   pref    显式优先表内排序                       默认 0.15
 #   quant   量化保真                               默认 0.10
 #   speed   速度收益（实测耗时越短越高）           默认 0.30
@@ -209,13 +229,13 @@ AUTO_VLM_HINTS = ("vl", "vision", "llava", "minicpm-v")
 
 
 LISTEN_HOST = os.environ.get("TG_HOST", "0.0.0.0")
-LISTEN_PORT = int(os.environ.get("TG_PORT", "3000"))
+LISTEN_PORT = _env_num("TG_PORT", 3000, minimum=1, maximum=65535)
 
 # HTTPS 配置
 CERT_DIR = CONFIG_DIR / "certs"
 CERT_FILE = CERT_DIR / "server.crt"
 KEY_FILE = CERT_DIR / "server.key"
-HTTP_REDIRECT_PORT = int(os.environ.get("TG_HTTP_PORT", "3001"))  # HTTP 端口（重定向到 HTTPS）
+HTTP_REDIRECT_PORT = _env_num("TG_HTTP_PORT", 3001, minimum=1, maximum=65535)  # HTTP 端口（重定向到 HTTPS）
 # 强制禁用 HTTPS（设为任意非空值即禁用，回退到 HTTP 单端口，方便不支持自签证书的客户端）
 DISABLE_HTTPS = bool(os.environ.get("TG_DISABLE_HTTPS"))
 
@@ -225,8 +245,8 @@ def _https_enabled() -> bool:
     return (not DISABLE_HTTPS) and CERT_FILE.exists() and KEY_FILE.exists()
 
 # 限流配置
-DEFAULT_QPS = int(os.environ.get("TG_QPS", "5"))     # 每个 Key 每秒请求数
-DEFAULT_MAX_CONCURRENCY = int(os.environ.get("TG_CONCURRENCY", "10"))  # 全局最大并发
+DEFAULT_QPS = _env_num("TG_QPS", 5, minimum=1)     # 每个 Key 每秒请求数
+DEFAULT_MAX_CONCURRENCY = _env_num("TG_CONCURRENCY", 10, minimum=1)  # 全局最大并发
 
 # ==========================
 
@@ -1137,25 +1157,30 @@ def get_month() -> str:
 # 避免用两三条样本决定路由。
 SPEED_BUCKET_EDGES = (3000, 20000)          # prompt token 分桶边界
 SPEED_BUCKET_N = len(SPEED_BUCKET_EDGES) + 1
-try:
-    SPEED_WINDOW = max(10, int(os.environ.get("TG_SPEED_WINDOW", "200")))
-except (TypeError, ValueError):
-    SPEED_WINDOW = 200
-try:
-    SPEED_MIN_SAMPLES = max(2, int(os.environ.get("TG_SPEED_MIN_SAMPLES", "12")))
-except (TypeError, ValueError):
-    SPEED_MIN_SAMPLES = 12
-# 字符→token 的粗略换算（中英混排实测约 0.5），只用于选桶，不参与计费
-try:
-    TOKENS_PER_CHAR = float(os.environ.get("TG_TOKENS_PER_CHAR", "0.5"))
-except (TypeError, ValueError):
-    TOKENS_PER_CHAR = 0.5
+SPEED_WINDOW = _env_num("TG_SPEED_WINDOW", 200, minimum=10)
+SPEED_MIN_SAMPLES = _env_num("TG_SPEED_MIN_SAMPLES", 12, minimum=2)
+# 字符→token 的粗略换算（中英混排实测约 0.5），只用于选桶，不参与计费。
+# 下限定 0.01：设成 0 会让所有请求都映射到 0 token（全都落进最小桶），速度因子退化为单一桶。
+TOKENS_PER_CHAR = _env_num("TG_TOKENS_PER_CHAR", 0.5, cast=float, minimum=0.01)
 # 速度软映射的参考耗时：speed = tau/(tau+t)。用绝对值而非"相对最快者"，
 # 否则池内一个极快的微模型（如 0.2s 的视觉微调用）会把其余候选统一压到 0.05 下限。
-try:
-    SPEED_TAU = max(0.5, float(os.environ.get("TG_SPEED_TAU", "10")))
-except (TypeError, ValueError):
-    SPEED_TAU = 10.0
+SPEED_TAU = _env_num("TG_SPEED_TAU", 10.0, cast=float, minimum=0.5)
+
+
+def _latency_names(model: str) -> Tuple[str, ...]:
+    """把模型名展开成「上游 id + 别名」两种记账键。
+
+    必须两个方向都覆盖：auto 候选池里的模型名可能是上游 id（快照内取到的名字），
+    而用量日志里记的可能是别名（客户端调用时写的那一侧）。只记一边就会出现
+    「实时跑过的请求能查到速度样本，重启后同一模型却查不到」的错位。
+    """
+    if not model:
+        return ()
+    names = [model]
+    alt = _MODEL_REVERSE_ALIAS.get(model) or MODEL_ALIASES.get(model)
+    if alt and alt != model:
+        names.append(alt)
+    return tuple(names)
 
 
 class LatencyStats:
@@ -1173,16 +1198,23 @@ class LatencyStats:
                 return i
         return SPEED_BUCKET_N - 1
 
-    def record(self, model: str, prompt_tokens: int, elapsed_s: float):
+    def record(self, model: str, prompt_tokens: int, elapsed_s: float) -> bool:
+        """写入一条实测耗时；模型名会按「id + 别名」双记。返回是否真的记了。"""
         if not model or elapsed_s is None or elapsed_s <= 0:
-            return
+            return False
+        names = _latency_names(model)
+        if not names:
+            return False
         b = self.bucket_of(prompt_tokens)
+        val = float(elapsed_s)
         with self._lock:
-            buckets = self._data.get(model)
-            if buckets is None:
-                buckets = [deque(maxlen=SPEED_WINDOW) for _ in range(SPEED_BUCKET_N)]
-                self._data[model] = buckets
-            buckets[b].append(float(elapsed_s))
+            for name in names:
+                buckets = self._data.get(name)
+                if buckets is None:
+                    buckets = [deque(maxlen=SPEED_WINDOW) for _ in range(SPEED_BUCKET_N)]
+                    self._data[name] = buckets
+                buckets[b].append(val)
+        return True
 
     def estimate(self, model: str, prompt_tokens: int) -> Optional[float]:
         """该模型在给定 prompt 规模下的典型耗时（秒）；该桶样本不足返回 None。
@@ -1226,8 +1258,8 @@ class LatencyStats:
                 r = json.loads(line)
             except Exception:
                 continue
-            self.record(r.get("model", ""), r.get("prompt_tokens", 0), r.get("elapsed_s") or 0)
-            n += 1
+            if self.record(r.get("model", ""), r.get("prompt_tokens", 0), r.get("elapsed_s") or 0):
+                n += 1
         return n
 
     def snapshot(self) -> Dict[str, List[int]]:
@@ -1284,11 +1316,8 @@ class UsageTracker:
         today = get_today()
         month = today[:7]
 
-        # 速度因子数据源：同时按上游 id 与别名记账，保证 auto 候选池按别名能查到
+        # 速度因子数据源：record 内部会按「上游 id + 别名」双记，这里只需调一次
         MODEL_LATENCY.record(model, prompt_tokens, elapsed_s)
-        _alias = _MODEL_REVERSE_ALIAS.get(model)
-        if _alias and _alias != model:
-            MODEL_LATENCY.record(_alias, prompt_tokens, elapsed_s)
 
         with state_lock:
             self.daily[api_key][today] += total_tokens
@@ -2471,13 +2500,13 @@ iframe{{padding-top:0}}
             # 预算耗尽时上游只回一个 finish_reason=length 的半截 tool_call，
             # 客户端解析不出完整调用 → 报 "Empty stream ... chunks=1"（已实测复现）。
             # 所以：带图 → 0（维持原语义）；纯文本 + 工具 → TG_MIN_MAX_TOKENS_TOOLS。
-            _MIN_MAX_TOKENS = int(os.environ.get("TG_MIN_MAX_TOKENS", "32768"))
+            _MIN_MAX_TOKENS = _env_num("TG_MIN_MAX_TOKENS", 32768, minimum=0)
             _has_tools = bool(original_req.get("tools") or original_req.get("functions"))
             if upstream_host in RAPID_MLX_VLM_HOSTS:
                 if self._auto_req_has_image(original_req):
                     _MIN_MAX_TOKENS = 0
                 elif _has_tools:
-                    _MIN_MAX_TOKENS = int(os.environ.get("TG_MIN_MAX_TOKENS_TOOLS", "8192"))
+                    _MIN_MAX_TOKENS = _env_num("TG_MIN_MAX_TOKENS_TOOLS", 8192, minimum=0)
                 else:
                     _MIN_MAX_TOKENS = 0
             if _MIN_MAX_TOKENS and _max_tokens < _MIN_MAX_TOKENS:
@@ -2562,8 +2591,8 @@ iframe{{padding-top:0}}
         # （报 "cannot read from timed out object"），所以不能把读切成小段轮询，
         # 一旦超时只能整条放弃——这也正是这里必须给足预算的原因。
         # 多模态（带图）请求单独用更短的 TG_VLM_READ_TIMEOUT：视觉决策正常 10~30s 就回。
-        connect_timeout = int(os.environ.get("TG_CONNECT_TIMEOUT", "10"))
-        read_timeout = int(os.environ.get("TG_READ_TIMEOUT", "900"))
+        connect_timeout = _env_num("TG_CONNECT_TIMEOUT", 10, minimum=1)
+        read_timeout = _env_num("TG_READ_TIMEOUT", 900, minimum=1)
         _req_has_image = False
         if isinstance(original_req, dict):
             for _m in original_req.get("messages", []) or []:
@@ -2577,7 +2606,7 @@ iframe{{padding-top:0}}
             if not _req_has_image and (original_req.get("images") or original_req.get("image")):
                 _req_has_image = True
         if _req_has_image:
-            read_timeout = int(os.environ.get("TG_VLM_READ_TIMEOUT", "120"))
+            read_timeout = _env_num("TG_VLM_READ_TIMEOUT", 120, minimum=1)
 
         t0 = time.time()
         resp = None
@@ -3363,8 +3392,10 @@ def print_banner():
     # 把实际生效的超时/转发模式打出来：这些值来自 launchd 注入的 env，
     # 改 plist 后若只做 kickstart，launchd 会沿用**加载时**的旧值，
     # 打印出来才能一眼看出"配置改没生效"。
-    _rt = os.environ.get("TG_READ_TIMEOUT", "900")
-    _vt = os.environ.get("TG_VLM_READ_TIMEOUT", "120")
+    # 横幅必须显示**实际生效值**而不是原始环境变量：写错（如 "600s"）时若照原样打印，
+    # 会让人以为预算是 600s 而实际回退成了 900s，排查方向直接跑偏。
+    _rt = _env_num("TG_READ_TIMEOUT", 900, minimum=1)
+    _vt = _env_num("TG_VLM_READ_TIMEOUT", 120, minimum=1)
     _bn = "缓冲" if os.environ.get("TG_BUFFER_NONSTREAM", "1") not in ("0", "false", "no", "off") else "直通"
     print(f"  ⏱️  静默预算:    文本 {_rt}s / 带图 {_vt}s   非流式转发: {_bn}")
     _lat = MODEL_LATENCY.snapshot()
