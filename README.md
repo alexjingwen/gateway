@@ -89,15 +89,17 @@ TG_DISABLE_HTTPS=1 TG_PORT=3000 python3 token-gateway.py
 | TG_VLM_READ_TIMEOUT | 120 | 多模态（带图）请求的单次静默上限（秒） |
 | TG_BUFFER_NONSTREAM | 1 | 非流式请求**先缓冲完整响应再回给客户端**：上游失败时能返回真实 5xx 与 `Content-Length`，而不是"截断的 200"。设 0 退回旧行为（立即发头、边读边转发，失败即断流） |
 | TG_CONNECT_TIMEOUT | 10 | 上游连接超时（秒） |
-| TG_MIN_MAX_TOKENS | 32768 | Rapid-MLX 上游的 `max_tokens` 强制下限（防止客户端给小值被截断）；**VLM 上游的多模态请求不生效**，设 0 关闭 |
-| TG_MIN_MAX_TOKENS_TOOLS | 8192 | **纯文本 + 工具调用**请求的 `max_tokens` 下限（即使上游属 VLM 组也生效）。工具调用是整块下发的，预算不足时上游只回半截 `tool_call` + `finish_reason=length`，客户端会报 `Empty stream`；设 0 关闭该下限 |
+| TG_MIN_MAX_TOKENS | 32768 | **Rapid-MLX 非 VLM 上游**的 `max_tokens` 强制下限（防止客户端给小值被截断）；VLM 上游的带图请求与纯文本请求都不生效，设 0 关闭 |
+| TG_MIN_MAX_TOKENS_TOOLS | 8192 | **纯文本 + 工具调用**请求的 `max_tokens` 下限（两个上游组都生效）。工具调用是整块下发的，预算不足时上游只回半截 `tool_call` + `finish_reason=length`，客户端会报 `Empty stream`；设 0 关闭该下限 |
+| TG_MIN_MAX_TOKENS_TEXT | 2048 | **Ollama 等非 Rapid-MLX 上游的纯文本**请求 `max_tokens` 下限（带图请求不受限）。gemma4 这类"会思考"的模型先把预算烧在思维链上，预算不足时 `content` 为空、`finish_reason=length`，客户端只看到一条空回复；设 0 关闭 |
+| TG_REASONING_RETRY_TOKENS | 4096 | 命中「空正文 + 有 `reasoning` + `finish_reason=length`」时的重发预算，实际取 `max(本值, 本次生效预算×4)`。仅对非流式、且响应尚未发往客户端的请求生效，**最多重发一次** |
+| TG_CONFIG_DIR | ~/.ollama-token-gateway | config.json / certs / logs 所在目录 |
+| TG_LOG_DIR | `$TG_CONFIG_DIR/logs` | 用量日志 `usage.jsonl` 所在目录 |
 
 > **数值型变量写错不会让服务挂掉**：端口、并发、超时、预算、速度参数统一走 `_env_num()` 解析。
 > 空串、带单位（`TG_READ_TIMEOUT=600s`）、非数字（`TG_MIN_MAX_TOKENS=32k`）一律**回退内置默认值**并打印
 > `⚠️ 环境变量 XXX='600s' 非法，已回退默认值 900`；超出安全区间的值（如 `TG_SPEED_TAU=0`）夹到下限。
 > 启动横幅打印的是**实际生效值**，不是原始字符串——所以看到 `文本 900s` 就说明 `600s` 没被采信。
-| TG_CONFIG_DIR | ~/.ollama-token-gateway | config.json / certs / logs 所在目录 |
-| TG_LOG_DIR | `$TG_CONFIG_DIR/logs` | 用量日志 `usage.jsonl` 所在目录 |
 
 ### macOS 后台运行（launchd）
 仓库内含 `com.token-gateway.server.plist` 模板：
@@ -674,6 +676,15 @@ launchctl unload ~/Library/LaunchAgents/com.user.memguard.plist
 > 复现方式：带 `tools` 的请求传 `max_tokens=48`，会看到一个 chunk（约 444 bytes）、`finish_reason=length`、既无 `content` 也无完整 `tool_calls` —— 与客户端报错的 `chunks=1, bytes=1139` 同形。
 > 注意这不是网关丢包：网关是逐帧转发的，截断发生在上游的 `max_tokens` 边界上。
 
+### 回复"成功但为空"（模型没说话）
+
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| 客户端收到 200、`finish_reason=length`，但 `message.content` 是空字符串；同一句提示换一次请求又正常了 | **推理模型把输出预算全花在思维链上**：gemma4 / r1 这类模型先产出 `reasoning` 再产出 `content`，预算在 reasoning 阶段就耗尽了。而"是否触发思维链"本身是**概率性**的，所以表现为偶发空回复。实测 `max_tokens=64` → `content` 0 字符 / `reasoning` 233 字符 / `completion_tokens` 恰好等于预算；`max_tokens=4096` 时 reasoning 可长到 1,960 字符才出正文 | ① 预算下限：Ollama 侧纯文本请求抬到 `TG_MIN_MAX_TOKENS_TEXT`（默认 2048），日志 `⬆️ 提升 max_tokens: 64 → 2048 (文本输出下限)`；② 确定性兜底：非流式请求若「content 空 + reasoning 非空 + `finish_reason=length`」，网关以 `max(4096, 生效预算×4)` **重发一次**，日志 `🔁 推理模型空正文 … ✅ 重发成功`，响应头带 `X-Gateway-Reasoning-Retry: 4096`；③ 流式请求无法回滚已发出的分片，只能靠 ① 的下限预防 |
+
+> Ollama 的 OpenAI 兼容端点**不支持**关闭思维链：`think: false` 与 `reasoning_effort: low` 均被忽略（已实测）。
+> 想彻底避开这类模型的思考开销，只能换非推理模型，或把 `TG_REASONING_RETRY_TOKENS` 调大以覆盖更长的思维链。
+
 ### GitHub 推送相关
 | 现象 | 可能原因 | 处理 |
 |---|---|---|
@@ -846,9 +857,10 @@ python3 tests/test_tools_budget.py  # 工具调用请求的输出预算下限（
 python3 tests/test_speed_weight.py  # speed 因子：权重结构 / 分档分派 / 无样本不占便宜 / 单调性
 python3 tests/test_env_guard.py     # 数值型环境变量写坏时降级不崩（静态断言 + 导入期回退 + 请求期 200，21 项）
 python3 tests/test_prompt_estimate.py # prompt 规模估算：工具清单 / 图片面积 / 桶边界（17 项）
+python3 tests/test_reasoning_retry.py # Ollama 预算下限 + 推理模型空正文修复（25 项）
 ```
 
-六个脚本都可通过环境变量改指向：
+七个脚本都可通过环境变量改指向：
 
 | 变量 | 作用 |
 |---|---|
@@ -862,6 +874,7 @@ python3 tests/test_prompt_estimate.py # prompt 规模估算：工具清单 / 图
 
 | 日期 | 提交 | 内容 |
 |---|---|---|
+| 2026-11-07 | `fdff934e` | **Ollama 侧补输出预算下限 + 推理模型空正文修复**：预算下限原先整块嵌在 `upstream_host in RAPID_MLX_HOSTS` 分支里，Ollama 上游完全不受约束；gemma4 这类推理模型先把预算烧在 `reasoning` 上，耗尽时 `content` 为空、`finish_reason=length`（实测 `max_tokens=64` → content 0 字符 / reasoning 233 字符 / completion 恰好等于预算），且是否触发思维链是**概率性**的，故单靠下限挡不住。新增 `_min_max_tokens_for()` 收口预算决策；非 Rapid-MLX 纯文本抬到 `TG_MIN_MAX_TOKENS_TEXT`（默认 2048）；非流式命中「空正文 + reasoning + length」时以 `max(4096, 生效预算×4)` **重发一次**（`TG_REASONING_RETRY_TOKENS`，响应头 `X-Gateway-Reasoning-Retry`），流式不重发；顺带确认 Ollama 的 OpenAI 兼容端点会忽略 `think` / `reasoning_effort`；新增 `tests/test_reasoning_retry.py`（25 项） |
 | 2026-11-07 | `29a2b2eb` | **速度分桶改用真实 prompt 规模估算**：此前 `p_hat` 只数 messages 正文，漏掉工具清单与图片，带工具/带图的长会话被估进偏小的桶（该桶全是纯文本样本，明显更快），speed 因子系统性偏高。实测 12 个工具 5,066 字符 ≈ 1,967 token、一张 768² 图 ≈ 578 token（约 980 token/百万像素，384²/768²/1536² 三点一致）。新增 `_auto_req_prompt_chars`（正文 + tools/functions/response_format 序列化长度）与 `_auto_req_image_tokens`（解析 data URI 图头取宽高，拿不到按 `TG_IMG_TOKENS_NOMINAL`）；分档用的 `_auto_req_text_len` 口径不变；新增 `tests/test_prompt_estimate.py`（17 项） |
 | 2026-11-07 | `cdfc4dbd` | **数值型环境变量统一兜底，写错不再让服务崩**：`TG_READ_TIMEOUT` / `TG_MIN_MAX_TOKENS` 等原先在请求路径裸 `int()` 解析，写成 `600s`、`32k` 或空串会抛 ValueError → 每个请求 500（/health 仍 200），启动期同错则进程起不来。改为 `_env_num()` 统一回退默认值并告警、越界值夹到端点，启动横幅改打印**生效值**；`LatencyStats` 预热与实时写入统一按「上游 id + 别名」双记（此前重启后按别名查不到速度样本），预热计数只统计有效样本；`config.example.json` 的 `auto_weights` 对齐新默认；新增 `tests/test_env_guard.py`（21 项） |
 | 2026-11-07 | `4511ddf2` | **speed 因子改为实测耗时并与分档/质量等权**：旧的 `speed = 1 - quality` 与质量完全共线（开启等于抵消一半质量权重），故长期为 0；实测 122B 在 3k~20k 上下文比 8B 快 2.7 倍，参数量不能当速度代理。新增 LatencyStats 按 (模型, prompt 桶) 记录真实耗时并取中位数，`speed = tau/(tau+t)` 绝对软映射；样本不足给中性 0.40、不做跨桶回退；权重改为 tier/quality/speed 各 0.30 |
