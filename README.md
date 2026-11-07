@@ -58,6 +58,7 @@ TG_DISABLE_HTTPS=1 TG_PORT=3000 python3 token-gateway.py
 ### 环境变量（TG_*）
 | 变量 | 默认 | 说明 |
 |---|---|---|
+| 2026-11-07 | `aa5f4aec` | **修复工具调用被输出预算截断导致的 `Empty stream`**：上游把整个 `tool_call` 放在单个 chunk 里下发，客户端固定 `max_tokens=2048` 时命中「VLM 上游不强制」豁免 → 预算耗尽只回半截 JSON（`chunks=1`、`finish_reason=length`）→ 客户端判定零模型 token 并重试。豁免改为按请求类型判定：带图仍不强制，纯文本 + tools 抬到 `TG_MIN_MAX_TOKENS_TOOLS`（默认 8192）；新增 `tests/test_tools_budget.py` |
 | 2026-11-05 | `67e5c773` | **回归用例入库 + 部署模板纠偏**：新增 `tests/test_ctx_trunc.py`（超窗截短不得 500）与 `tests/test_timeout.py`（静默预算 / 缓冲发送 / 504·502 / 流式错误事件，27 项），两者自包含、用临时端口与 stub 上游，不碰线上实例；`com.token-gateway.server.plist` 的 `TG_READ_TIMEOUT` 240 → 600 并补 `TG_BUFFER_NONSTREAM=1`，与生产一致 |
 | TG_HOST | 0.0.0.0 | 监听地址 |
 | TG_PORT | 3000 | 监听端口（`config.json` 的 `listen_port` 优先） |
