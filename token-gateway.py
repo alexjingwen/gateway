@@ -28,6 +28,8 @@ import threading
 import socket
 import select
 import ssl
+import base64
+import struct
 from pathlib import Path
 from collections import defaultdict, deque
 from typing import Dict, List, Optional, Tuple
@@ -1167,6 +1169,63 @@ TOKENS_PER_CHAR = _env_num("TG_TOKENS_PER_CHAR", 0.5, cast=float, minimum=0.01)
 SPEED_TAU = _env_num("TG_SPEED_TAU", 10.0, cast=float, minimum=0.5)
 
 
+# 图片占用的 prompt token：实测本机 VLM 上游按面积线性计费，约 980 tok / 百万像素
+# （384²=146、768²=578、1536²=2306，三点一致）。拿不到宽高时按一张 768² 的名义值计。
+IMG_TOKENS_PER_MPIX = _env_num("TG_IMG_TOKENS_PER_MPIX", 980, cast=float, minimum=1)
+IMG_TOKENS_NOMINAL = _env_num("TG_IMG_TOKENS_NOMINAL", 600, minimum=1)
+# 只解前 256KB base64 就够读到图头（PNG 的 IHDR / JPEG 的 SOF 都在文件前部）
+_IMG_HEADER_B64 = 262144
+
+
+def _data_uri_megapixels(url) -> Optional[float]:
+    """从 base64 data URI 读出图像面积（百万像素）；非 data URI 或解析失败返回 None。
+
+    只解 PNG 与 JPEG 的图头，不解码像素：目的是估算 prompt token，不需要图像内容。
+    不支持远程 http(s) URL —— 那里取宽高要额外发一次请求，不值得放在请求路径上。
+    """
+    if not isinstance(url, str) or not url.startswith("data:image/"):
+        return None
+    head, _, b64 = url.partition(",")
+    if "base64" not in head or not b64:
+        return None
+    try:
+        # 截断后长度必须是 4 的倍数，否则 b64decode 会因填充错误抛异常
+        raw = base64.b64decode(b64[:_IMG_HEADER_B64][: (_IMG_HEADER_B64 // 4) * 4])
+    except Exception:
+        return None
+    w = h = 0
+    if raw[:8] == b"\x89PNG\r\n\x1a\n" and raw[12:16] == b"IHDR":
+        try:
+            w, h = struct.unpack(">II", raw[16:24])
+        except struct.error:
+            return None
+    elif raw[:2] == b"\xff\xd8":
+        sof = {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+               0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}
+        i = 2
+        while i + 9 <= len(raw):
+            if raw[i] != 0xFF:
+                i += 1
+                continue
+            marker = raw[i + 1]
+            if marker == 0xFF:          # 填充字节
+                i += 1
+                continue
+            if marker in (0xD8, 0xD9) or 0xD0 <= marker <= 0xD7:
+                i += 2                  # 无载荷段
+                continue
+            seg = struct.unpack(">H", raw[i + 2:i + 4])[0]
+            if seg < 2:
+                return None
+            if marker in sof:
+                h, w = struct.unpack(">HH", raw[i + 5:i + 9])
+                break
+            i += 2 + seg
+    if not w or not h or w * h > 50_000_000:   # 超过 50MP 视为异常数据，不采信
+        return None
+    return w * h / 1e6
+
+
 def _latency_names(model: str) -> Tuple[str, ...]:
     """把模型名展开成「上游 id + 别名」两种记账键。
 
@@ -1618,6 +1677,75 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             total += len(req["prompt"])
         return total
 
+    @staticmethod
+    def _auto_req_prompt_chars(req: dict) -> int:
+        """估算真实 prompt 规模：正文 + 工具清单等结构化字段的序列化长度。
+
+        与 `_auto_req_text_len` 的区别是用途不同：后者回答"用户输入有多长"（分档阈值用），
+        这个回答"上游会看到多少 token"（速度分桶用）。
+
+        工具清单在真实 prompt 里占的 token 不可忽略：实测 12 个工具、5,066 字符 JSON
+        ≈ 1,967 prompt token（0.39 tok/char）。漏掉它会让带工具的长会话被估进偏小的桶，
+        取到偏小的耗时样本，speed 因子随之失真。
+        """
+        total = GatewayHandler._auto_req_text_len(req)
+        if not isinstance(req, dict):
+            return total
+        for key in ("tools", "functions", "response_format"):
+            val = req.get(key)
+            if not val:
+                continue
+            try:
+                total += len(json.dumps(val, ensure_ascii=False))
+            except (TypeError, ValueError):
+                # 极端情况下（含不可序列化对象）给保守估计，避免整个估算失效
+                total += 2048
+        return total
+
+    @staticmethod
+    def _auto_req_image_urls(req: dict) -> List[str]:
+        """收集请求里所有图片地址（data URI 或 http URL）。"""
+        if not isinstance(req, dict):
+            return []
+        urls: List[str] = []
+        for msg in req.get("messages", []) or []:
+            if not isinstance(msg, dict):
+                continue
+            content = msg.get("content")
+            if isinstance(content, list):
+                for p in content:
+                    if not isinstance(p, dict):
+                        continue
+                    if p.get("type") not in ("image_url", "image", "input_image"):
+                        continue
+                    iu = p.get("image_url")
+                    url = iu.get("url") if isinstance(iu, dict) else iu
+                    if isinstance(url, str) and url:
+                        urls.append(url)
+            if isinstance(msg.get("images"), list):
+                urls.extend(u for u in msg["images"] if isinstance(u, str))
+        for key in ("images", "image"):
+            val = req.get(key)
+            if isinstance(val, str):
+                urls.append(val)
+            elif isinstance(val, list):
+                urls.extend(u for u in val if isinstance(u, str))
+        return urls
+
+    @staticmethod
+    def _auto_req_image_tokens(req: dict) -> int:
+        """图片占用的 prompt token 估算。
+
+        图片在真实 prompt 里按面积计费（实测约 980 tok / 百万像素），与正文无关。
+        漏算它会让带图请求的 p_hat 偏小、取到偏小的速度桶（那里全是纯文本样本，
+        明显更快），speed 因子因此系统性偏高。拿不到宽高（远程 URL）时按名义值计。
+        """
+        total = 0
+        for url in GatewayHandler._auto_req_image_urls(req):
+            mp = _data_uri_megapixels(url)
+            total += IMG_TOKENS_NOMINAL if mp is None else int(mp * IMG_TOKENS_PER_MPIX)
+        return total
+
     def _auto_policy(self, cfg: dict) -> dict:
         """读取分档/权重策略：env 默认值 + config.json global 覆盖（可运行时调整）。"""
         g = cfg.get("global") or {}
@@ -1921,8 +2049,11 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
                 logs = [math.log10(s) for s in sizes if s and s > 0]
                 ctx = {"lo": min(logs) if logs else None, "hi": max(logs) if logs else None}
                 # 速度因子：按本请求预估的 prompt 规模取各候选的实测中位耗时，
-                # 再用软映射 tau/(tau+t) 转成 0~1（越快越高），与候选池构成无关
-                p_hat = int(self._auto_req_text_len(req) * TOKENS_PER_CHAR)
+                # 再用软映射 tau/(tau+t) 转成 0~1（越快越高），与候选池构成无关。
+                # 用 _auto_req_prompt_chars 而非 _auto_req_text_len：工具清单同样占 token，
+                # 只数正文会把带工具的长会话估进偏小的桶；图片另按面积折算 token 再加。
+                p_hat = (int(self._auto_req_prompt_chars(req) * TOKENS_PER_CHAR)
+                         + self._auto_req_image_tokens(req))
                 t_est = {}
                 for (m, _h) in cands:
                     t = MODEL_LATENCY.estimate(m, p_hat)
