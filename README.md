@@ -862,6 +862,7 @@ python3 tests/test_prompt_estimate.py # prompt 规模估算：工具清单 / 图
 
 | 日期 | 提交 | 内容 |
 |---|---|---|
+| 2026-11-07 | `29a2b2eb` | **速度分桶改用真实 prompt 规模估算**：此前 `p_hat` 只数 messages 正文，漏掉工具清单与图片，带工具/带图的长会话被估进偏小的桶（该桶全是纯文本样本，明显更快），speed 因子系统性偏高。实测 12 个工具 5,066 字符 ≈ 1,967 token、一张 768² 图 ≈ 578 token（约 980 token/百万像素，384²/768²/1536² 三点一致）。新增 `_auto_req_prompt_chars`（正文 + tools/functions/response_format 序列化长度）与 `_auto_req_image_tokens`（解析 data URI 图头取宽高，拿不到按 `TG_IMG_TOKENS_NOMINAL`）；分档用的 `_auto_req_text_len` 口径不变；新增 `tests/test_prompt_estimate.py`（17 项） |
 | 2026-11-07 | `cdfc4dbd` | **数值型环境变量统一兜底，写错不再让服务崩**：`TG_READ_TIMEOUT` / `TG_MIN_MAX_TOKENS` 等原先在请求路径裸 `int()` 解析，写成 `600s`、`32k` 或空串会抛 ValueError → 每个请求 500（/health 仍 200），启动期同错则进程起不来。改为 `_env_num()` 统一回退默认值并告警、越界值夹到端点，启动横幅改打印**生效值**；`LatencyStats` 预热与实时写入统一按「上游 id + 别名」双记（此前重启后按别名查不到速度样本），预热计数只统计有效样本；`config.example.json` 的 `auto_weights` 对齐新默认；新增 `tests/test_env_guard.py`（21 项） |
 | 2026-11-07 | `4511ddf2` | **speed 因子改为实测耗时并与分档/质量等权**：旧的 `speed = 1 - quality` 与质量完全共线（开启等于抵消一半质量权重），故长期为 0；实测 122B 在 3k~20k 上下文比 8B 快 2.7 倍，参数量不能当速度代理。新增 LatencyStats 按 (模型, prompt 桶) 记录真实耗时并取中位数，`speed = tau/(tau+t)` 绝对软映射；样本不足给中性 0.40、不做跨桶回退；权重改为 tier/quality/speed 各 0.30 |
 | 2026-11-07 | `aa5f4aec` | **修复工具调用被输出预算截断导致的 `Empty stream`**：上游把整个 `tool_call` 放在单个 chunk 里下发，客户端固定 `max_tokens=2048` 时命中「VLM 上游不强制」豁免 → 预算耗尽只回半截 JSON（`chunks=1`、`finish_reason=length`）→ 客户端判定零模型 token 并重试。豁免改为按请求类型判定：带图仍不强制，纯文本 + tools 抬到 `TG_MIN_MAX_TOKENS_TOOLS`（默认 8192）；新增 `tests/test_tools_budget.py` |
