@@ -1177,6 +1177,34 @@ IMG_TOKENS_NOMINAL = _env_num("TG_IMG_TOKENS_NOMINAL", 600, minimum=1)
 _IMG_HEADER_B64 = 262144
 
 
+def _min_max_tokens_for(is_rapid: bool, is_vlm: bool, has_image: bool, has_tools: bool) -> int:
+    """本次请求应强制的最小 max_tokens；返回 0 表示不强制（保持客户端原值）。
+
+    按**请求类型**而非主机判定：122B 同时挂在 RAPID_MLX_HOSTS 与 RAPID_MLX_VLM_HOSTS
+    上，纯文本的 agent 请求同样会命中 VLM 豁免；而视觉调用要的是"短结构化输出 +
+    低延迟"，把 200 抬到 32768 会让模型长篇胡写，单次请求从 ~30s 涨到 10 分钟，
+    期间一直占着 global 并发额度（实测 10 个槽位被占满 → 所有客户端瞬时 429）。
+
+    非 Rapid-MLX（Ollama）侧必须有**纯文本下限**：gemma4 这类会"思考"的模型先把预算
+    烧在思维链上，预算耗尽时 content 为空、finish_reason=length，客户端只看到一条空
+    回复（实测 max_tokens=64 → content 0 字符 / reasoning 233 字符 / completion=64）。
+    """
+    if is_rapid:
+        if not is_vlm:
+            return _env_num("TG_MIN_MAX_TOKENS", 32768, minimum=0)
+        if has_image:
+            return 0
+        if has_tools:
+            return _env_num("TG_MIN_MAX_TOKENS_TOOLS", 8192, minimum=0)
+        return 0
+    # Ollama 等非 Rapid-MLX 上游
+    if has_image:
+        return 0                      # 视觉调用要短输出，维持原语义
+    if has_tools:
+        return _env_num("TG_MIN_MAX_TOKENS_TOOLS", 8192, minimum=0)
+    return _env_num("TG_MIN_MAX_TOKENS_TEXT", 2048, minimum=0)
+
+
 def _data_uri_megapixels(url) -> Optional[float]:
     """从 base64 data URI 读出图像面积（百万像素）；非 data URI 或解析失败返回 None。
 
@@ -2607,6 +2635,32 @@ iframe{{padding-top:0}}
                 body_bytes = json.dumps(original_req, ensure_ascii=False).encode("utf-8")
                 log(f"🖼️  已过滤图片请求（{model} 不支持多模态）→ 来自:{client_ip}")
 
+        # ========= 输出预算下限（Ollama 等非 Rapid-MLX 上游） =========
+        # 下方"Context Window 自动截断降级"整块嵌在 `upstream_host in RAPID_MLX_HOSTS`
+        # 里，所以 Ollama 侧原本**完全没有** max_tokens 下限：gemma4 这类会"思考"的模型
+        # 先把预算烧在思维链上，预算耗尽时 content 为空、finish_reason=length，
+        # 客户端只看到一条空回复。这不是理论风险，已实测复现：
+        #   max_tokens=64  → content 0 字符 / reasoning 233 字符 / completion_tokens=64
+        #   max_tokens=192 → 同样为空；4096 时 reasoning 可到 1960 字符才出正文
+        # 且 gemma4 是否触发思维链是概率性的（同一句提示另一次直接 34 token 出结果），
+        # 所以下限只能降低概率，真正兜底的是后面的"推理模型空正文修复"。
+        # 注意：Ollama 的 OpenAI 兼容端点会**忽略** think / reasoning_effort（已实测），
+        # 无法从根上关掉思维链，只能给预算。
+        if (original_req and self.path.startswith("/v1/chat")
+                and upstream_host not in RAPID_MLX_HOSTS):
+            try:
+                _o_max_tokens = int(original_req.get("max_tokens") or 4096)
+            except (TypeError, ValueError):
+                _o_max_tokens = 4096
+            _o_tools = bool(original_req.get("tools") or original_req.get("functions"))
+            _o_img = self._auto_req_has_image(original_req)
+            _o_floor = _min_max_tokens_for(False, False, _o_img, _o_tools)
+            if _o_floor and _o_max_tokens < _o_floor:
+                _o_why = "工具调用预算" if _o_tools else "文本输出下限"
+                log(f"⬆️  提升 max_tokens: {_o_max_tokens} → {_o_floor} ({_o_why}) → {client_ip}")
+                original_req["max_tokens"] = _o_floor
+                body_bytes = json.dumps(original_req, ensure_ascii=False).encode("utf-8")
+
         # ========= Context Window 自动截断降级 =========
         if upstream_host in RAPID_MLX_HOSTS and original_req and self.path.startswith("/v1/chat"):
             _cw = _MODEL_CONTEXT_WINDOWS.get(model, _MODEL_CONTEXT_WINDOWS.get("*", 262144))
@@ -2620,26 +2674,16 @@ iframe{{padding-top:0}}
             except (TypeError, ValueError):
                 _max_tokens = 4096
             # 强制最小 max_tokens，防止 dsh 等客户端发送过小的 max_tokens 导致回复被截断。
-            # 可用 TG_MIN_MAX_TOKENS 覆盖；**VLM 上游的多模态请求不强制** ——
-            # 视觉调用要的是"短结构化输出 + 低延迟"，把 200 抬到 32768 会让模型长篇胡写，
-            # 单次请求从 ~30s 涨到 10 分钟，期间一直占着 global 并发额度。
-            # 实测：10 个槽位被这类挂死请求占满 → 所有客户端（含挂机 bot）收到瞬时 429。
-            #
-            # 但豁免必须按**请求类型**而不是按主机判定：122B 同时挂在 RAPID_MLX_HOSTS
-            # 与 RAPID_MLX_VLM_HOSTS 上，纯文本的 agent 请求同样会命中这条豁免。
-            # 而 IDE 客户端通常固定 max_tokens=2048，工具调用又是**整块下发**的：
-            # 预算耗尽时上游只回一个 finish_reason=length 的半截 tool_call，
-            # 客户端解析不出完整调用 → 报 "Empty stream ... chunks=1"（已实测复现）。
-            # 所以：带图 → 0（维持原语义）；纯文本 + 工具 → TG_MIN_MAX_TOKENS_TOOLS。
-            _MIN_MAX_TOKENS = _env_num("TG_MIN_MAX_TOKENS", 32768, minimum=0)
+            # 决策统一收口在 _min_max_tokens_for()，两个上游分支共用同一套规则。
+            # 本分支（Rapid-MLX）的结论是：带图 → 0（维持原语义）；
+            # 纯文本 + 工具 → TG_MIN_MAX_TOKENS_TOOLS；纯文本无工具 → 0。
             _has_tools = bool(original_req.get("tools") or original_req.get("functions"))
-            if upstream_host in RAPID_MLX_VLM_HOSTS:
-                if self._auto_req_has_image(original_req):
-                    _MIN_MAX_TOKENS = 0
-                elif _has_tools:
-                    _MIN_MAX_TOKENS = _env_num("TG_MIN_MAX_TOKENS_TOOLS", 8192, minimum=0)
-                else:
-                    _MIN_MAX_TOKENS = 0
+            _MIN_MAX_TOKENS = _min_max_tokens_for(
+                True,
+                upstream_host in RAPID_MLX_VLM_HOSTS,
+                self._auto_req_has_image(original_req),
+                _has_tools,
+            )
             if _MIN_MAX_TOKENS and _max_tokens < _MIN_MAX_TOKENS:
                 _why = "工具调用预算" if _has_tools else "强制最小值"
                 log(f"⬆️  提升 max_tokens: {_max_tokens} → {_MIN_MAX_TOKENS} ({_why}) → {client_ip}")
@@ -2856,6 +2900,10 @@ iframe{{padding-top:0}}
                 _tier = getattr(self, "_auto_tier_label", "")
                 if _tier:
                     self.send_header("X-Gateway-Auto-Tier", _tier)
+            # 推理空正文修复命中时回传实际生效的预算，便于客户端/日志侧对齐
+            _rrm = getattr(self, "_reasoning_retry_mt", 0)
+            if _rrm:
+                self.send_header("X-Gateway-Reasoning-Retry", str(_rrm))
             # 非流式补 Content-Length：客户端可据此判断响应是否收全（截断会直接报错，
             # 而不是悄悄当成一次"被取消"的请求）
             if content_length is not None:
@@ -2914,6 +2962,57 @@ iframe{{padding-top:0}}
                             log(f"⚠️ {upstream_fault}")
                     except ValueError:
                         pass
+
+                # ========= 推理模型空正文修复（仅缓冲的非流式） =========
+                # 已知现象：gemma4 / r1 这类"会思考"的模型把预算先花在 reasoning 上，
+                # 预算耗尽时 message.content 为空、finish_reason=length —— 客户端看到的是
+                # 一条"成功但空"的回复（IDE 里表现为模型没说话）。首次实测：
+                #   max_tokens=64 → content 0 字符 / reasoning 233 字符 / completion=64
+                # 预算下限只能降低概率（是否触发思维链本身是概率性的），这里做确定性兜底：
+                # 已读完、还没往客户端写任何字节时，用更大的预算重发**一次**。
+                # 流式响应无法回滚已发出的 SSE 分片，故只对缓冲的非流式请求生效。
+                if (not _early and not client_gone and not upstream_fault
+                        and response_data and original_req):
+                    try:
+                        _pj = json.loads(bytes(response_data).decode("utf-8", errors="replace"))
+                        _pc = (_pj.get("choices") or [{}])[0] if isinstance(_pj, dict) else {}
+                        _pmsg = (_pc.get("message") or {}) if isinstance(_pc, dict) else {}
+                        _ptext = _pmsg.get("content")
+                        _preason = _pmsg.get("reasoning") or _pmsg.get("reasoning_content") or ""
+                        _pempty = (not _ptext) or (isinstance(_ptext, str) and not _ptext.strip())
+                        if (_pempty and _preason
+                                and _pc.get("finish_reason") == "length"):
+                            _old_mt = int(original_req.get("max_tokens") or 0)
+                            _new_mt = max(
+                                _env_num("TG_REASONING_RETRY_TOKENS", 4096, minimum=1),
+                                _old_mt * 4,
+                            )
+                            log(f"🔁 推理模型空正文（reasoning {len(_preason)} 字符，"
+                                f"预算 {_old_mt} 已耗尽）→ 以 max_tokens={_new_mt} 重发一次"
+                                f" → {client_ip}")
+                            _rreq = dict(original_req)
+                            _rreq["max_tokens"] = _new_mt
+                            _rbody = json.dumps(_rreq, ensure_ascii=False).encode("utf-8")
+                            try:
+                                _r = urllib.request.Request(
+                                    url, data=_rbody, method=method, headers=upstream_headers)
+                                with urllib.request.urlopen(_r, timeout=read_timeout) as _rr:
+                                    _rdata = _rr.read()
+                                _rj = json.loads(_rdata.decode("utf-8", errors="replace"))
+                                _rc = ((_rj.get("choices") or [{}])[0].get("message") or {})
+                                _rtext = _rc.get("content")
+                                if _rtext and str(_rtext).strip():
+                                    response_data = bytearray(_rdata)
+                                    original_req["max_tokens"] = _new_mt
+                                    self._reasoning_retry_mt = _new_mt
+                                    log(f"✅ 重发成功：正文 {len(str(_rtext))} 字符"
+                                        f"（原为空） → {client_ip}")
+                                else:
+                                    log(f"⚠️ 重发仍未产出正文，透传原响应 → {client_ip}")
+                            except Exception as _re:
+                                log(f"⚠️ 重发失败（{type(_re).__name__}: {_re}），透传原响应")
+                    except Exception:
+                        pass          # 响应不是可解析的 JSON：按原样透传
 
                 if not _early and not client_gone:
                     if upstream_fault:
