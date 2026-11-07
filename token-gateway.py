@@ -2615,6 +2615,22 @@ iframe{{padding-top:0}}
         url = f"{upstream_host}{self.path}"
         stream = bool(original_req and original_req.get("stream", False)) if original_req else False
 
+        # ========= 流式请求索取 usage（配额记账精度，默认关闭） =========
+        # Ollama / llama-server / mlx_vlm 的 SSE 默认**不带 usage**，网关只能估算；而旧的
+        # 估算是「原始字节 // 3」，把 SSE 每帧约 230 字节的 `data: {...}` 框架也算进去：
+        # 实测一个真实 64 token 的流式回复被记成 4,389 token（约 68 倍），配额被吃光。
+        # 估算本身已改为按增量文本字符折算（见下方解析段），这条注入是"要精确值"的开关。
+        #
+        # 为什么默认关闭：索取 usage 后上游会在 [DONE] 前多发一个 `choices: []` 的帧，
+        # 这是 OpenAI 的标准行为，但**手写** SSE 解析器常写成 `chunk["choices"][0]`，
+        # 遇到空数组会崩。网关自己转发的是字节流、不重写分片，无法只对该帧做过滤，
+        # 所以不把这个行为默认强加给客户端。确认客户端能耐受时再开：TG_STREAM_INCLUDE_USAGE=1。
+        _want_usage = os.environ.get("TG_STREAM_INCLUDE_USAGE", "0") not in ("0", "false", "no", "off")
+        if (_want_usage and stream and original_req is not None
+                and self.path.startswith("/v1/chat") and "stream_options" not in original_req):
+            original_req["stream_options"] = {"include_usage": True}
+            body_bytes = json.dumps(original_req, ensure_ascii=False).encode("utf-8")
+
         # ========= Rapid-MLX 图片过滤（纯文本模型不支持多模态） =========
         if upstream_host in RAPID_MLX_HOSTS and upstream_host not in RAPID_MLX_VLM_HOSTS and original_req and self.path.startswith("/v1/chat"):
             _msgs = original_req.get("messages", [])
@@ -3107,6 +3123,7 @@ iframe{{padding-top:0}}
             if stream:
                 # SSE: 每行 data: {...}，最后一条带 usage
                 lines = raw_resp.decode("utf-8", errors="replace").split("\n")
+                _sse_chars = 0        # 增量文本字符数（正文 + 思维链），供无 usage 时估算
                 for line in lines:
                     if not line.startswith("data: "):
                         continue
@@ -3120,15 +3137,34 @@ iframe{{padding-top:0}}
                             total_prompt = u.get("prompt_tokens", total_prompt)
                             total_completion = u.get("completion_tokens", total_completion)
                             total = u.get("total_tokens", total)
+                        for _ch in (chunk_obj.get("choices") or []):
+                            _dl = (_ch or {}).get("delta") or {}
+                            for _k in ("content", "reasoning", "reasoning_content"):
+                                _v = _dl.get(_k)
+                                if isinstance(_v, str):
+                                    _sse_chars += len(_v)
                     except Exception:
                         pass
-                # 如果流式没有 usage，估算一下（简单方法）
+                # 无 usage 时才估算。**不要用原始字节**：SSE 每帧的 `data: {...}` 框架
+                # 约 230 字节，按 bytes//3 算出来的"token"里九成是 JSON 与换行——实测
+                # 一个真实 64 token 的流式回复被记成 4,389 token（约 68 倍），配额被吃光。
+                # 改为按**增量文本字符**折算（TOKENS_PER_CHAR 与速度分桶共用同一系数）。
                 if total == 0:
-                    total_completion = len(raw_resp.decode("utf-8", errors="replace")) // 3
-                    # 从请求估算 prompt
+                    if _sse_chars > 0:
+                        total_completion = max(1, int(_sse_chars * TOKENS_PER_CHAR))
+                    else:
+                        total_completion = len(raw_resp) // 3   # 非 SSE 的流：退回旧估算
+                    # 从请求估算 prompt（content 可能是 str，也可能是分段 list）
                     if original_req:
-                        msgs = original_req.get("messages", [])
-                        total_prompt = sum(len(m.get("content", "")) // 4 + 1 for m in msgs)
+                        _pchars = 0
+                        for _m in (original_req.get("messages") or []):
+                            _c = _m.get("content") if isinstance(_m, dict) else None
+                            if isinstance(_c, str):
+                                _pchars += len(_c)
+                            elif isinstance(_c, list):
+                                _pchars += sum(len(_p.get("text", ""))
+                                               for _p in _c if isinstance(_p, dict))
+                        total_prompt = max(1, int(_pchars * TOKENS_PER_CHAR))
                     total = total_prompt + total_completion
             else:
                 # 非流式，整个 JSON
