@@ -12,20 +12,28 @@
 		<string>3000</string>
 		<key>TG_DISABLE_HTTPS</key>
 		<string>1</string>
-		<key>TG_OLLAMA_HOST</key>
-		<string>http://127.0.0.1:11434</string>
+		<!-- 只登记真实在跑的上游。写进一个不存在的端口，每次模型探测都要白等一轮超时，
+		     而 /health 不碰上游照样 200，排查时极易误判"一切正常" -->
 		<key>TG_RAPID_MLX_HOSTS</key>
-		<string>http://127.0.0.1:8090,http://127.0.0.1:8088</string>
+		<string>http://127.0.0.1:8088</string>
 		<key>TG_RAPID_MLX_VLM_HOSTS</key>
 		<string>http://127.0.0.1:8088</string>
 		<key>TG_MLX_VLM_API_KEY</key>
 		<string>sk-test</string>
 		<key>TG_MODEL_ALIASES</key>
 		<string>qwen3.5-122b=mlx-community/Qwen3.5-122B-A10B-4bit</string>
-		<key>TG_QPS</key>
-		<string>5</string>
-		<key>TG_CONCURRENCY</key>
-		<string>10</string>
+		<!-- 代理双保险：代码层已固定直连（模块加载时安装空 ProxyHandler 的 opener），
+		     但 launchd 会把登录 shell 里的 HTTP_PROXY 一起带进进程；这里显式清空，
+		     避免代理停掉后连 127.0.0.1 都被转给代理而 Connection refused -->
+		<key>NO_PROXY</key>
+		<string>*</string>
+		<key>no_proxy</key>
+		<string>*</string>
+		<!-- 离线：不让 MLX / HF 在推理时尝试联网校验，断网也能正常起服务 -->
+		<key>HF_HUB_OFFLINE</key>
+		<string>1</string>
+		<key>TRANSFORMERS_OFFLINE</key>
+		<string>1</string>
 		<!-- 单次静默预算：5 万 token 上下文预填充本身就要 100~150s，240 会把长上下文误判超时 -->
 		<key>TG_READ_TIMEOUT</key>
 		<string>600</string>
@@ -34,6 +42,12 @@
 		<!-- 非流式先缓冲完整响应再发送：上游失败时能返回真实 5xx 与 Content-Length，而不是截断的 200 -->
 		<key>TG_BUFFER_NONSTREAM</key>
 		<string>1</string>
+		<!-- 可选硬限流：默认不设（网关自带并发槽位与 429 退避），确需再取消注释
+		<key>TG_QPS</key>
+		<string>5</string>
+		<key>TG_CONCURRENCY</key>
+		<string>10</string>
+		-->
 	</dict>
 	<key>KeepAlive</key>
 	<true/>
