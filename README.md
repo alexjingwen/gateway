@@ -117,6 +117,10 @@ launchctl list | grep token-gateway
 tail -f /tmp/token-gateway.log
 ```
 
+> 模板里带了 `NO_PROXY=*`：launchd 会把登录 shell 的 `HTTP_PROXY` 一并带进进程，
+> 代理停掉后 urllib 连 `127.0.0.1` 也会被转出去（见故障排查「模型列表只剩 auto」）。
+> 代码层已固定直连，这个变量是第二道保险。
+
 **改了 plist 里的环境变量后，只做 `kickstart -k` 是不够的**——launchd 会沿用**加载时**记录的那份作业定义，进程重启了但 env 还是旧值（本仓库曾因此出现"把 `TG_READ_TIMEOUT` 改成 600 却仍报 240s"）。必须重新装载：
 
 ```bash
@@ -912,6 +916,7 @@ python3 tests/test_upstream_proxy.py # 上游直连：HTTP_PROXY 指向死端口
 
 | 日期 | 提交 | 内容 |
 |---|---|---|
+| 2026-11-08 | `0a8f0f54` | **部署模板与线上对齐**：仓库里的 `com.token-gateway.server.plist` 落后于实跑配置——缺 `NO_PROXY`（代理劫持那道保险只写在代码里）、把已下线的 `:8090` 留在 `TG_RAPID_MLX_HOSTS` 里（每次模型探测白等超时）、`TG_QPS`/`TG_CONCURRENCY` 与生产不符。已按线上校正并补 `HF_HUB_OFFLINE`/`TRANSFORMERS_OFFLINE`，可选限流项改为注释保留；`plutil -lint` 通过。同日回归实测 122B：`/v1/models` 可见、纯文本 0.93s、流式 SSE 正常、带图 3,620 prompt tokens 描述准确、两把 Key 均 200 |
 | 2026-11-08 | `fde83242` | **上游连接固定直连，修复代理劫持导致「122B 消失」**：从带 `HTTP_PROXY` 的环境启动时，urllib 把 `127.0.0.1:11434` / `:8088` 也交给代理，代理一停全部 `Connection refused` → 模型发现失败、`/v1/models` 只剩 `auto`、推理全 502（`/health` 仍 200，极难自查）。模块加载时安装空 `ProxyHandler` 的 opener，覆盖全部 urlopen 调用点；plist 增加 `NO_PROXY=*` 作双保险。新增 `tests/test_upstream_proxy.py`（7 项）。另：文档自测清单补为十个脚本 |
 | 2026-11-08 | `bbb6202d` | **上游模型失效时自动检测并降级**：`/api/tags` 只说明 manifest 在不在，权重损坏时模型仍留在列表里、请求必 404，而 auto 会按分档反复选中它。新增失效模型熔断表（`TG_BAD_MODEL_TTL`，默认 120s），auto 候选池与存在性检查都跳过它；`_proxy` 增加 auto 降级重试（`TG_AUTO_MODEL_FALLBACK`，默认 2 次），**显式点名模型的请求不降级**；HTTPError 响应体改为只读一次并缓存；`_refresh_model_caches` 的网络探测移出锁并加单飞，避免缓存过期瞬间并发请求排队等同一个 3s 探测。新增 `tests/test_model_fallback.py`（19 项） |
 | 2026-11-07 | `e54d064f` | **流式请求记账不再把 SSE 框架算成 token**：SSE 默认不带 usage，旧实现退回 `len(原始字节)//3`，而每帧 `data: {...}` 约 230 字节 —— 一个真实 64 token 的流式回复被记成 4,389 token（约 68 倍），配额被几十倍地扣。改为按**增量文本字符**折算（`TOKENS_PER_CHAR`），同一次请求 33,115 → 812 token；prompt 估算同样改按字符并兼容 `content` 为分段 list；新增可选 `TG_STREAM_INCLUDE_USAGE`（默认 0）以换取上游精确 usage；新增 `tests/test_stream_usage.py`（13 项） |
