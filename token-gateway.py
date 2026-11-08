@@ -35,6 +35,24 @@ from collections import defaultdict, deque
 from typing import Dict, List, Optional, Tuple
 
 
+# ========= 上游一律直连，永不经过 HTTP_PROXY =========
+# 网关的所有上游（Ollama / llama-server / mlx_vlm）都在本机。urllib 默认会读
+# HTTP_PROXY / HTTPS_PROXY / ALL_PROXY，于是连 `http://127.0.0.1:11434` 也会被
+# 交给代理。2026-11-08 现网故障就是这么来的：进程从带
+# `HTTP_PROXY=http://127.0.0.1:65388` 的环境里被拉起（沙箱给子进程注入的出口代理），
+# 代理只在工具调用期间存活，停掉之后网关所有上游请求都变成
+# `[Errno 61] Connection refused`：
+#   · `/api/tags` 与上游 `/v1/models` 失败 → 模型缓存被清空
+#   · `/v1/models` 只剩 `auto` → 用户看到的现象是「122B 不见了」
+#   · 所有推理请求 502，而同一台机器上 curl 一切正常（curl 常带 --noproxy）
+# 极难自查：/health 仍 200、进程还在跑，日志只有一句 Connection refused。
+# 这里装一个空 ProxyHandler 的 opener，把这条隐式依赖从代码层断掉；
+# plist 里的 NO_PROXY=* 只是双保险，不能作为唯一防线。
+urllib.request.install_opener(
+    urllib.request.build_opener(urllib.request.ProxyHandler({}))
+)
+
+
 def _env_num(name: str, default, cast=int, minimum=None, maximum=None):
     """读取数值型环境变量；非法值退回默认值，**绝不在请求路径抛异常**。
 
