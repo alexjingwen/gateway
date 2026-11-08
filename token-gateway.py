@@ -1575,6 +1575,51 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
     _ollama_meta_cache = {"ts": 0.0, "meta": {}}
     _models_cache_lock = threading.Lock()
 
+    # 已失效模型熔断表 {model: 到期时间戳}。
+    # 背景：`/api/tags` 只报告"manifest 在不在",不保证权重可加载。当模型被删除、
+    # 权重损坏、或拉取中途中断时，它仍可能留在列表里，直到上游自己判定失败。
+    # 此时 auto 会反复选中它，把上游的 404 原样打回客户端——用户侧表现为
+    # "明明有别的模型可用，却每次都报错"。命中一次不可用就熔断一段时间，
+    # 让候选池自动跳过它，而不是靠人工删配置。
+    _bad_models: dict = {}
+    _bad_models_lock = threading.Lock()
+    # 单飞标记：同一时刻只让一个线程去探测上游模型列表，其余请求直接用现有缓存。
+    # 否则缓存一过期，N 个并发请求会各自等满 timeout（每主机 3s）——表现为整体卡顿。
+    _ollama_refreshing = False
+    _rapid_refreshing = False
+
+    @classmethod
+    def _mark_model_bad(cls, model: str, reason: str = "") -> None:
+        if not model:
+            return
+        ttl = _env_num("TG_BAD_MODEL_TTL", 120, minimum=0)
+        if ttl <= 0:
+            return
+        with cls._bad_models_lock:
+            cls._bad_models[model] = time.time() + ttl
+        log(f"🚫 模型熔断 {ttl}s：{model}" + (f"（{reason}）" if reason else ""))
+
+    @classmethod
+    def _is_model_bad(cls, model: str) -> bool:
+        if not model:
+            return False
+        with cls._bad_models_lock:
+            exp = cls._bad_models.get(model)
+            if exp is None:
+                return False
+            if exp <= time.time():
+                cls._bad_models.pop(model, None)
+                return False
+            return True
+
+    @classmethod
+    def _mark_model_good(cls, model: str) -> None:
+        if not model:
+            return
+        with cls._bad_models_lock:
+            if cls._bad_models.pop(model, None) is not None:
+                log(f"✅ 模型恢复：{model}")
+
     def _fetch_ollama_models(self) -> set:
         """拉取 ollama 模型名集合；顺带缓存 details（参数量/量化）供 auto 质量排序使用。"""
         try:
@@ -1626,19 +1671,48 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         """刷新并返回 (ollama 模型集合, {rapid-mlx 模型: host})。
 
         30 秒缓存；上游整体不可达时保留上一次的非空结果，避免候选池被瞬时清空。
+
+        探测必须在锁**外**做：`_fetch_*` 是同步网络调用（每主机 timeout=3s），
+        放在锁内会让缓存过期瞬间的所有并发请求排成一队，等同一个探测完成。
+        现在改为「锁内只判定要不要刷 + 置单飞标记，锁外探测，锁内写回」：
+        同一时刻只有一个线程真正发探测，其余请求立刻拿到上一版缓存继续服务。
         """
+        now = time.time()
         with self._models_cache_lock:
-            now = time.time()
-            if now - self._ollama_models_cache["ts"] > 30:
+            need_ollama = now - self._ollama_models_cache["ts"] > 30
+            need_rapid = now - self._rapid_mlx_models_cache["ts"] > 30
+            if need_ollama and self._ollama_refreshing:
+                need_ollama = False
+            if need_rapid and self._rapid_refreshing:
+                need_rapid = False
+            if need_ollama:
+                type(self)._ollama_refreshing = True
+            if need_rapid:
+                type(self)._rapid_refreshing = True
+
+        if need_ollama:
+            try:
                 models = self._fetch_ollama_models()
-                if models or not self._ollama_models_cache["models"]:
-                    self._ollama_models_cache["models"] = models
-                self._ollama_models_cache["ts"] = now
-            if now - self._rapid_mlx_models_cache["ts"] > 30:
+                with self._models_cache_lock:
+                    if models or not self._ollama_models_cache["models"]:
+                        self._ollama_models_cache["models"] = models
+                    self._ollama_models_cache["ts"] = time.time()
+            finally:
+                with self._models_cache_lock:
+                    type(self)._ollama_refreshing = False
+
+        if need_rapid:
+            try:
                 models = self._fetch_rapid_mlx_models()
-                if models or not self._rapid_mlx_models_cache["models"]:
-                    self._rapid_mlx_models_cache["models"] = models
-                self._rapid_mlx_models_cache["ts"] = now
+                with self._models_cache_lock:
+                    if models or not self._rapid_mlx_models_cache["models"]:
+                        self._rapid_mlx_models_cache["models"] = models
+                    self._rapid_mlx_models_cache["ts"] = time.time()
+            finally:
+                with self._models_cache_lock:
+                    type(self)._rapid_refreshing = False
+
+        with self._models_cache_lock:
             return (set(self._ollama_models_cache["models"]),
                     dict(self._rapid_mlx_models_cache["models"]))
 
@@ -1646,6 +1720,10 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         """检查模型是否在任一上游存在。"""
         if not model:
             return True
+        # 熔断中的模型视为不存在：让客户端立刻拿到 404 + 可用列表，
+        # 而不是把请求发出去、等上游自己拒绝。
+        if self._is_model_bad(model):
+            return False
         ollama_models, rapid_models = self._refresh_model_caches()
         all_models = ollama_models | set(rapid_models.keys())
         if all_models:
@@ -2015,26 +2093,32 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         wide_allow = ("*" in allow) or (AUTO_MODEL_NAME in allow)
 
         allowed: List[Tuple[str, str]] = []
+        skipped_bad = 0
         for m, h in pool:
             if m in deny or m in AUTO_EXCLUDE or m in auto_excl:
                 continue
             if not wide_allow and m not in allow:
                 continue
+            # 熔断中的模型不进候选池：它可能仍在 /api/tags 里，但实际加载不了。
+            if self._is_model_bad(m):
+                skipped_bad += 1
+                continue
             allowed.append((m, h))
+        note_bad = f"；跳过 {skipped_bad} 个失效模型" if skipped_bad else ""
 
         if path.endswith("/embeddings"):
             embed = [(m, h) for m, h in allowed if self._auto_is_embed(m)]
             if embed:
-                return embed, "嵌入端点，仅限嵌入模型"
-            return [], "嵌入端点但候选池内没有嵌入模型"
+                return embed, "嵌入端点，仅限嵌入模型" + note_bad
+            return [], "嵌入端点但候选池内没有嵌入模型" + note_bad
 
         chat = [(m, h) for m, h in allowed if not self._auto_is_embed(m)]
         if self._auto_req_has_image(req):
             vlm = [(m, h) for m, h in chat if self._auto_is_vlm(m, h)]
             if vlm:
-                return vlm, "带图请求，优先多模态模型"
-            return chat, "带图请求但无多模态候选，回退文本模型（图片将被过滤）"
-        return chat, "文本请求"
+                return vlm, "带图请求，优先多模态模型" + note_bad
+            return chat, "带图请求但无多模态候选，回退文本模型（图片将被过滤）" + note_bad
+        return chat, "文本请求" + note_bad
 
     def _auto_pick_model(self, path: str, req: dict, cfg: dict) -> Tuple[str, str, str]:
         """从候选池挑一个模型，返回 (model, upstream_host, 说明)；无候选时 model 为空串。
@@ -2802,40 +2886,102 @@ iframe{{padding-top:0}}
         t0 = time.time()
         resp = None
         last_exc = None
+        _err_body = b""
 
-        # 上游重试：对连接类错误重试 1 次（Ollama 偶发抖动）
-        for attempt in range(2):
-            try:
-                req = urllib.request.Request(url, data=body_bytes or None, method=method, headers=upstream_headers)
-                resp = urllib.request.urlopen(req, timeout=read_timeout)
-                break
-            except urllib.error.HTTPError as e:
-                # HTTP 错误（如 404/500）不重试，直接处理
-                last_exc = e
-                break
-            except (urllib.error.URLError, ConnectionError, TimeoutError, OSError) as e:
-                last_exc = e
-                # 超时 ≠ 连接抖动：重试只会把已经等过的预算再翻一倍，
-                # 5 万 token 的生成也没必要跑两遍。直接判定超时。
-                if isinstance(e, TimeoutError) or isinstance(getattr(e, "reason", None), TimeoutError):
+        # ---- auto 模型可用性降级 ----
+        # `/api/tags` 只说明 manifest 在不在，不代表权重能加载（被删/损坏/拉取中断都算）。
+        # auto 选中的模型一旦在上游被判定不可用，这里自动换下一个候选重试，
+        # 而不是把上游的 404 原样打回客户端 —— 那会让"池子里还有别的可用模型"
+        # 这件事完全失效，用户侧看起来就是"模型没了，网关也跟着废了"。
+        # 显式点名某个模型的请求**不降级**：用户要的就是它，拿不到应当明确报错。
+        _max_switch = _env_num("TG_AUTO_MODEL_FALLBACK", 2, minimum=0)
+        _switched = 0
+
+        def _looks_model_unavailable(code: int, text: str) -> bool:
+            """上游错误是否属于"模型本身不可用"（而非参数错/内容错）。"""
+            if code not in (400, 404, 422, 500):
+                return False
+            t = (text or "").lower()
+            if not t:
+                return code == 404
+            for kw in ("not found", "no such model", "not exist", "unknown model",
+                       "failed to load", "unable to load", "model not loaded",
+                       "does not exist", "error loading model"):
+                if kw in t:
+                    return True
+            return False
+
+        while True:
+            resp = None
+            last_exc = None
+            _err_body = b""
+            # 上游重试：对连接类错误重试 1 次（Ollama 偶发抖动）
+            for attempt in range(2):
+                try:
+                    req = urllib.request.Request(url, data=body_bytes or None, method=method, headers=upstream_headers)
+                    resp = urllib.request.urlopen(req, timeout=read_timeout)
                     break
-                if attempt == 0 and resp is None:
-                    # 首次连接失败，等 1 秒后重试一次
-                    log(f"⚠️ 上游连接失败，1秒后重试: {e}")
-                    time.sleep(1)
-                    continue
+                except urllib.error.HTTPError as e:
+                    # HTTP 错误（如 404/500）不重试，但要留住响应体：
+                    # 判断"模型不可用"和最终透传都要用它，而 HTTPError 的流只能读一次。
+                    last_exc = e
+                    try:
+                        _err_body = e.read() or b""
+                    except Exception:
+                        _err_body = b""
+                    break
+                except (urllib.error.URLError, ConnectionError, TimeoutError, OSError) as e:
+                    last_exc = e
+                    # 超时 ≠ 连接抖动：重试只会把已经等过的预算再翻一倍，
+                    # 5 万 token 的生成也没必要跑两遍。直接判定超时。
+                    if isinstance(e, TimeoutError) or isinstance(getattr(e, "reason", None), TimeoutError):
+                        break
+                    if attempt == 0 and resp is None:
+                        # 首次连接失败，等 1 秒后重试一次
+                        log(f"⚠️ 上游连接失败，1秒后重试: {e}")
+                        time.sleep(1)
+                        continue
+                    break
+
+            if resp is not None:
+                # 成功一次即解除熔断（同一模型下次还能被选）
+                self._mark_model_good(model)
                 break
+
+            if (isinstance(last_exc, urllib.error.HTTPError)
+                    and self._auto_resolved and _switched < _max_switch
+                    and _looks_model_unavailable(last_exc.code, _err_body.decode("utf-8", errors="replace"))):
+                self._mark_model_bad(model, f"HTTP {last_exc.code}")
+                _nm, _nh, _nwhy = self._auto_pick_model(self.path, original_req or {}, cfg)
+                if _nm and _nm != model:
+                    log(f"🔁 auto 降级：{model} 不可用 → 换 {_nm} @ {_nh}（{_nwhy}）")
+                    model = _nm
+                    self._auto_resolved = _nm
+                    if isinstance(original_req, dict):
+                        original_req["model"] = _nm
+                        body_bytes = json.dumps(original_req, ensure_ascii=False).encode("utf-8")
+                    upstream_host = _nh
+                    url = f"{upstream_host}{self.path}"
+                    upstream_headers = {}
+                    for h in ("Content-Type", "Accept", "Accept-Encoding"):
+                        v = self.headers.get(h)
+                        if v:
+                            upstream_headers[h] = v
+                    upstream_headers["X-Forwarded-For"] = client_ip
+                    upstream_headers["X-Forwarded-Proto"] = "http"
+                    if upstream_host in RAPID_MLX_VLM_HOSTS:
+                        upstream_headers["Authorization"] = f"Bearer {MLX_VLM_API_KEY}"
+                    _switched += 1
+                    continue
+            break
 
         # 处理连接失败（重试后仍失败）
         if resp is None:
             elapsed = time.time() - t0
             if isinstance(last_exc, urllib.error.HTTPError):
                 e = last_exc
-                err_body = b""
-                try:
-                    err_body = e.read() or b""
-                except Exception:
-                    pass
+                # 响应体已在上面读取并缓存（HTTPError 的流只能读一次）
+                err_body = _err_body
                 try:
                     self.send_response(e.code)
                     for k, v in e.headers.items():
