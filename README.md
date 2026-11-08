@@ -94,6 +94,8 @@ TG_DISABLE_HTTPS=1 TG_PORT=3000 python3 token-gateway.py
 | TG_MIN_MAX_TOKENS_TEXT | 2048 | **Ollama 等非 Rapid-MLX 上游的纯文本**请求 `max_tokens` 下限（带图请求不受限）。gemma4 这类"会思考"的模型先把预算烧在思维链上，预算不足时 `content` 为空、`finish_reason=length`，客户端只看到一条空回复；设 0 关闭 |
 | TG_REASONING_RETRY_TOKENS | 4096 | 命中「空正文 + 有 `reasoning` + `finish_reason=length`」时的重发预算，实际取 `max(本值, 本次生效预算×4)`。仅对非流式、且响应尚未发往客户端的请求生效，**最多重发一次** |
 | TG_STREAM_INCLUDE_USAGE | 0 | 流式请求是否向上游索取 `stream_options.include_usage` 以获得**精确** usage。三家上游都支持，但会在 `[DONE]` 前多发一个 `choices: []` 的帧，手写 SSE 解析器（`chunk["choices"][0]`）会崩，故默认关闭；关闭时按增量文本字符折算 |
+| TG_BAD_MODEL_TTL | 120 | 上游判定某模型不可用后，把它从 auto 候选池与存在性检查里熔断多久（秒）。`/api/tags` 只说明 manifest 在不在，权重损坏 / 拉取中断时模型仍会留在列表里，靠这个开关避免反复选中它；设 0 关闭熔断 |
+| TG_AUTO_MODEL_FALLBACK | 2 | auto 选中的模型在上游被判定不可用时，自动换下一个候选重试的次数。**显式点名模型的请求不降级**（要的就是它，拿不到应当明确报错）；设 0 关闭降级 |
 | TG_CONFIG_DIR | ~/.ollama-token-gateway | config.json / certs / logs 所在目录 |
 | TG_LOG_DIR | `$TG_CONFIG_DIR/logs` | 用量日志 `usage.jsonl` 所在目录 |
 
@@ -641,6 +643,18 @@ launchctl unload ~/Library/LaunchAgents/com.user.memguard.plist
 
 ## 故障排查 / 常见问题
 
+### 模型在 `/v1/models` 里，但请求它必报 404
+
+`/api/tags` 反映的是 manifest 是否存在，不代表权重能加载。权重 blob 缺失、下载中断、
+config blob 损坏时，模型**仍会出现在列表里**，但上游一律回 `model 'x' not found`。
+
+网关的处理：命中一次就熔断该模型 `TG_BAD_MODEL_TTL`（默认 120s）——期间 auto 候选池
+跳过它、显式请求立即 404 并附可用列表；auto 请求会自动换下一个候选重试（最多
+`TG_AUTO_MODEL_FALLBACK` 次）。日志里对应 `🚫 模型熔断` 与 `🔁 auto 降级`。
+
+核查：对比每个 manifest 的 `config.digest` 与 `layers[].digest` 是否都在 `blobs/` 下；
+修复只需 `ollama pull <模型名>`（已存在的层会跳过，只补缺口）。
+
 ### `curl localhost:3000/health` 异常
 | 现象 | 可能原因 | 排查 / 处理 |
 |---|---|---|
@@ -866,9 +880,10 @@ python3 tests/test_env_guard.py     # 数值型环境变量写坏时降级不崩
 python3 tests/test_prompt_estimate.py # prompt 规模估算：工具清单 / 图片面积 / 桶边界（17 项）
 python3 tests/test_reasoning_retry.py # Ollama 预算下限 + 推理模型空正文修复（25 项）
 python3 tests/test_stream_usage.py  # 流式记账：按增量文本折算、不把 SSE 框架算成 token（13 项）
+python3 tests/test_model_fallback.py # 模型失效检测：熔断 / auto 降级 / 显式不降级 / 快速 503（19 项）
 ```
 
-八个脚本都可通过环境变量改指向：
+九个脚本都可通过环境变量改指向：
 
 | 变量 | 作用 |
 |---|---|
@@ -882,6 +897,7 @@ python3 tests/test_stream_usage.py  # 流式记账：按增量文本折算、不
 
 | 日期 | 提交 | 内容 |
 |---|---|---|
+| 2026-11-08 | `bbb6202d` | **上游模型失效时自动检测并降级**：`/api/tags` 只说明 manifest 在不在，权重损坏时模型仍留在列表里、请求必 404，而 auto 会按分档反复选中它。新增失效模型熔断表（`TG_BAD_MODEL_TTL`，默认 120s），auto 候选池与存在性检查都跳过它；`_proxy` 增加 auto 降级重试（`TG_AUTO_MODEL_FALLBACK`，默认 2 次），**显式点名模型的请求不降级**；HTTPError 响应体改为只读一次并缓存；`_refresh_model_caches` 的网络探测移出锁并加单飞，避免缓存过期瞬间并发请求排队等同一个 3s 探测。新增 `tests/test_model_fallback.py`（19 项） |
 | 2026-11-07 | `e54d064f` | **流式请求记账不再把 SSE 框架算成 token**：SSE 默认不带 usage，旧实现退回 `len(原始字节)//3`，而每帧 `data: {...}` 约 230 字节 —— 一个真实 64 token 的流式回复被记成 4,389 token（约 68 倍），配额被几十倍地扣。改为按**增量文本字符**折算（`TOKENS_PER_CHAR`），同一次请求 33,115 → 812 token；prompt 估算同样改按字符并兼容 `content` 为分段 list；新增可选 `TG_STREAM_INCLUDE_USAGE`（默认 0）以换取上游精确 usage；新增 `tests/test_stream_usage.py`（13 项） |
 | 2026-11-07 | `fdff934e` | **Ollama 侧补输出预算下限 + 推理模型空正文修复**：预算下限原先整块嵌在 `upstream_host in RAPID_MLX_HOSTS` 分支里，Ollama 上游完全不受约束；gemma4 这类推理模型先把预算烧在 `reasoning` 上，耗尽时 `content` 为空、`finish_reason=length`（实测 `max_tokens=64` → content 0 字符 / reasoning 233 字符 / completion 恰好等于预算），且是否触发思维链是**概率性**的，故单靠下限挡不住。新增 `_min_max_tokens_for()` 收口预算决策；非 Rapid-MLX 纯文本抬到 `TG_MIN_MAX_TOKENS_TEXT`（默认 2048）；非流式命中「空正文 + reasoning + length」时以 `max(4096, 生效预算×4)` **重发一次**（`TG_REASONING_RETRY_TOKENS`，响应头 `X-Gateway-Reasoning-Retry`），流式不重发；顺带确认 Ollama 的 OpenAI 兼容端点会忽略 `think` / `reasoning_effort`；新增 `tests/test_reasoning_retry.py`（25 项） |
 | 2026-11-07 | `29a2b2eb` | **速度分桶改用真实 prompt 规模估算**：此前 `p_hat` 只数 messages 正文，漏掉工具清单与图片，带工具/带图的长会话被估进偏小的桶（该桶全是纯文本样本，明显更快），speed 因子系统性偏高。实测 12 个工具 5,066 字符 ≈ 1,967 token、一张 768² 图 ≈ 578 token（约 980 token/百万像素，384²/768²/1536² 三点一致）。新增 `_auto_req_prompt_chars`（正文 + tools/functions/response_format 序列化长度）与 `_auto_req_image_tokens`（解析 data URI 图头取宽高，拿不到按 `TG_IMG_TOKENS_NOMINAL`）；分档用的 `_auto_req_text_len` 口径不变；新增 `tests/test_prompt_estimate.py`（17 项） |
