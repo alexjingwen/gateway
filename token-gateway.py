@@ -1638,6 +1638,48 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             if cls._bad_models.pop(model, None) is not None:
                 log(f"✅ 模型恢复：{model}")
 
+    # ---- 工具能力缓存 {model: (supports: bool, 到期时间戳)} ----
+    # 背景（2026-11-08）：Ollama 的视觉/嵌入模型（如 qwen2.5vl:3b）对话完全正常，
+    # 但**不接受 tools**，上游会回
+    #   400 {"message":"registry.ollama.ai/library/qwen2.5vl:3b does not support tools"}
+    # auto 的分档只看请求体量（工具清单不计入 chars），一条带 tools 的短请求会被判成
+    # 「短问答」轻量档，于是正好选中这类小 VLM —— 表现就是"开了工具调用，每个请求都 400"。
+    # 这里把能力探测结果缓存起来，候选池在带 tools 时按需过滤；同时把上游 400 当作
+    # 能力信息（而不是模型损坏）记下来，**不能进熔断表**——它对普通对话仍然可用。
+    _tool_caps: dict = {}
+    _tool_caps_lock = threading.Lock()
+
+    @classmethod
+    def _tool_cap_get(cls, model: str) -> Optional[bool]:
+        with cls._tool_caps_lock:
+            entry = cls._tool_caps.get(model)
+            if entry is None:
+                return None
+            supports, exp = entry
+            if exp <= time.time():
+                cls._tool_caps.pop(model, None)
+                return None
+            return supports
+
+    @classmethod
+    def _tool_cap_set(cls, model: str, supports: bool, ttl: Optional[float] = None) -> None:
+        if not model:
+            return
+        if ttl is None:
+            ttl = _env_num("TG_TOOL_CAP_TTL", 600, minimum=0)
+        if ttl <= 0:
+            return
+        with cls._tool_caps_lock:
+            cls._tool_caps[model] = (bool(supports), time.time() + ttl)
+
+    @classmethod
+    def _mark_model_no_tools(cls, model: str) -> None:
+        """上游明确回「不支持 tools」：这是能力边界，不是模型坏了，别写进熔断表。"""
+        if not model:
+            return
+        cls._tool_cap_set(model, False)
+        log(f"🧰 记下能力边界：{model} 不支持工具调用（后续带 tools 的请求会跳过它）")
+
     def _fetch_ollama_models(self) -> set:
         """拉取 ollama 模型名集合；顺带缓存 details（参数量/量化）供 auto 质量排序使用。"""
         try:
@@ -1765,6 +1807,52 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             return True
         m = model.lower()
         return any(h in m for h in AUTO_VLM_HINTS)
+
+    @staticmethod
+    def _auto_req_has_tools(req: dict) -> bool:
+        """请求是否携带工具定义（OpenAI 的 tools / 旧版 functions）。"""
+        if not isinstance(req, dict):
+            return False
+        return bool(req.get("tools") or req.get("functions"))
+
+    def _probe_ollama_tool_cap(self, model: str) -> Optional[bool]:
+        """向 Ollama `/api/show` 询问模型能力，返回 True/False/None（未知）。
+
+        只用于"带 tools 的 auto 请求"，按模型懒探测并缓存 `TG_TOOL_CAP_TTL` 秒。
+        老版本 Ollama 不返回 `capabilities` 字段，此时一律返回 None —— **未知即放行**，
+        绝不能因为探测不到就把模型从候选池里踢掉（那会把可用模型越筛越少）。
+        """
+        try:
+            payload = json.dumps({"name": model}).encode("utf-8")
+            req = urllib.request.Request(
+                f"{OLLAMA_HOST}/api/show", data=payload, method="POST",
+                headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=2) as r:
+                if r.status != 200:
+                    return None
+                data = json.loads(r.read() or b"{}")
+        except Exception:
+            return None
+        caps = data.get("capabilities")
+        if not isinstance(caps, list) or not caps:
+            return None
+        return "tools" in [str(c).lower() for c in caps]
+
+    def _auto_supports_tools(self, model: str, host: str) -> Optional[bool]:
+        """模型是否支持工具调用；None 表示未知（按支持处理）。
+
+        只有 Ollama 有可查的能力接口；Rapid-MLX / vLLM 这类上游没有，返回 None
+        由上游 400 反向学习（见 `_mark_model_no_tools`）。
+        """
+        cap = self._tool_cap_get(model)
+        if cap is not None:
+            return cap
+        if host == OLLAMA_HOST:
+            cap = self._probe_ollama_tool_cap(model)
+            if cap is not None:
+                self._tool_cap_set(model, cap)
+            return cap
+        return None
 
     @staticmethod
     def _auto_req_has_image(req: dict) -> bool:
@@ -2134,9 +2222,24 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         if self._auto_req_has_image(req):
             vlm = [(m, h) for m, h in chat if self._auto_is_vlm(m, h)]
             if vlm:
-                return vlm, "带图请求，优先多模态模型" + note_bad
-            return chat, "带图请求但无多模态候选，回退文本模型（图片将被过滤）" + note_bad
-        return chat, "文本请求" + note_bad
+                base, note = vlm, "带图请求，优先多模态模型"
+            else:
+                base, note = chat, "带图请求但无多模态候选，回退文本模型（图片将被过滤）"
+        else:
+            base, note = chat, "文本请求"
+
+        # 工具调用是硬能力要求：视觉模型常常只能对话、不接受 tools，
+        # 选中它们的下场是上游 400（而且原文带 registry 路径，客户端看不懂）。
+        if self._auto_req_has_tools(req):
+            tooled = [(m, h) for m, h in base if self._auto_supports_tools(m, h) is not False]
+            dropped = len(base) - len(tooled)
+            if dropped:
+                note += f"；带工具请求，已排除 {dropped} 个不支持 tools 的模型"
+            if tooled:
+                return tooled, note + note_bad
+            # 全部未知/不支持：仍把原池交出去，让上游给出确切原因，别在这里谎报"无候选"
+            return base, note + "；带工具请求但候选均未声明支持 tools" + note_bad
+        return base, note + note_bad
 
     def _auto_pick_model(self, path: str, req: dict, cfg: dict) -> Tuple[str, str, str]:
         """从候选池挑一个模型，返回 (model, upstream_host, 说明)；无候选时 model 为空串。
@@ -2622,6 +2725,16 @@ iframe{{padding-top:0}}
                                  f"模型 '{model}' 不存在。可用模型: {available}")
             return
 
+        # 工具能力预检查：已知不支持 tools 的模型（如 qwen2.5vl:3b）不必再浪费一次上游往返，
+        # 也不该让客户端收到带 registry 路径的原始 400。auto 已在上面的候选池里过滤过。
+        if (model and not self._auto_resolved and self._auto_req_has_tools(req)
+                and self._auto_supports_tools(model, self._resolve_upstream(model, path)) is False):
+            self._send_error(400, "model_no_tools",
+                             f"模型 '{model}' 不支持工具调用（tools）。"
+                             f"请改用支持 tools 的模型（选 auto 时网关会自动挑），"
+                             f"或把该模型加入 deny_models / TG_AUTO_EXCLUDE。")
+            return
+
         # 估算 tokens (prompt_tokens + max_tokens) 用于额度预检查
         est = 1000
         try:
@@ -2940,6 +3053,22 @@ iframe{{padding-top:0}}
                     return True
             return False
 
+        _req_has_tools = bool(isinstance(original_req, dict)
+                              and (original_req.get("tools") or original_req.get("functions")))
+
+        def _looks_tools_unsupported(code: int, text: str) -> bool:
+            """上游是否在说"这个模型不支持 tools"。
+
+            与"模型不可用"必须分开处理：模型本身是好的，只是没有工具调用能力，
+            把它写进熔断表会让普通对话也跟着被拒 120 秒。
+            """
+            if code not in (400, 422):
+                return False
+            t = (text or "").lower()
+            if "tool" not in t:
+                return False
+            return ("not support" in t) or ("unsupported" in t) or ("cannot use tool" in t)
+
         while True:
             resp = None
             last_exc = None
@@ -2977,13 +3106,20 @@ iframe{{padding-top:0}}
                 self._mark_model_good(model)
                 break
 
-            if (isinstance(last_exc, urllib.error.HTTPError)
-                    and self._auto_resolved and _switched < _max_switch
-                    and _looks_model_unavailable(last_exc.code, _err_body.decode("utf-8", errors="replace"))):
-                self._mark_model_bad(model, f"HTTP {last_exc.code}")
+            _is_http = isinstance(last_exc, urllib.error.HTTPError)
+            _err_text = _err_body.decode("utf-8", errors="replace")
+            _tools_unsup = _is_http and _req_has_tools and _looks_tools_unsupported(last_exc.code, _err_text)
+            _unavail = _is_http and _looks_model_unavailable(last_exc.code, _err_text)
+            if ((_unavail or _tools_unsup) and self._auto_resolved and _switched < _max_switch):
+                # 两条路径的记账方式不同：不可用→熔断；不支持 tools→只记能力边界
+                if _tools_unsup:
+                    self._mark_model_no_tools(model)
+                else:
+                    self._mark_model_bad(model, f"HTTP {last_exc.code}")
                 _nm, _nh, _nwhy = self._auto_pick_model(self.path, original_req or {}, cfg)
                 if _nm and _nm != model:
-                    log(f"🔁 auto 降级：{model} 不可用 → 换 {_nm} @ {_nh}（{_nwhy}）")
+                    _why_switch = "不支持 tools" if _tools_unsup else "不可用"
+                    log(f"🔁 auto 降级：{model} {_why_switch} → 换 {_nm} @ {_nh}（{_nwhy}）")
                     model = _nm
                     self._auto_resolved = _nm
                     if isinstance(original_req, dict):
@@ -3011,6 +3147,21 @@ iframe{{padding-top:0}}
                 e = last_exc
                 # 响应体已在上面读取并缓存（HTTPError 的流只能读一次）
                 err_body = _err_body
+                if _req_has_tools and _looks_tools_unsupported(
+                        e.code, err_body.decode("utf-8", errors="replace")):
+                    # 上游原话带 `registry.ollama.ai/library/...` 前缀，客户端只会把它当成
+                    # 莫名其妙的 400 弹出来。换成人能看懂的原因 + 可执行的处置建议。
+                    self._mark_model_no_tools(model)
+                    log(f"🧰 上游拒绝工具调用：{model} 不支持 tools | 来自:{client_ip}")
+                    try:
+                        self._send_error(
+                            400, "model_no_tools",
+                            f"模型 '{model}' 不支持工具调用（tools）。"
+                            f"请改用支持 tools 的模型（选 auto 时网关会自动挑），"
+                            f"或把该模型加入 deny_models / TG_AUTO_EXCLUDE。")
+                    except self._CLIENT_GONE_ERRORS:
+                        pass
+                    return
                 try:
                     self.send_response(e.code)
                     for k, v in e.headers.items():
