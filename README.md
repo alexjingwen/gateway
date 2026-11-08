@@ -95,6 +95,7 @@ TG_DISABLE_HTTPS=1 TG_PORT=3000 python3 token-gateway.py
 | TG_REASONING_RETRY_TOKENS | 4096 | 命中「空正文 + 有 `reasoning` + `finish_reason=length`」时的重发预算，实际取 `max(本值, 本次生效预算×4)`。仅对非流式、且响应尚未发往客户端的请求生效，**最多重发一次** |
 | TG_STREAM_INCLUDE_USAGE | 0 | 流式请求是否向上游索取 `stream_options.include_usage` 以获得**精确** usage。三家上游都支持，但会在 `[DONE]` 前多发一个 `choices: []` 的帧，手写 SSE 解析器（`chunk["choices"][0]`）会崩，故默认关闭；关闭时按增量文本字符折算 |
 | TG_BAD_MODEL_TTL | 120 | 上游判定某模型不可用后，把它从 auto 候选池与存在性检查里熔断多久（秒）。`/api/tags` 只说明 manifest 在不在，权重损坏 / 拉取中断时模型仍会留在列表里，靠这个开关避免反复选中它；设 0 关闭熔断 |
+| TG_TOOL_CAP_TTL | 600 | 模型「是否支持 tools」这层能力判定的缓存秒数（来源：Ollama `/api/show` 的 `capabilities`，以及上游 400 的反向学习）。带 tools 的请求会跳过已判定不支持的模型；设 0 关闭缓存（每次重新探测） |
 | TG_AUTO_MODEL_FALLBACK | 2 | auto 选中的模型在上游被判定不可用时，自动换下一个候选重试的次数。**显式点名模型的请求不降级**（要的就是它，拿不到应当明确报错）；设 0 关闭降级 |
 | TG_CONFIG_DIR | ~/.ollama-token-gateway | config.json / certs / logs 所在目录 |
 | TG_LOG_DIR | `$TG_CONFIG_DIR/logs` | 用量日志 `usage.jsonl` 所在目录 |
@@ -673,6 +674,32 @@ config blob 损坏时，模型**仍会出现在列表里**，但上游一律回 
 核查：对比每个 manifest 的 `config.digest` 与 `layers[].digest` 是否都在 `blobs/` 下；
 修复只需 `ollama pull <模型名>`（已存在的层会跳过，只补缺口）。
 
+### 客户端报 `400 ... does not support tools`
+
+原始报文长这样，前缀是上游给模型打的规范化名，看着像"模型不存在"，其实与模型是否可用无关：
+
+```
+400 {"message":"registry.ollama.ai/library/qwen2.5vl:3b does not support tools",
+     "type":"invalid_request_error","param":null,"code":null}
+```
+
+含义是**这个模型没有工具调用能力**。Ollama 的视觉模型（`qwen2.5vl:3b` 的 `capabilities`
+是 `["completion","vision"]`）对话完全正常，但不接受 `tools`。auto 的分档只看请求体量
+（工具清单不计入字符数），一条带 tools 的短请求会被判成「短问答」轻量档，于是正好选中
+这类小 VLM —— 表现为"一开工具调用，每个请求都 400"。
+
+网关的处理（2026-11-08 起）：
+
+1. **带 tools 的 auto 请求**先按 `capabilities` 过滤候选（来源 `POST /api/show`，缓存
+   `TG_TOOL_CAP_TTL` 秒），日志会出现 `已排除 N 个不支持 tools 的模型`；
+2. 上游仍回这句 400 时，把它当作**能力信息**记下（`🧰 记下能力边界`），auto 换下一个候选重试。
+   它**不会**进熔断表——该模型对普通对话仍然可用；
+3. 显式点名时返回干净的 `400 model_no_tools`，明确写出原因与处置建议，而不是把上游
+   带 `registry.` 前缀的原文丢给客户端。
+
+自查：`curl -s -X POST 127.0.0.1:11434/api/show -d '{"name":"<模型>"}'` 看 `capabilities`
+里有没有 `tools`。想彻底不让 auto 碰它，把它写进 `deny_models` 或 `TG_AUTO_EXCLUDE`。
+
 ### `curl localhost:3000/health` 异常
 | 现象 | 可能原因 | 排查 / 处理 |
 |---|---|---|
@@ -900,9 +927,10 @@ python3 tests/test_reasoning_retry.py # Ollama 预算下限 + 推理模型空正
 python3 tests/test_stream_usage.py  # 流式记账：按增量文本折算、不把 SSE 框架算成 token（13 项）
 python3 tests/test_model_fallback.py # 模型失效检测：熔断 / auto 降级 / 显式不降级 / 快速 503（19 项）
 python3 tests/test_upstream_proxy.py # 上游直连：HTTP_PROXY 指向死端口时模型列表与推理仍正常（7 项）
+python3 tests/test_tool_capability.py # 工具能力：带 tools 时不得选中不支持 tools 的模型（21 项）
 ```
 
-十个脚本都可通过环境变量改指向：
+十一个脚本都可通过环境变量改指向：
 
 | 变量 | 作用 |
 |---|---|
@@ -916,6 +944,7 @@ python3 tests/test_upstream_proxy.py # 上游直连：HTTP_PROXY 指向死端口
 
 | 日期 | 提交 | 内容 |
 |---|---|---|
+| 2026-11-08 | `cb80121d` | **带 `tools` 的请求不再落到不支持工具调用的模型上**：`qwen2.5vl:3b` 这类视觉模型的 `capabilities` 是 `["completion","vision"]`，对话正常但不接受 `tools`，上游回 `400 ... does not support tools`（前缀是 registry 路径）。auto 分档只看请求体量、工具清单不计入字符数，带 tools 的短请求被判成轻量档 → 正好选中它们，表现为"一开工具调用每个请求都 400"。新增能力缓存（`TG_TOOL_CAP_TTL`，来源 `/api/show` 的 `capabilities`，未知一律放行），带 tools 时过滤候选；上游这句 400 按**能力边界**记账而**不进熔断表**（模型对普通对话仍可用），auto 换下一个候选重试；显式点名时直接返回 `400 model_no_tools` 并给出处置建议。新增 `tests/test_tool_capability.py`（21 项，修复前 9/21） |
 | 2026-11-08 | `0a8f0f54` | **部署模板与线上对齐**：仓库里的 `com.token-gateway.server.plist` 落后于实跑配置——缺 `NO_PROXY`（代理劫持那道保险只写在代码里）、把已下线的 `:8090` 留在 `TG_RAPID_MLX_HOSTS` 里（每次模型探测白等超时）、`TG_QPS`/`TG_CONCURRENCY` 与生产不符。已按线上校正并补 `HF_HUB_OFFLINE`/`TRANSFORMERS_OFFLINE`，可选限流项改为注释保留；`plutil -lint` 通过。同日回归实测 122B：`/v1/models` 可见、纯文本 0.93s、流式 SSE 正常、带图 3,620 prompt tokens 描述准确、两把 Key 均 200 |
 | 2026-11-08 | `fde83242` | **上游连接固定直连，修复代理劫持导致「122B 消失」**：从带 `HTTP_PROXY` 的环境启动时，urllib 把 `127.0.0.1:11434` / `:8088` 也交给代理，代理一停全部 `Connection refused` → 模型发现失败、`/v1/models` 只剩 `auto`、推理全 502（`/health` 仍 200，极难自查）。模块加载时安装空 `ProxyHandler` 的 opener，覆盖全部 urlopen 调用点；plist 增加 `NO_PROXY=*` 作双保险。新增 `tests/test_upstream_proxy.py`（7 项）。另：文档自测清单补为十个脚本 |
 | 2026-11-08 | `bbb6202d` | **上游模型失效时自动检测并降级**：`/api/tags` 只说明 manifest 在不在，权重损坏时模型仍留在列表里、请求必 404，而 auto 会按分档反复选中它。新增失效模型熔断表（`TG_BAD_MODEL_TTL`，默认 120s），auto 候选池与存在性检查都跳过它；`_proxy` 增加 auto 降级重试（`TG_AUTO_MODEL_FALLBACK`，默认 2 次），**显式点名模型的请求不降级**；HTTPError 响应体改为只读一次并缓存；`_refresh_model_caches` 的网络探测移出锁并加单飞，避免缓存过期瞬间并发请求排队等同一个 3s 探测。新增 `tests/test_model_fallback.py`（19 项） |
