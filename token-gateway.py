@@ -298,6 +298,14 @@ REAPER_INTERVAL_S = 5
 #   · 清单变化时顺带清理熔断表 / 能力缓存里对已经不存在的模型的记录。
 MODEL_REFRESH_INTERVAL_S = _env_num("TG_MODEL_REFRESH_INTERVAL", 60, minimum=0)
 
+# `/v1/models` 与 `/api/tags` 直接读缓存的陈旧容忍度（秒）。
+# 旧实现每次列举都现场向上游发 1 + len(RAPID_MLX_HOSTS) 个同步请求（各 timeout=3s），
+# 有两个后果：① 客户端轮询列表时每次可能阻塞数秒；② 任一上游抖动，`except: pass`
+# 就会让列表**静默少几个模型**（甚至只剩 auto）——客户端据此缓存的结果也会跟着错。
+# 现在列举只读缓存：超过这个陈旧度就**后台**触发一次刷新（不阻塞本次响应），
+# 因此删掉的模型最多在一个 TTL + 一次探测耗时内从列表消失，而在的模型不会因抖动请假。
+MODEL_LIST_TTL_S = _env_num("TG_MODEL_LIST_TTL", 5, minimum=0)
+
 
 def _slots_free_by_client_gone() -> int:
     """回收所有"客户端已断开"的在飞请求槽位，返回回收个数。"""
@@ -1623,6 +1631,12 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
     # 否则缓存一过期，N 个并发请求会各自等满 timeout（每主机 3s）——表现为整体卡顿。
     _ollama_refreshing = False
     _rapid_refreshing = False
+    # 上游**原始**条目，供 /v1/models 与 /api/tags 原样透出（保留 details / size 等字段，
+    # 避免客户端因字段缺失而认不出模型）。与上面的 set/dict 缓存同源同寿命。
+    _ollama_raw_models: list = []
+    _rapid_raw_models: list = []   # [{"id": 原始 id, "host": host}]
+    # 列举接口的后台刷新单飞标记（与巡检线程的标记分开，互不干扰）
+    _list_refreshing = False
 
     @classmethod
     def _mark_model_bad(cls, model: str, reason: str = "") -> None:
@@ -1733,11 +1747,13 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             data = json.loads(r.read())
             models = set()
             meta = {}
+            raw = []
             for m in data.get("models", []) or []:
                 name = m.get("name")
                 if not name:
                     continue
                 models.add(name)
+                raw.append(m)
                 det = m.get("details") or {}
                 meta[name] = {
                     "param": det.get("parameter_size") or "",
@@ -1748,6 +1764,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             # 成功答复即覆盖元数据（空清单也要覆盖，否则被删模型的参数量会一直留着）
             cls._ollama_meta_cache["meta"] = meta
             cls._ollama_meta_cache["ts"] = time.time()
+            cls._ollama_raw_models = raw
             return models
         except Exception:
             return None
@@ -1756,6 +1773,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
     def _fetch_rapid_mlx_models(cls) -> Optional[dict]:
         """返回 {model: host}；全部主机都探测失败时返回 None（未知），否则返回字典。"""
         result = {}
+        raw = []
         answered = 0
         for host in RAPID_MLX_HOSTS:
             try:
@@ -1771,9 +1789,32 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
                         mid = m["id"]
                         if "/" not in mid or "/" not in result:
                             result[mid] = host
+                        raw.append({"id": mid, "host": host})
             except Exception:
                 continue
-        return result if answered else None
+        if answered:
+            cls._rapid_raw_models = raw
+            return result
+        return None
+
+    @classmethod
+    def _wait_inflight_refresh(cls) -> None:
+        """force 路径专用：若有刷新正在飞，等它落地（有界），别让"强刷"拿到旧值。
+
+        为什么需要：单飞标记会让后来者直接跳过探测。对后台刷新这是对的（本来就
+        不想排队），但对 `?refresh=1` 是错的 —— 用户明确要最新，却可能正好撞上
+        巡检线程在飞，于是拿回一份旧清单，表现为"刚删掉的模型还在"。
+        """
+        wait = _env_num("TG_LIST_REFRESH_WAIT", 5, minimum=0)
+        if wait <= 0:
+            return
+        deadline = time.time() + wait
+        while time.time() < deadline:
+            with cls._models_cache_lock:
+                busy = cls._ollama_refreshing or cls._rapid_refreshing
+            if not busy:
+                return
+            time.sleep(0.02)
 
     @classmethod
     def _refresh_model_caches(cls, force: bool = False) -> Tuple[set, dict]:
@@ -1789,6 +1830,10 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         并在清单变化后清理熔断表 / 能力缓存里已经不存在的模型。
         """
         now = time.time()
+        if force:
+            # 先等掉在飞的刷新：否则单飞标记会让本次"强刷"直接跳过探测、返回旧值
+            cls._wait_inflight_refresh()
+            now = time.time()
         ttl = 0 if force else 30
         with cls._models_cache_lock:
             need_ollama = now - cls._ollama_models_cache["ts"] > ttl
@@ -1835,6 +1880,51 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         if changed:
             cls._sync_model_registry(ollama_now, rapid_now)
         return ollama_now, rapid_now
+
+    @classmethod
+    def _ensure_list_fresh(cls, force: bool = False) -> None:
+        """列举接口（/v1/models、/api/tags）用：**不阻塞**地保证清单大致新鲜。
+
+        三种情形：
+          · `force=True` 或 `TG_MODEL_LIST_TTL=0` → 同步刷新（调用方明确要最新，且
+            这是唯一会等网络的情形）；
+          · 缓存年龄 ≤ TTL → 直接返回，本次用缓存；
+          · 缓存已过期 → 起一个**单飞**后台线程去刷，本次仍返回旧缓存。
+            这样客户端轮询列表不会被上游超时拖住，也不会因某台上游抖动而少几个模型。
+
+        与巡检线程（`_model_refresh_loop`）的分工：巡检只负责闲时保活与对账；
+        这里负责"有人在看列表"时尽快让删除/新增可见。两者都走同一把
+        `_refresh_model_caches`，锁与单飞标记一致，不会重复探测。
+        """
+        if force or MODEL_LIST_TTL_S <= 0:
+            cls._refresh_model_caches(force=True)
+            return
+        with cls._models_cache_lock:
+            cold = not cls._known_models
+            age = time.time() - max(cls._ollama_models_cache["ts"],
+                                   cls._rapid_mlx_models_cache["ts"])
+            busy = cls._list_refreshing
+        if cold:
+            # 冷启动没有旧数据可给，宁可等一次也别返回空列表（客户端会把空列表当真）
+            cls._refresh_model_caches(force=True)
+            return
+        if age <= MODEL_LIST_TTL_S or busy:
+            return
+        with cls._models_cache_lock:
+            if cls._list_refreshing:
+                return
+            cls._list_refreshing = True
+
+        def _bg() -> None:
+            try:
+                cls._refresh_model_caches(force=True)
+            except Exception as e:
+                log(f"⚠️  后台刷新模型清单失败：{type(e).__name__}: {e}")
+            finally:
+                with cls._models_cache_lock:
+                    cls._list_refreshing = False
+
+        threading.Thread(target=_bg, daemon=True, name="model-list-refresh").start()
 
     @classmethod
     def _sync_model_registry(cls, ollama: set, rapid: dict) -> None:
@@ -2625,37 +2715,35 @@ iframe{{padding-top:0}}
         # /v1/models — 合并 Ollama + Rapid-MLX
         if path == "/v1/models":
             try:
+                # 列表一律读缓存：旧实现每次现场探测 1+N 个上游（各 timeout=3s），
+                # 客户端轮询时会阻塞数秒，且任一上游抖动就静默少几个模型。
+                # 缓存过期则后台刷新，本次照常返回旧值；?refresh=1 才同步等更新。
+                _force = "_refresh=1" in self.path or "refresh=1" in self.path
+                self._ensure_list_fresh(force=_force)
+                with self._models_cache_lock:
+                    ollama_raw = list(self._ollama_raw_models)
+                    ollama_names = set(self._ollama_models_cache["models"])
+                    rapid_raw = list(self._rapid_raw_models)
                 all_models = []
                 seen = set()
-                try:
-                    r = urllib.request.urlopen(f"{OLLAMA_HOST}/api/tags", timeout=3)
-                    if r.status == 200:
-                        for m in json.loads(r.read()).get("models", []):
-                            mid = m["name"]
-                            if mid not in seen:
-                                seen.add(mid)
-                                all_models.append({"id": mid, "object": "model", "created": 0, "owned_by": "ollama"})
-                except Exception:
-                    pass
-                for host in RAPID_MLX_HOSTS:
-                    try:
-                        _h = {}
-                        if host in RAPID_MLX_VLM_HOSTS:
-                            _h["Authorization"] = f"Bearer {MLX_VLM_API_KEY}"
-                        _req = urllib.request.Request(f"{host}/v1/models", headers=_h)
-                        r = urllib.request.urlopen(_req, timeout=3)
-                        if r.status == 200:
-                            for m in json.loads(r.read()).get("data", []):
-                                mid = m.get("id", "")
-                                if not mid or mid in seen:
-                                    continue
-                                mid = _MODEL_REVERSE_ALIAS.get(mid, mid)
-                                if mid in seen:
-                                    continue
-                                seen.add(mid)
-                                all_models.append({"id": mid, "object": "model", "created": 0, "owned_by": "rapid-mlx"})
-                    except Exception:
+                for m in ollama_raw:
+                    mid = m.get("name")
+                    if mid and mid not in seen:
+                        seen.add(mid)
+                        all_models.append({"id": mid, "object": "model", "created": 0, "owned_by": "ollama"})
+                # 兜底：原始条目为空但集合非空（例如从旧缓存恢复）时至少把名字列出来
+                for mid in sorted(ollama_names - seen):
+                    seen.add(mid)
+                    all_models.append({"id": mid, "object": "model", "created": 0, "owned_by": "ollama"})
+                for e in rapid_raw:
+                    raw_id = e.get("id", "")
+                    if not raw_id:
                         continue
+                    mid = _MODEL_REVERSE_ALIAS.get(raw_id, raw_id)
+                    if mid in seen:
+                        continue
+                    seen.add(mid)
+                    all_models.append({"id": mid, "object": "model", "created": 0, "owned_by": "rapid-mlx"})
                 # auto 虚拟模型放在列表末尾：避免改变"客户端默认取第一个模型"的既有行为
                 if AUTO_ENABLED and AUTO_MODEL_NAME not in seen:
                     all_models.append({"id": AUTO_MODEL_NAME, "object": "model",
@@ -2675,41 +2763,37 @@ iframe{{padding-top:0}}
         # /api/tags — 合并 Ollama + Rapid-MLX（含 VLM）
         if path == "/api/tags":
             try:
-                ollama_models = []
+                # 与 /v1/models 同源：读同一份缓存，保留上游原始字段（details / size / modified_at）
+                _force = "_refresh=1" in self.path or "refresh=1" in self.path
+                self._ensure_list_fresh(force=_force)
+                with self._models_cache_lock:
+                    ollama_models = list(self._ollama_raw_models)
+                    ollama_names = set(self._ollama_models_cache["models"])
+                    rapid_raw = list(self._rapid_raw_models)
+                # 兜底：集合里有但原始条目缺失的名字，合成最小可用条目
+                _have = {m.get("name") for m in ollama_models}
+                for mid in sorted(ollama_names - _have):
+                    ollama_models.append({"name": mid, "model": mid, "size": 0,
+                                          "modified_at": "", "details": {}})
                 vlm_models = []
-                try:
-                    r = urllib.request.urlopen(f"{OLLAMA_HOST}/api/tags", timeout=3)
-                    if r.status == 200:
-                        ollama_models = json.loads(r.read()).get("models", [])
-                except Exception:
-                    pass
                 seen = {m.get("name") for m in ollama_models}
-                for host in RAPID_MLX_HOSTS:
-                    try:
-                        _h = {}
-                        if host in RAPID_MLX_VLM_HOSTS:
-                            _h["Authorization"] = f"Bearer {MLX_VLM_API_KEY}"
-                        _req = urllib.request.Request(f"{host}/v1/models", headers=_h)
-                        r = urllib.request.urlopen(_req, timeout=3)
-                        if r.status == 200:
-                            for m in json.loads(r.read()).get("data", []):
-                                mid = m.get("id", "")
-                                if not mid:
-                                    continue
-                                mid = _MODEL_REVERSE_ALIAS.get(mid, mid)
-                                if mid in seen:
-                                    continue
-                                seen.add(mid)
-                                vlm_models.append({
-                                    "name": mid, "model": mid, "size": 0, "modified_at": "",
-                                        "details": {
-                                            "family": "rapid-mlx", "families": None,
-                                            "parameter_size": "unknown", "quantization_level": "",
-                                            "input": ["text", "image"] if host in RAPID_MLX_VLM_HOSTS else ["text"],
-                                        },
-                                    })
-                    except Exception:
+                for e in rapid_raw:
+                    mid = e.get("id", "")
+                    host = e.get("host", "")
+                    if not mid:
                         continue
+                    mid = _MODEL_REVERSE_ALIAS.get(mid, mid)
+                    if mid in seen:
+                        continue
+                    seen.add(mid)
+                    vlm_models.append({
+                        "name": mid, "model": mid, "size": 0, "modified_at": "",
+                        "details": {
+                            "family": "rapid-mlx", "families": None,
+                            "parameter_size": "unknown", "quantization_level": "",
+                            "input": ["text", "image"] if host in RAPID_MLX_VLM_HOSTS else ["text"],
+                        },
+                    })
                 merged = ollama_models + vlm_models
                 body = json.dumps({"models": merged}).encode("utf-8")
                 self.send_response(200)
