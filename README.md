@@ -97,6 +97,8 @@ TG_DISABLE_HTTPS=1 TG_PORT=3000 python3 token-gateway.py
 | TG_BAD_MODEL_TTL | 120 | 上游判定某模型不可用后，把它从 auto 候选池与存在性检查里熔断多久（秒，**首次**失败）。`/api/tags` 只说明 manifest 在不在，权重损坏 / 拉取中断时模型仍会留在列表里，靠这个开关避免反复选中它；设 0 关闭熔断 |
 | TG_BAD_MODEL_TTL_MAX | 3600 | 熔断时长按**连续失败次数**指数退避的上限（秒）：第 n 次失败熔断 `TTL × 2^(n-1)`，到顶后不再增长。没有上界时，一个"早上删掉、晚上才补"的模型会每两小时才试一次；有上界才能让长期坏模型彻底让路 |
 | TG_MODEL_REFRESH_INTERVAL | 60 | 上游模型清单巡检间隔（秒）。巡检无条件下拉 `/api/tags` 与各 Rapid-MLX 的 `/v1/models`，**删掉的模型会立刻从候选池与存在性检查里消失**；清单变化时顺带清理熔断表 / 能力缓存。设 0 关闭巡检（退化为"有请求才刷新"的旧行为） |
+| TG_MODEL_LIST_TTL | 5 | `/v1/models` 与 `/api/tags` 允许的缓存陈旧度（秒）。列举只读缓存，超过该值就后台刷新（不阻塞响应）；设 0 则每次列举同步探测上游（旧行为，客户端会感到卡顿） |
+| TG_LIST_REFRESH_WAIT | 5 | `?refresh=1` 撞上正在飞的刷新时，最多等多久让它落地（秒）。不等待会拿到旧清单，表现为"刚删掉的模型还在" |
 | TG_TOOL_CAP_TTL | 600 | 模型「是否支持 tools」这层能力判定的缓存秒数（来源：Ollama `/api/show` 的 `capabilities`，以及上游 400 的反向学习）。带 tools 的请求会跳过已判定不支持的模型；设 0 关闭缓存（每次重新探测） |
 | TG_AUTO_MODEL_FALLBACK | 2 | auto 选中的模型在上游被判定不可用时，自动换下一个候选重试的次数。**显式点名模型的请求不降级**（要的就是它，拿不到应当明确报错）；设 0 关闭降级 |
 | TG_CONFIG_DIR | ~/.ollama-token-gateway | config.json / certs / logs 所在目录 |
@@ -688,6 +690,19 @@ config blob 损坏时，模型**仍会出现在列表里**，但上游一律回 
 > 探测失败（网络不通）**不会**清空缓存：上游"明确答复空清单"才是删除，超时 / 5xx 只是"未知"。
 > 两者混用会让一次 3 秒抖动把候选池清空，所有 auto 请求变 503。
 
+**列表接口本身也读缓存**（`TG_MODEL_LIST_TTL`，默认 5s）。以前 `/v1/models` 与 `/api/tags`
+每次列举都现场向上游发 1 + N 个同步请求（各 `timeout=3s`），有两个副作用：客户端轮询列表
+时每次可能卡几秒；任一上游抖动，`except: pass` 就让列表**静默少几个模型**（最差只剩 `auto`），
+客户端把这个残缺清单缓存下来之后，看起来就像"模型丢了"。现在列举只读缓存，过期则由
+**后台**线程刷新（不阻塞本次响应）：
+
+| 情形 | 表现 |
+|---|---|
+| 模型被删掉 | 最多 `TG_MODEL_LIST_TTL` + 一次探测耗时后从列表消失；`GET /v1/models?refresh=1` 立即拉到最新 |
+| 上游超时 / 5xx | 沿用手里清单，不会退化成只剩 `auto` |
+| 上游明确答复空清单 | 照实清空（这是真删除，不是"未知"） |
+| 上游响应很慢 | 列举仍是毫秒级，不被拖住 |
+
 核查：对比每个 manifest 的 `config.digest` 与 `layers[].digest` 是否都在 `blobs/` 下；
 修复只需 `ollama pull <模型名>`（已存在的层会跳过，只补缺口）。彻底不想让它参与 auto，
 把它写进 `deny_models` / `TG_AUTO_EXCLUDE`。
@@ -947,9 +962,10 @@ python3 tests/test_model_fallback.py # 模型失效检测：熔断 / auto 降级
 python3 tests/test_upstream_proxy.py # 上游直连：HTTP_PROXY 指向死端口时模型列表与推理仍正常（7 项）
 python3 tests/test_tool_capability.py # 工具能力：带 tools 时不得选中不支持 tools 的模型（21 项）
 python3 tests/test_model_refresh.py # 清单巡检 + 失效模型指数退避（删掉的模型要消失 / 探测失败要保缓存，14 项）
+python3 tests/test_model_list_cache.py # 列举接口读缓存：不再每次探上游 / 抖动不塌成只剩 auto / 删除当场生效（19 项）
 ```
 
-十二个脚本都可通过环境变量改指向：
+十三个脚本都可通过环境变量改指向：
 
 | 变量 | 作用 |
 |---|---|
@@ -963,6 +979,7 @@ python3 tests/test_model_refresh.py # 清单巡检 + 失效模型指数退避（
 
 | 日期 | 提交 | 内容 |
 |---|---|---|
+| 2026-11-08 | `2e143143` | **列举接口改读缓存 + 后台刷新**：`/v1/models` 与 `/api/tags` 以前每次都现场向上游发 1 + N 个同步请求（各 `timeout=3s`），于是客户端轮询列表可能卡几秒，且任一上游抖动 `except: pass` 就让列表**静默少几个模型**（最差只剩 `auto`）——客户端把这个残缺清单缓存下来，看起来就是"模型丢了"。现在列举只读缓存（`TG_MODEL_LIST_TTL`，默认 5s），过期由后台单飞线程刷新；`?refresh=1` 走同步强刷，且会先等掉正在飞的刷新（`TG_LIST_REFRESH_WAIT`），否则刚删掉的模型还会回来一次。上游原始条目（`details`/`size`/`modified_at`）一并缓存，`/api/tags` 字段不变。新增 `tests/test_model_list_cache.py`（19 项，旧版 15/19：6 次列举触发 6 次上游探测、上游 500 时列表塌成只剩 `auto`、慢上游阻塞 2.01s） |
 | 2026-11-08 | `8541cb0b` | **失效模型与拥堵同等待遇 + 上游清单定期巡检**：熔断时长改为按连续失败次数指数退避（`120s → 240s → 480s`，上限 `TG_BAD_MODEL_TTL_MAX`）——定值 120s 时，一个真正坏掉的模型每两分钟就骗走一次上游往返，客户端每次白等一轮；候选池日志与 busy 对齐（`跳过 N 个失效模型: xxx`）。新增巡检线程 `TG_MODEL_REFRESH_INTERVAL`（默认 60s，启动即拉一次），并区分「未知」与「空」：探测失败返回 `None` 保留旧缓存，上游明确答复（含空集）则无条件覆盖——旧实现两者都返回 `set()`，删除被当成失败丢弃，**删掉的模型因此长期留在候选池**。清单变化时对账：消失的模型清掉熔断/失败计数/能力缓存，重新出现的解除旧熔断。新增 `tests/test_model_refresh.py`（14 项，修复前 7/14） |
 | 2026-11-08 | `cb80121d` | **带 `tools` 的请求不再落到不支持工具调用的模型上**：`qwen2.5vl:3b` 这类视觉模型的 `capabilities` 是 `["completion","vision"]`，对话正常但不接受 `tools`，上游回 `400 ... does not support tools`（前缀是 registry 路径）。auto 分档只看请求体量、工具清单不计入字符数，带 tools 的短请求被判成轻量档 → 正好选中它们，表现为"一开工具调用每个请求都 400"。新增能力缓存（`TG_TOOL_CAP_TTL`，来源 `/api/show` 的 `capabilities`，未知一律放行），带 tools 时过滤候选；上游这句 400 按**能力边界**记账而**不进熔断表**（模型对普通对话仍可用），auto 换下一个候选重试；显式点名时直接返回 `400 model_no_tools` 并给出处置建议。新增 `tests/test_tool_capability.py`（21 项，修复前 9/21） |
 | 2026-11-08 | `0a8f0f54` | **部署模板与线上对齐**：仓库里的 `com.token-gateway.server.plist` 落后于实跑配置——缺 `NO_PROXY`（代理劫持那道保险只写在代码里）、把已下线的 `:8090` 留在 `TG_RAPID_MLX_HOSTS` 里（每次模型探测白等超时）、`TG_QPS`/`TG_CONCURRENCY` 与生产不符。已按线上校正并补 `HF_HUB_OFFLINE`/`TRANSFORMERS_OFFLINE`，可选限流项改为注释保留；`plutil -lint` 通过。同日回归实测 122B：`/v1/models` 可见、纯文本 0.93s、流式 SSE 正常、带图 3,620 prompt tokens 描述准确、两把 Key 均 200 |
