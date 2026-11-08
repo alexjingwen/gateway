@@ -2588,9 +2588,20 @@ iframe{{padding-top:0}}
 
         # 模型存在性预检查（避免 Ollama 返回不明确的 404）
         if model and not self._ollama_model_exists(model):
-            available = ", ".join(sorted(self._ollama_models_cache["models"])) or "无"
-            self._send_error(404, "model_not_found",
-                             f"模型 '{model}' 不存在。可用模型: {available}")
+            # 可用列表要排除熔断中的模型：否则会出现"模型 X 不存在，可用模型: X, Y"
+            # 这种自相矛盾的话（X 仍在 /api/tags 里，但已判定加载不了）。
+            ollama_models, rapid_models = self._refresh_model_caches()
+            avail = sorted(set(ollama_models) | set(rapid_models.keys()))
+            avail = [m for m in avail if not self._is_model_bad(m)]
+            available = ", ".join(avail) or "无"
+            if self._is_model_bad(model):
+                ttl = _env_num("TG_BAD_MODEL_TTL", 120, minimum=0)
+                self._send_error(404, "model_unavailable",
+                                 f"模型 '{model}' 暂不可用（上游加载失败，已熔断 {ttl}s 后自动重试）。"
+                                 f"可用模型: {available}")
+            else:
+                self._send_error(404, "model_not_found",
+                                 f"模型 '{model}' 不存在。可用模型: {available}")
             return
 
         # 估算 tokens (prompt_tokens + max_tokens) 用于额度预检查

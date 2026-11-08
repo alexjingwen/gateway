@@ -221,6 +221,14 @@ def main():
         check("状态 404", st == 404, str(st))
         check("未发出上游请求", len(SEEN) == 0, str(SEEN))
         check("快速返回（<1s）", el < 1.0, f"{el:.2f}s")
+        check("错误码为 model_unavailable（而非 not_found）",
+              "model_unavailable" in txt, txt[:140])
+        # 可用列表不得包含被熔断的模型本身，否则会出现"X 不存在，可用: X, Y"
+        try:
+            avail = json.loads(txt)["error"]["message"].split("可用模型:")[-1]
+        except Exception:
+            avail = ""
+        check("可用模型列表不含熔断模型自身", BIG not in avail, avail.strip()[:90])
 
         print(f"\n-- 5. 熔断到期（{BAD_TTL}s）：模型重回候选池 --")
         time.sleep(BAD_TTL + 0.6)
