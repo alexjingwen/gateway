@@ -643,6 +643,20 @@ launchctl unload ~/Library/LaunchAgents/com.user.memguard.plist
 
 ## 故障排查 / 常见问题
 
+### 模型列表只剩 `auto`，所有请求 502 `Connection refused`
+
+先看错误文案：如果是 `无法连接 Ollama (http://127.0.0.1:11434): [Errno 61] Connection refused`，
+**而同一台机器上 `curl --noproxy '*' http://127.0.0.1:11434/api/tags` 是通的**，那就是代理劫持，不是上游挂了。
+
+原因：`urllib` 默认读 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`，连 `127.0.0.1` 也会被送去代理。
+从带代理的环境里（IDE 沙箱 shell、某些 CI）手工拉起网关时，代理进程一退出，网关的每个上游
+请求都失败 → 模型发现拿不到列表 → 缓存被清空 → `/v1/models` 只剩 `auto`（即「122B 不见了」），
+推理全部 502。这个故障特别难自查：`/health` 仍 200、进程还在、日志只有一句 Connection refused。
+
+网关已在代码层固定直连（模块加载时 `install_opener(build_opener(ProxyHandler({})))`），
+不再依赖环境变量；plist 里的 `NO_PROXY=*` 只是双保险。若仍复现，检查是否有别的东西改写了
+`sys.modules` 里的 opener，或上游真的挂了（此时 `curl` 也会失败）。
+
 ### 模型在 `/v1/models` 里，但请求它必报 404
 
 `/api/tags` 反映的是 manifest 是否存在，不代表权重能加载。权重 blob 缺失、下载中断、
@@ -881,9 +895,10 @@ python3 tests/test_prompt_estimate.py # prompt 规模估算：工具清单 / 图
 python3 tests/test_reasoning_retry.py # Ollama 预算下限 + 推理模型空正文修复（25 项）
 python3 tests/test_stream_usage.py  # 流式记账：按增量文本折算、不把 SSE 框架算成 token（13 项）
 python3 tests/test_model_fallback.py # 模型失效检测：熔断 / auto 降级 / 显式不降级 / 快速 503（19 项）
+python3 tests/test_upstream_proxy.py # 上游直连：HTTP_PROXY 指向死端口时模型列表与推理仍正常（7 项）
 ```
 
-九个脚本都可通过环境变量改指向：
+十个脚本都可通过环境变量改指向：
 
 | 变量 | 作用 |
 |---|---|
@@ -897,6 +912,7 @@ python3 tests/test_model_fallback.py # 模型失效检测：熔断 / auto 降级
 
 | 日期 | 提交 | 内容 |
 |---|---|---|
+| 2026-11-08 | `fde83242` | **上游连接固定直连，修复代理劫持导致「122B 消失」**：从带 `HTTP_PROXY` 的环境启动时，urllib 把 `127.0.0.1:11434` / `:8088` 也交给代理，代理一停全部 `Connection refused` → 模型发现失败、`/v1/models` 只剩 `auto`、推理全 502（`/health` 仍 200，极难自查）。模块加载时安装空 `ProxyHandler` 的 opener，覆盖全部 urlopen 调用点；plist 增加 `NO_PROXY=*` 作双保险。新增 `tests/test_upstream_proxy.py`（7 项）。另：文档自测清单补为十个脚本 |
 | 2026-11-08 | `bbb6202d` | **上游模型失效时自动检测并降级**：`/api/tags` 只说明 manifest 在不在，权重损坏时模型仍留在列表里、请求必 404，而 auto 会按分档反复选中它。新增失效模型熔断表（`TG_BAD_MODEL_TTL`，默认 120s），auto 候选池与存在性检查都跳过它；`_proxy` 增加 auto 降级重试（`TG_AUTO_MODEL_FALLBACK`，默认 2 次），**显式点名模型的请求不降级**；HTTPError 响应体改为只读一次并缓存；`_refresh_model_caches` 的网络探测移出锁并加单飞，避免缓存过期瞬间并发请求排队等同一个 3s 探测。新增 `tests/test_model_fallback.py`（19 项） |
 | 2026-11-07 | `e54d064f` | **流式请求记账不再把 SSE 框架算成 token**：SSE 默认不带 usage，旧实现退回 `len(原始字节)//3`，而每帧 `data: {...}` 约 230 字节 —— 一个真实 64 token 的流式回复被记成 4,389 token（约 68 倍），配额被几十倍地扣。改为按**增量文本字符**折算（`TOKENS_PER_CHAR`），同一次请求 33,115 → 812 token；prompt 估算同样改按字符并兼容 `content` 为分段 list；新增可选 `TG_STREAM_INCLUDE_USAGE`（默认 0）以换取上游精确 usage；新增 `tests/test_stream_usage.py`（13 项） |
 | 2026-11-07 | `fdff934e` | **Ollama 侧补输出预算下限 + 推理模型空正文修复**：预算下限原先整块嵌在 `upstream_host in RAPID_MLX_HOSTS` 分支里，Ollama 上游完全不受约束；gemma4 这类推理模型先把预算烧在 `reasoning` 上，耗尽时 `content` 为空、`finish_reason=length`（实测 `max_tokens=64` → content 0 字符 / reasoning 233 字符 / completion 恰好等于预算），且是否触发思维链是**概率性**的，故单靠下限挡不住。新增 `_min_max_tokens_for()` 收口预算决策；非 Rapid-MLX 纯文本抬到 `TG_MIN_MAX_TOKENS_TEXT`（默认 2048）；非流式命中「空正文 + reasoning + length」时以 `max(4096, 生效预算×4)` **重发一次**（`TG_REASONING_RETRY_TOKENS`，响应头 `X-Gateway-Reasoning-Retry`），流式不重发；顺带确认 Ollama 的 OpenAI 兼容端点会忽略 `think` / `reasoning_effort`；新增 `tests/test_reasoning_retry.py`（25 项） |
