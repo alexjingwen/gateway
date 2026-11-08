@@ -287,6 +287,17 @@ _active_reqs: Dict[int, dict] = {}
 _req_seq = itertools.count(1)
 REAPER_INTERVAL_S = 5
 
+# ── 上游模型清单巡检 ─────────────────────────────────────────────────────────
+# 踩过的坑：模型被删掉（或被 `ollama rm` / 磁盘清理带走）之后，网关的缓存只在
+# 有请求进来时才顺便刷新；而刷新失败时又"保留上一次非空结果"，于是**删掉的模型
+# 会长期赖在候选池里**，auto 一直选中它、每次都被上游 404，再靠熔断挡 120s，
+# 120s 后又重来一遍 —— 用户侧看到的就是"每两分钟白等一轮"。
+# 这里起一个独立的巡检线程：按固定间隔无条件下拉一次清单，
+#   · 上游**明确答复**（哪怕空集）→ 直接覆盖缓存，删掉的模型立刻消失；
+#   · 网络失败（未知）→ 保留旧缓存，不能因为一次抖动就把候选池清空；
+#   · 清单变化时顺带清理熔断表 / 能力缓存里对已经不存在的模型的记录。
+MODEL_REFRESH_INTERVAL_S = _env_num("TG_MODEL_REFRESH_INTERVAL", 60, minimum=0)
+
 
 def _slots_free_by_client_gone() -> int:
     """回收所有"客户端已断开"的在飞请求槽位，返回回收个数。"""
@@ -1601,6 +1612,13 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
     # 让候选池自动跳过它，而不是靠人工删配置。
     _bad_models: dict = {}
     _bad_models_lock = threading.Lock()
+    # 连续失败计数 {model: n}：熔断时长按指数退避递增（120s → 240s → 480s …），
+    # 上限 TG_BAD_MODEL_TTL_MAX。这样"真坏掉"的模型不会每 2 分钟就骗走一次上游往返，
+    # 而偶然抖动一次的模型仍能很快回到候选池（第 1 次只有 120s）。
+    _fail_counts: dict = {}
+    _fail_counts_lock = threading.Lock()
+    # 上一次"上游确实答复过"的模型清单，用于识别新增/消失（见 _sync_model_registry）
+    _known_models: set = set()
     # 单飞标记：同一时刻只让一个线程去探测上游模型列表，其余请求直接用现有缓存。
     # 否则缓存一过期，N 个并发请求会各自等满 timeout（每主机 3s）——表现为整体卡顿。
     _ollama_refreshing = False
@@ -1608,14 +1626,27 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
 
     @classmethod
     def _mark_model_bad(cls, model: str, reason: str = "") -> None:
+        """把模型记为不可用并按**连续失败次数**指数退避熔断。
+
+        404（模型加载失败 / 权重缺失）与拥堵走同一套"从候选池里摘掉"的逻辑，
+        区别只在恢复条件：拥堵看实时的在飞计数，这里看退避计时器 + 清单巡检。
+        """
         if not model:
             return
-        ttl = _env_num("TG_BAD_MODEL_TTL", 120, minimum=0)
-        if ttl <= 0:
+        base = _env_num("TG_BAD_MODEL_TTL", 120, minimum=0)
+        if base <= 0:
             return
+        cap = _env_num("TG_BAD_MODEL_TTL_MAX", 3600, minimum=0)
+        with cls._fail_counts_lock:
+            n = cls._fail_counts.get(model, 0) + 1
+            cls._fail_counts[model] = n
+        ttl = base * (2 ** (n - 1))
+        if cap > 0:
+            ttl = min(ttl, cap)
         with cls._bad_models_lock:
             cls._bad_models[model] = time.time() + ttl
-        log(f"🚫 模型熔断 {ttl}s：{model}" + (f"（{reason}）" if reason else ""))
+        log(f"🚫 模型熔断 {ttl:.0f}s（连续第 {n} 次失败）：{model}"
+            + (f"（{reason}）" if reason else ""))
 
     @classmethod
     def _is_model_bad(cls, model: str) -> bool:
@@ -1634,9 +1665,11 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
     def _mark_model_good(cls, model: str) -> None:
         if not model:
             return
+        with cls._fail_counts_lock:
+            n = cls._fail_counts.pop(model, 0)
         with cls._bad_models_lock:
             if cls._bad_models.pop(model, None) is not None:
-                log(f"✅ 模型恢复：{model}")
+                log(f"✅ 模型恢复：{model}" + (f"（此前连续失败 {n} 次）" if n else ""))
 
     # ---- 工具能力缓存 {model: (supports: bool, 到期时间戳)} ----
     # 背景（2026-11-08）：Ollama 的视觉/嵌入模型（如 qwen2.5vl:3b）对话完全正常，
@@ -1680,36 +1713,50 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         cls._tool_cap_set(model, False)
         log(f"🧰 记下能力边界：{model} 不支持工具调用（后续带 tools 的请求会跳过它）")
 
-    def _fetch_ollama_models(self) -> set:
-        """拉取 ollama 模型名集合；顺带缓存 details（参数量/量化）供 auto 质量排序使用。"""
+    @classmethod
+    def _fetch_ollama_models(cls) -> Optional[set]:
+        """拉取 ollama 模型名集合；顺带缓存 details（参数量/量化）供 auto 质量排序使用。
+
+        返回值语义（**关键**，曾因混用而出过问题）：
+          · `set`（可以是空集）—— 上游确实答复了，这就是它当前的清单。
+            空集是合法状态（模型被全部删除），调用方应当用它覆盖缓存。
+          · `None` —— 网络/解析失败，**未知**。调用方必须保留上一次缓存，
+            否则一次 3 秒抖动就会把候选池清空，所有 auto 请求变 503。
+
+        旧实现两种情况都返回 `set()`，调用方用 `if models or not 旧缓存` 兜底，
+        结果"上游答复空清单"被当成失败丢弃 → 已删除的模型长期留在列表里。
+        """
         try:
             r = urllib.request.urlopen(f"{OLLAMA_HOST}/api/tags", timeout=3)
-            if r.status == 200:
-                data = json.loads(r.read())
-                models = set()
-                meta = {}
-                for m in data.get("models", []):
-                    name = m.get("name")
-                    if not name:
-                        continue
-                    models.add(name)
-                    det = m.get("details") or {}
-                    meta[name] = {
-                        "param": det.get("parameter_size") or "",
-                        "quant": det.get("quantization_level") or "",
-                        "family": det.get("family") or "",
-                        "size_gb": round((m.get("size") or 0) / 1e9, 2),
-                    }
-                if meta:
-                    self._ollama_meta_cache["meta"] = meta
-                    self._ollama_meta_cache["ts"] = time.time()
-                return models
+            if r.status != 200:
+                return None
+            data = json.loads(r.read())
+            models = set()
+            meta = {}
+            for m in data.get("models", []) or []:
+                name = m.get("name")
+                if not name:
+                    continue
+                models.add(name)
+                det = m.get("details") or {}
+                meta[name] = {
+                    "param": det.get("parameter_size") or "",
+                    "quant": det.get("quantization_level") or "",
+                    "family": det.get("family") or "",
+                    "size_gb": round((m.get("size") or 0) / 1e9, 2),
+                }
+            # 成功答复即覆盖元数据（空清单也要覆盖，否则被删模型的参数量会一直留着）
+            cls._ollama_meta_cache["meta"] = meta
+            cls._ollama_meta_cache["ts"] = time.time()
+            return models
         except Exception:
-            pass
-        return set()
+            return None
 
-    def _fetch_rapid_mlx_models(self) -> dict:
+    @classmethod
+    def _fetch_rapid_mlx_models(cls) -> Optional[dict]:
+        """返回 {model: host}；全部主机都探测失败时返回 None（未知），否则返回字典。"""
         result = {}
+        answered = 0
         for host in RAPID_MLX_HOSTS:
             try:
                 _headers = {}
@@ -1718,6 +1765,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
                 _req = urllib.request.Request(f"{host}/v1/models", headers=_headers)
                 r = urllib.request.urlopen(_req, timeout=3)
                 if r.status == 200:
+                    answered += 1
                     data = json.loads(r.read())
                     for m in data.get("data", []):
                         mid = m["id"]
@@ -1725,56 +1773,133 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
                             result[mid] = host
             except Exception:
                 continue
-        return result
+        return result if answered else None
 
-    def _refresh_model_caches(self) -> Tuple[set, dict]:
+    @classmethod
+    def _refresh_model_caches(cls, force: bool = False) -> Tuple[set, dict]:
         """刷新并返回 (ollama 模型集合, {rapid-mlx 模型: host})。
 
-        30 秒缓存；上游整体不可达时保留上一次的非空结果，避免候选池被瞬时清空。
+        30 秒缓存（`force=True` 立即探测，供巡检线程用）。
 
-        探测必须在锁**外**做：`_fetch_*` 是同步网络调用（每主机 timeout=3s），
-        放在锁内会让缓存过期瞬间的所有并发请求排成一队，等同一个探测完成。
-        现在改为「锁内只判定要不要刷 + 置单飞标记，锁外探测，锁内写回」：
-        同一时刻只有一个线程真正发探测，其余请求立刻拿到上一版缓存继续服务。
+        「探测」与「写回」严格分离：探测是同步网络调用（每主机 timeout=3s），
+        必须在锁**外**做，否则缓存过期瞬间的并发请求会排成一队等同一个探测。
+        锁内只做三件事：判定要不要刷、置单飞标记、写回结果。
+
+        写回规则：拿到 `None`（未知）时保留旧值；拿到集合（含空集）时无条件覆盖，
+        并在清单变化后清理熔断表 / 能力缓存里已经不存在的模型。
         """
         now = time.time()
-        with self._models_cache_lock:
-            need_ollama = now - self._ollama_models_cache["ts"] > 30
-            need_rapid = now - self._rapid_mlx_models_cache["ts"] > 30
-            if need_ollama and self._ollama_refreshing:
+        ttl = 0 if force else 30
+        with cls._models_cache_lock:
+            need_ollama = now - cls._ollama_models_cache["ts"] > ttl
+            need_rapid = now - cls._rapid_mlx_models_cache["ts"] > ttl
+            if need_ollama and cls._ollama_refreshing:
                 need_ollama = False
-            if need_rapid and self._rapid_refreshing:
+            if need_rapid and cls._rapid_refreshing:
                 need_rapid = False
             if need_ollama:
-                type(self)._ollama_refreshing = True
+                cls._ollama_refreshing = True
             if need_rapid:
-                type(self)._rapid_refreshing = True
+                cls._rapid_refreshing = True
 
+        changed = False
         if need_ollama:
             try:
-                models = self._fetch_ollama_models()
-                with self._models_cache_lock:
-                    if models or not self._ollama_models_cache["models"]:
-                        self._ollama_models_cache["models"] = models
-                    self._ollama_models_cache["ts"] = time.time()
+                models = cls._fetch_ollama_models()
+                if models is not None:
+                    with cls._models_cache_lock:
+                        old = set(cls._ollama_models_cache["models"])
+                        cls._ollama_models_cache["models"] = models
+                        cls._ollama_models_cache["ts"] = time.time()
+                    changed = changed or (old != models)
             finally:
-                with self._models_cache_lock:
-                    type(self)._ollama_refreshing = False
+                with cls._models_cache_lock:
+                    cls._ollama_refreshing = False
 
         if need_rapid:
             try:
-                models = self._fetch_rapid_mlx_models()
-                with self._models_cache_lock:
-                    if models or not self._rapid_mlx_models_cache["models"]:
-                        self._rapid_mlx_models_cache["models"] = models
-                    self._rapid_mlx_models_cache["ts"] = time.time()
+                models = cls._fetch_rapid_mlx_models()
+                if models is not None:
+                    with cls._models_cache_lock:
+                        old = dict(cls._rapid_mlx_models_cache["models"])
+                        cls._rapid_mlx_models_cache["models"] = models
+                        cls._rapid_mlx_models_cache["ts"] = time.time()
+                    changed = changed or (old != models)
             finally:
-                with self._models_cache_lock:
-                    type(self)._rapid_refreshing = False
+                with cls._models_cache_lock:
+                    cls._rapid_refreshing = False
 
-        with self._models_cache_lock:
-            return (set(self._ollama_models_cache["models"]),
-                    dict(self._rapid_mlx_models_cache["models"]))
+        with cls._models_cache_lock:
+            ollama_now = set(cls._ollama_models_cache["models"])
+            rapid_now = dict(cls._rapid_mlx_models_cache["models"])
+        if changed:
+            cls._sync_model_registry(ollama_now, rapid_now)
+        return ollama_now, rapid_now
+
+    @classmethod
+    def _sync_model_registry(cls, ollama: set, rapid: dict) -> None:
+        """按最新模型清单清理失效记录，并处理"重新出现"的模型。
+
+        为什么需要：熔断表与能力缓存都以模型名为键，模型被删掉后这些条目不会自己消失。
+        留着它们有两个后果：① 名字复用（删了又 pull 同名/同 tag）时，新模型一上来就带着
+        旧的熔断/「不支持 tools」判定；② 长期累积、无从回收。清单变化时按名字做一次
+        对账，最省事也最不容易错。
+        """
+        live = set(ollama) | set(rapid.keys())
+        prev = set(cls._known_models)
+        added = live - prev
+        removed = prev - live
+        cls._known_models = set(live)
+        if not prev:
+            # 首次观测（进程刚起）：把当前清单记下来，别把它当成"变化"刷一条误导日志
+            log(f"📋 已同步上游模型清单：{len(live)} 个"
+                + (f"（{', '.join(sorted(live)[:6])}{' …' if len(live) > 6 else ''}）" if live else ""))
+            return
+        if not (added or removed):
+            return
+
+        # 1) 已经不存在的模型：连同熔断 / 失败计数 / 能力缓存一起清掉
+        gone_bad = 0
+        with cls._bad_models_lock:
+            for m in list(cls._bad_models):
+                if m not in live:
+                    cls._bad_models.pop(m, None)
+                    gone_bad += 1
+        with cls._fail_counts_lock:
+            for m in list(cls._fail_counts):
+                if m not in live:
+                    cls._fail_counts.pop(m, None)
+        with cls._tool_caps_lock:
+            for m in list(cls._tool_caps):
+                if m not in live:
+                    cls._tool_caps.pop(m, None)
+
+        # 2) 重新出现的模型：很可能是重新 pull 过，清掉旧的熔断与能力判定
+        revived = []
+        with cls._bad_models_lock:
+            for m in added:
+                if cls._bad_models.pop(m, None) is not None:
+                    revived.append(m)
+        with cls._fail_counts_lock:
+            for m in added:
+                cls._fail_counts.pop(m, None)
+        with cls._tool_caps_lock:
+            for m in added:
+                cls._tool_caps.pop(m, None)
+
+        def _brief(xs):
+            xs = sorted(xs)
+            head = ", ".join(xs[:4])
+            return head + (f" 等 {len(xs)} 个" if len(xs) > 4 else "")
+
+        parts = []
+        if added:
+            parts.append(f"+{_brief(added)}")
+        if removed:
+            parts.append(f"-{_brief(removed)}")
+        log(f"📋 模型清单变化：{' '.join(parts)}"
+            + (f"；清理 {gone_bad} 条失效熔断" if gone_bad else "")
+            + (f"；解除 {len(revived)} 个重新出现的模型的熔断" if revived else ""))
 
     def _ollama_model_exists(self, model: str) -> bool:
         """检查模型是否在任一上游存在。"""
@@ -2200,6 +2325,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
 
         allowed: List[Tuple[str, str]] = []
         skipped_bad = 0
+        skipped_bad_names: List[str] = []
         for m, h in pool:
             if m in deny or m in AUTO_EXCLUDE or m in auto_excl:
                 continue
@@ -2208,9 +2334,14 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             # 熔断中的模型不进候选池：它可能仍在 /api/tags 里，但实际加载不了。
             if self._is_model_bad(m):
                 skipped_bad += 1
+                skipped_bad_names.append(m)
                 continue
             allowed.append((m, h))
-        note_bad = f"；跳过 {skipped_bad} 个失效模型" if skipped_bad else ""
+        note_bad = ""
+        if skipped_bad:
+            note_bad = f"；跳过 {skipped_bad} 个失效模型"
+            if skipped_bad <= 3:
+                note_bad += ": " + ", ".join(skipped_bad_names)
 
         if path.endswith("/embeddings"):
             embed = [(m, h) for m, h in allowed if self._auto_is_embed(m)]
@@ -4036,6 +4167,24 @@ _cfg = load_config()
 auth_result_ok = None
 
 
+def _model_refresh_loop():
+    """定期刷新上游模型清单（间隔 TG_MODEL_REFRESH_INTERVAL，0 关闭）。
+
+    解决两个只在长跑里才暴露的问题：
+      ① 被删掉的模型长期留在候选池里 —— 请求驱动的 30s 缓存只有在"有请求进来"时
+         才刷新，而刷新失败又保留旧值，于是删掉的模型可以一直赖着；
+      ② 熔断时长只有 120s，坏掉的模型每 2 分钟就骗走一次上游往返。
+         巡检把清单变化（新增/消失）交给 `_sync_model_registry` 对账：
+         消失的清掉熔断记录，新出现的解除旧熔断，配合指数退避即可收敛。
+    """
+    while True:
+        time.sleep(MODEL_REFRESH_INTERVAL_S)
+        try:
+            GatewayHandler._refresh_model_caches(force=True)
+        except Exception as e:
+            log(f"⚠️ 上游模型清单巡检异常: {type(e).__name__}: {e}")
+
+
 def main():
     # 速度因子预热：用最近的用量日志回填实测耗时，避免重启后 speed 因子失明
     _seeded = MODEL_LATENCY.seed_from_usage(USAGE_LOG)
@@ -4081,6 +4230,15 @@ def main():
     # 避免 active_concurrency 被卡死在 max_concurrency（全局 429 假死）
     threading.Thread(target=_reaper_loop, daemon=True).start()
     print(f"♻️  槽位回收巡检已启动（每 {REAPER_INTERVAL_S}s 一次）")
+    # 上游模型清单巡检：删掉的模型要及时消失，坏掉的模型不要每 2 分钟骗一次往返
+    if MODEL_REFRESH_INTERVAL_S > 0:
+        threading.Thread(target=_model_refresh_loop, daemon=True).start()
+        print(f"🔍 上游模型清单巡检已启动（每 {MODEL_REFRESH_INTERVAL_S}s 一次）")
+    # 启动即拉一次清单：别等第一个请求来才发现模型已经变了
+    try:
+        GatewayHandler._refresh_model_caches(force=True)
+    except Exception as e:
+        log(f"⚠️ 启动时刷新模型清单失败: {type(e).__name__}: {e}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
