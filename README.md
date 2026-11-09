@@ -6,7 +6,7 @@
 - **auto 虚拟模型**：客户端把 `model` 设为 `auto`，由网关按**请求分档 + 多维加权**从本地池里挑最合适的模型（短问答走小模型、复杂任务上大模型，被占用时自动让位），免去手动切换。两个可用硬约束：`TG_AUTO_DEEP_ONLY` 让贵模型只在深度档参与、`TG_MODEL_PARAMS` 覆写参数量（详见 [auto 虚拟模型](#auto-虚拟模型自动分配)）
 - **内置运行时看门狗**：上游模型服务（Ollama / gmlx）挂了由网关自己拉起，**不需要第二个守护进程**；判据是连续 N 次探测失败而非单次超时，有在飞请求时阈值自动翻倍（详见 [运行时看门狗](#运行时看门狗内置自愈)）
 - **配置样例**：`config.example.json`（真实 `config.json` 含密钥，被 `.gitignore` 排除）
-- **运维工具**：`mem-guard.mjs` + `com.user.memguard.plist`、`tools/start-{gateway,flash}.py`、`tools/fix-launchd.sh`
+- **运维工具**：`mem-guard.mjs` + `com.user.memguard.plist`；`tools/` 下有 `rollback.py`（回滚到历史版本）、`fix-launchd.sh`（launchd 加作业 EIO 诊断）、`verify-watchdog.py`（真 kill 上游验证自愈）、`start-{gateway,flash}.py`（手动拉起）、`tools/start-{gateway,flash}.py`、`tools/fix-launchd.sh`
 - **推送工具**：`tools/push-via-api.py`（Git Data API，绕过被拦的 `github.com:443`）
 
 > 仅用于**可信内网**，不要直接暴露到公网。安全细则见 [安全加固](#安全加固)。
@@ -1029,6 +1029,53 @@ sudo bash tools/fix-launchd.sh --apply # 以 root 重试（能拿到真正的错
 | 非 macOS 上 `--sample` 返回空/报错 | 探针是 macOS 专属 | 属预期；默认 `--fail-open` 会静默放行 |
 | CI 里希望显式失败 | 默认 fail-open | 加 `--no-fail-open` |
 | `launchctl` 加载后不采样 | node 路径或 `mem-guard.mjs` 路径错 | 按「安装为 LaunchAgent」核对 `ProgramArguments` |
+
+## 回滚到历史版本
+
+本项目的每次推送都是**全树快照**（Git Data API sync-tree），不是增量 diff——
+所以任意一个提交都能独立还原，不需要 clone、不需要历史链。取用端是 `tools/rollback.py`。
+
+**仓库根 ≠ 线上部署目录**，这是用这个脚本时最容易踩的坑：仓库里有 `README.md` /
+`tests/` / `LICENSE`，而部署件分散在三个位置。脚本用显式 `MAPPING` 表决定
+「取哪个文件、放到哪」，**只碰下面 6 个部署件**，其余仓库文件仅作参考：
+
+| 仓库路径 | 本机位置 |
+|---|---|
+| `token-gateway.py` | `<LIVE>/token-gateway.py` |
+| `tg_watchdog.py` | `<LIVE>/tg_watchdog.py` |
+| `flash-runtime.json` | `~/.ollama-token-gateway/` |
+| `com.token-gateway.server.plist` | `~/Library/LaunchAgents/` |
+| `tools/start-flash.py` | `~/.ollama-token-gateway/tools/` |
+| `tools/start-gateway.py` | `~/.ollama-token-gateway/tools/` |
+
+```bash
+python3 tools/rollback.py --list                      # 最近 20 个版本（只读）
+python3 tools/rollback.py --to 3d3ca3a2               # 只看 diff，不改任何文件
+python3 tools/rollback.py --to 3d3ca3a2 --apply       # 快照 → 覆盖 → 编译校验 → 重启
+python3 tools/rollback.py --to 3d3ca3a2 --apply --no-restart
+python3 tools/rollback.py --tag v2026.11.10 --apply   # 给当前 HEAD 打版本标签
+```
+
+默认只读，因为这会覆盖正在服务的代码。`--apply` 时自动做四件事：
+
+1. 把本机现有部署件整份快照到 `~/.ollama-token-gateway/backups/rollback-<ts>-<sha>/`
+2. 目标版本里**没有**、本机却存在的部署件（例如回滚到内联看门狗时代，`tg_watchdog.py`
+   应当消失）→ 移进备份，**不删**
+3. 内存里 `compile()` 校验（不产生 `__pycache__`）；失败立刻还原并退出码 4
+4. 重启后轮询 `/health`；非 200 只告警不自动回滚（可能是别的启动故障），并打印还原命令
+
+**密钥不在这条链路上**。`config.json`、`certs/`、`frp/*.toml` 从来不进仓库，
+所以回滚不会碰它们——好处是不会把旧密钥带回来，代价是回滚只覆盖代码、
+不覆盖凭据（换机器时那部分要单独搬 —— 它们只在本地，且必须加密）。
+
+实测（隔离目录往返，Non-destructive）：
+
+```
+A) 空目录 → 部署 HEAD         6 个文件落在正确位置，4 个 .py 编译通过
+B) 回滚到 3d3ca3a2（旧版）     tg_watchdog.py 自动移入备份，5 个文件写入
+C) 再回到 HEAD                tg_watchdog.py 恢复；6 个文件 sha256 与远端逐字节一致
+                              token-gateway.py = d5f00d4e05af（= 生产在跑的那个）
+```
 
 ## 运维细节（日志 / 权限 / 轮转）
 
