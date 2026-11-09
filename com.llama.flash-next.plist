@@ -1,6 +1,13 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
+<!--
+  llama.cpp 回退运行时（不是当前在生产用的那个）。
+  当前 :8090 由 gmlx 提供（flash-runtime.json 的 engine=gmlx），
+  由网关的内置看门狗托管；本 plist 的 alias 也是旧的 qwen3.8-flash-125b。
+  若启用它会与看门狗抢同一个端口、且回一个不同的 model id，故保持禁用。
+  真要切回 llama.cpp：按 flash-runtime.json 的 fallback 段改 argv，再把本文件改名回 .plist。
+-->
 <dict>
 	<key>EnvironmentVariables</key>
 	<dict>

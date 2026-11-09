@@ -142,6 +142,11 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.token-gateway.server
 >
 > 验证是否真的生效：看启动横幅里的 `⏱️ 静默预算: 文本 600s / 带图 150s  非流式转发: 缓冲`，或 `launchctl print gui/$(id -u)/com.token-gateway.server | grep TG_`。只改 Python 代码不需要重新装载，`kickstart -k` 即可。
 
+> 仓库里的 `com.llama.flash-next.plist` 是**旧的 llama.cpp 运行时**（alias `qwen3.8-flash-125b`），
+> 当前 `:8090` 由 gmlx 提供并由网关看门狗托管，两者抢同一端口，**故本机把它改名成
+> `.plist.disabled` 并 `launchctl disable` 掉**。保留文件只为记录回退参数（与 `flash-runtime.json`
+> 的 `fallback` 段一致）。
+
 ## API 参考
 
 所有 `/v1/*` 接口兼容 OpenAI 客户端。鉴权方式：
