@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ollama.client-distributor</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/Users/claw/Library/Application Support/TRAE SOLO CN/ModularData/ai-agent/work-mode-projects/6a6e89c7d72e5be37140c8ad/client-distributor.py</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>DIST_PORT</key>
+        <string>8088</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/claw/.ollama-token-gateway/logs/client-distributor.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/claw/.ollama-token-gateway/logs/client-distributor.log</string>
+</dict>
+</plist>

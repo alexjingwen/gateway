@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ollama.gateway</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/python3</string>
+        <string>-u</string>
+        <string>REPLACE_WITH_PROJECT_PATH/token-gateway.py</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>TG_HOST</key>
+        <string>0.0.0.0</string>
+        <key>TG_PORT</key>
+        <string>3000</string>
+        <key>TG_OLLAMA_HOST</key>
+        <string>http://127.0.0.1:11434</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>Crashed</key>
+        <true/>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>/tmp/ollama-gateway.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/ollama-gateway.err.log</string>
+</dict>
+</plist>

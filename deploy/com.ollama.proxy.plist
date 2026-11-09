@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ollama.proxy</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>REPLACE_WITH_PROJECT_PATH/ollama-openai-proxy.py</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>OLLAMA_PROXY_API_KEY</key>
+        <string>sk-ollama-REPLACE_WITH_YOUR_KEY</string>
+        <key>OLLAMA_PROXY_UPSTREAM</key>
+        <string>http://127.0.0.1:11434</string>
+        <key>OLLAMA_PROXY_HOST</key>
+        <string>0.0.0.0</string>
+        <key>OLLAMA_PROXY_PORT</key>
+        <string>3000</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/ollama-proxy.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/ollama-proxy.err.log</string>
+</dict>
+</plist>
