@@ -782,6 +782,16 @@ python3 tg_watchdog.py http://127.0.0.1:8090     # Ctrl-C 退出
 日志里对应 `🐕 看门狗: 目标 X 连续 N 次探测失败 → 重启`、`🐕 看门狗: 重启后恢复健康`、`🐕 看门狗: 进入退避，N 秒后再试`。
 
 > 真实自愈验证：`kill -9` 掉 gmlx（pid 30166）后，20:20:44 日志出现 `restarting`（当时已连续 8 次探测失败），20:21:04 转为 `healthy`，新 pid 35091；重启后跑 400 token 用 6.12s（65.4 tok/s）——证明权重是真加载了，不是"端口通了就算活"。
+>
+> 这套验证已固化成 `tools/verify-watchdog.py`。**默认只读**（只检查基线并告诉你它会做什么），要真跑加 `--yes`：
+>
+> ```bash
+> python3 tools/verify-watchdog.py           # 只读：基线是否健康、目标 pid 是哪个 → exit 3
+> python3 tools/verify-watchdog.py --yes     # 真 kill -9 上游并等它自愈（服务会中断 20–80s）
+> ```
+>
+> 加门禁的原因很实际：这脚本会 SIGKILL 一个正在服务的推理进程，不该"顺手跑一下就跑了"。
+> 它测的是**重启链路**，而 `/health` 变绿只说明端口通——两者不是一回事。
 
 ### 与 launchd 的分工
 
@@ -1166,6 +1176,7 @@ python3 tests/test_model_list_cache.py # 列举接口读缓存：不再每次探
 python3 tests/test_auto_deep_only.py # 深度档白名单：轻/常规档摘掉贵模型，深度档仍可选，摘空不生效（11 项）
 python3 tests/test_model_params.py  # 参数量覆写：覆写优先于元数据与名字推断，非法值忽略（12 项）
 python3 tests/test_watchdog.py      # 看门狗：模块自足性 / 决策矩阵 / 退避序列 / 网关集成 / 缺模块降级（33 项）
+python3 tools/verify-watchdog.py --yes  # 端到端自愈：真 kill -9 上游并等它回来（会中断服务；不带 --yes 为只读）
 ```
 
 十六个脚本都可通过环境变量改指向：
