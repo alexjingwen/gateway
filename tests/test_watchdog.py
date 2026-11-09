@@ -169,6 +169,25 @@ wd.tick(base_dead)
 check("宽限期内即使仍探不到 → starting，不重复重启", st["state"] == "starting" and len(CALLS) == 1,
       (st["state"], CALLS))
 
+# 回归：宽限期内每 20s 一次探测，失败曾被累加进 fails，150s 后攒到 7~8 次
+# 一次性判死 —— 告警时刻恒等于宽限期到期那一刻。改成宽限期内只记 grace_fails。
+base_grace = f"http://127.0.0.1:{closed_port()}"
+CALLS.clear()
+st = new_state(wd, base_grace, next_attempt=time.time() + 150, grace_fails=0)
+for _ in range(8):          # 8 次 = 150s / 20s + 1，正是线上两次事件的失败数
+    wd.tick(base_grace)
+check("宽限期内 8 次探测失败 → fails 仍为 0（不攒判死票）",
+      st["fails"] == 0 and not CALLS, (st["fails"], CALLS))
+check("宽限期内的失败单记 grace_fails（可见但不判死）",
+      st.get("grace_fails") == 8, st.get("grace_fails"))
+check("宽限期内不写 first_fail（卡死计时起点必须是真失败）",
+      st["first_fail"] == 0.0, st["first_fail"])
+st["next_attempt"] = time.time() - 1
+wd.tick(base_grace)
+check("宽限期到期后第 1 次真失败 → fails=1，仍未到阈值",
+      st["fails"] == 1 and st["state"] == "down" and not CALLS,
+      (st["fails"], st["state"], CALLS))
+
 base_hang = f"http://127.0.0.1:{p_bad}"
 wd.WD_HUNG_TIMEOUT_S = 300
 CALLS.clear()

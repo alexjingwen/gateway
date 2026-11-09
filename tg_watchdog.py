@@ -214,6 +214,7 @@ def tick(base: str) -> None:
             log(f"✅ {base} 已恢复（{st['state']} → healthy，累计重启 {st['restarts']} 次）")
         st["state"] = "healthy"
         st["fails"] = 0
+        st["grace_fails"] = 0
         st["first_fail"] = 0.0
         st["last_ok"] = now
         st["last_error"] = None
@@ -225,13 +226,18 @@ def tick(base: str) -> None:
         return
 
     st["last_error"] = err
+    # 宽限期 / 退避期：只观察，**不计数**。冷加载期间健康检查本来就是红的。
+    # 这里曾经是先 `fails += 1` 再 return，于是宽限期内每 20s 累加一次，
+    # 150s 攒出 7~8 次「失败」，到点一次性判死 —— 告警时刻恒等于宽限期到期
+    # 那一刻，看起来像「又崩了」，其实端口从未真的被连续判失败过。
+    # 同理 first_fail 也不能在宽限期内落笔，否则卡死判定的计时起点是假的。
+    if now < st["next_attempt"]:
+        st["state"] = "starting"
+        st["grace_fails"] = st.get("grace_fails", 0) + 1
+        return
     st["fails"] += 1
     if not st["first_fail"]:
         st["first_fail"] = now
-    # 宽限期 / 退避期：只观察。冷加载期间健康检查本来就是红的
-    if now < st["next_attempt"]:
-        st["state"] = "starting"
-        return
 
     alive = tcp_alive(host, port)
     # 有请求在飞时不轻易判死：131k 上下文的 prefill 可能把服务堵住几十秒，
@@ -253,6 +259,7 @@ def tick(base: str) -> None:
     delay = min(WD_BACKOFF_BASE_S * (2 ** (st["restarts"] - 1)), WD_BACKOFF_MAX_S)
     st["next_attempt"] = now + max(delay, WD_GRACE_S)
     st["fails"] = 0
+    st["grace_fails"] = 0
     st["first_fail"] = 0.0
     st["state"] = "restarting"
     if not restart(base, st):
@@ -269,6 +276,9 @@ def init_states(targets_list: List[str], *, grace: Optional[float] = None) -> No
                 "last_check": 0.0, "last_ok": 0.0, "last_error": None,
                 # 启动后先给一个宽限期：看门狗可能比运行时先起来，此时健康检查本来就红
                 "next_attempt": now + g, "healthy_since": 0.0,
+                # 宽限期内的失败单独记，不参与判死；有它才能区分
+                # 「真的连续失败」和「只是启动还没好」
+                "grace_fails": 0,
             }
 
 
@@ -302,6 +312,9 @@ def snapshot() -> dict:
         out[base] = {
             "state": st["state"],
             "fails": st["fails"],
+            # 宽限期内的失败不参与判死，但要能看见 —— 否则「它在启动」和
+            # 「它挂了」在 /health 里长得一样
+            "grace_fails": st.get("grace_fails", 0),
             "restarts": st["restarts"],
             "last_check_ago_s": int(now - st["last_check"]) if st["last_check"] else None,
             "last_error": st["last_error"],
