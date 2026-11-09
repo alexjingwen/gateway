@@ -918,6 +918,14 @@ launchctl print gui/$(id -u)/com.token-gateway.server | grep -E "state = |pid = 
 
 结论：**只有「把 plist 交给 launchd 注册成作业」这条路径坏了**（`bootstrap` 与 legacy `load` 都坏），其余操作全部正常。这不是本项目代码的问题，也不是权限/语法问题。已排除的无效尝试：改属组、`chmod 600`、二进制 plist、换目录、`asuser`、`user/503` 域、`submit`、`-F`、清 xattr。
 
+上面这套判据已固化成一条命令，不用每次重新摸索：
+
+```bash
+bash tools/fix-launchd.sh              # 诊断 + 无 sudo 尝试；退出码 0=已修复 2=域级故障 3=plist 有问题
+bash tools/fix-launchd.sh --verify     # 只看作业是否注册、/health 是否 200
+sudo bash tools/fix-launchd.sh --apply # 以 root 重试（能拿到真正的错误码）
+```
+
 可用的处置（按代价排序）：
 
 ```bash
