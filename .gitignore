@@ -6,12 +6,26 @@ config.json.bak*
 certs/
 ipv6-ddns-state.json
 
+# 手工备份文件：部署目录里的 token-gateway.py.bak.20261104-221406（119527 B）
+# 曾被 git add 进公开仓库，把现网 key 永久留在了历史里。这里按通配全挡。
+*.bak
+*.bak*
+*.orig
+*.rej
+
+# frp：配置里带 auth.token / webServer.password，二进制 33 MB
+frp/frpc.toml
+frp/frps.toml
+frp/bin/
+frp/logs/
+
 # ── 运行时产物 ──
 logs/
 mem-guard.log
 .DS_Store
 __pycache__/
 *.pyc
+*.log
 
 # ── 大型二进制（Tailscale 安装包等，不进版本库）──
 clients/

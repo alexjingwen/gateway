@@ -108,6 +108,37 @@ def local_files(prefix=""):
     return out
 
 
+# 这个仓库是 public 的，历史上已经因为「本地 .bak 被 git add」泄露过一次现网 key。
+# 所以推之前先扫一遍**整棵树**，不是只扫这次要推的那几个文件 —— 已经躺在树里的秘密
+# 也该在下次推送时被撞出来，而不是等它换个文件名再泄露一次。
+SECRET_PATTERNS = [
+    (rb"sk-[A-Za-z0-9_\-]{16,}", "疑似 API key（sk-…）"),
+    (rb"github_pat_[A-Za-z0-9_]{20,}", "GitHub fine-grained PAT"),
+    (rb"gh[pousr]_[A-Za-z0-9]{30,}", "GitHub token"),
+    (rb"-----BEGIN (?:RSA |OPENSSH |EC |DSA )?PRIVATE KEY-----", "私钥"),
+    (rb"(?i)(?:auth[_.]?token|webServer\.password)\s*[:=]\s*\"?[^\s\"',}]{8,}", "配置里的口令字段"),
+]
+
+
+# 形如 sk-ollama-REPLACE_WITH_YOUR_KEY / TEST-CTX-0001 / please-change-me 的占位符
+# 是文档和测试的正常内容，不该拦。只跳过**命中片段本身**含这些词的。
+PLACEHOLDER_RE = re.compile(
+    rb"(?i)(replace|change[-_]?me|placeholder|your[-_]?(?:key|token)|example|dummy|sample"
+    rb"|test[-_]|xxxx|deadbeef|\.\.\.|<[^>]*>|[:-]0{4})")
+
+
+def scan_secrets(files):
+    """返回 [(path, 说明, 命中片段前 8 字符)]。只报位置，不打印秘密本身。"""
+    findings = []
+    for _mode, path, sha in files:
+        blob = git("cat-file", "blob", sha, binary=True)
+        for pat, label in SECRET_PATTERNS:
+            m = re.search(pat, blob)
+            if m and not PLACEHOLDER_RE.search(m.group(0)):
+                findings.append((path, label, m.group(0)[:8].decode("utf-8", "replace")))
+    return findings
+
+
 def make_entries(api, repo, files, dry_run):
     """把本地文件逐个建成远端 blob，带字节级自检。"""
     entries = []
@@ -220,6 +251,8 @@ def main():
     ap.add_argument("--create", action="store_true", help="仓库不存在时尝试用 API 创建")
     ap.add_argument("--public", action="store_true", help="配合 --create：建公开仓库（默认私有）")
     ap.add_argument("--prefix", default="", help="把所有文件放到远端的这个子目录下（例如 ollama-token-gateway）")
+    ap.add_argument("--skip-secret-scan", action="store_true",
+                    help="跳过密钥扫描（默认扫描；确认误报才用）")
     args = ap.parse_args()
 
     repo, branch = args.repo, args.branch
@@ -227,6 +260,19 @@ def main():
     files = local_files(args.prefix)
     print(f"[+] 本地 HEAD 共 {len(files)} 个文件"
           + (f"，远端路径前缀 = {args.prefix.strip('/')}/" if args.prefix.strip("/") else "（平铺到远端根目录）"))
+
+    if args.skip_secret_scan:
+        print("[!] 已跳过密钥扫描")
+    else:
+        findings = scan_secrets(files)
+        if findings:
+            print(f"\n[x] 密钥扫描命中 {len(findings)} 处，已中止推送：")
+            for path, label, frag in findings:
+                print(f"      {path:44} {label}  以 {frag}… 开头")
+            print("\n    仓库是公开的，历史提交删不掉。要么把文件移出版本库（并加进 .gitignore），")
+            print("    要么确认是误报后再加 --skip-secret-scan。")
+            return 1
+        print("[+] 密钥扫描通过")
 
     if not ensure_repo(api, repo, args.create, not args.public, args.dry_run):
         return 1
