@@ -1,8 +1,8 @@
 # gateway —— 本地局域网 OpenAI 兼容 token 网关
 
-`gateway` 是一个**单文件、纯 Python 标准库**实现的 OpenAI 兼容 token 网关，面向**本地局域网 / Tailscale 内网**使用：统一代理 Ollama 与 Rapid-MLX 上游，做 per-key 配额 / QPS / 限流，并提供 Web 管理台与 `/api/admin/*` 管理接口。附带 `mem-guard.mjs` 设备内存守卫。
+`gateway` 是一个**单文件主程序 + 一个可选模块、纯 Python 标准库**实现的 OpenAI 兼容 token 网关，面向**本地局域网 / Tailscale 内网**使用：统一代理 Ollama 与 Rapid-MLX 上游，做 per-key 配额 / QPS / 限流，并提供 Web 管理台与 `/api/admin/*` 管理接口。附带 `mem-guard.mjs` 设备内存守卫。
 
-- **服务端**：`token-gateway.py`（无第三方依赖，Python 3.10+）
+- **服务端**：`token-gateway.py`（无第三方依赖，Python 3.10+）；看门狗实现独立在 `tg_watchdog.py`（323 行，零依赖，可直接搬到别的项目）
 - **auto 虚拟模型**：客户端把 `model` 设为 `auto`，由网关按**请求分档 + 多维加权**从本地池里挑最合适的模型（短问答走小模型、复杂任务上大模型，被占用时自动让位），免去手动切换。两个可用硬约束：`TG_AUTO_DEEP_ONLY` 让贵模型只在深度档参与、`TG_MODEL_PARAMS` 覆写参数量（详见 [auto 虚拟模型](#auto-虚拟模型自动分配)）
 - **内置运行时看门狗**：上游模型服务（Ollama / gmlx）挂了由网关自己拉起，**不需要第二个守护进程**；判据是连续 N 次探测失败而非单次超时，有在飞请求时阈值自动翻倍（详见 [运行时看门狗](#运行时看门狗内置自愈)）
 - **配置样例**：`config.example.json`（真实 `config.json` 含密钥，被 `.gitignore` 排除）
@@ -30,13 +30,15 @@
 
 ## 范围 / Scope
 
-- 本仓库是**本地局域网（LAN）**使用的 OpenAI 兼容 token 网关的「配置 + 运维 + 服务端源码」家目录：含网关服务端 `token-gateway.py`（单文件、纯标准库）、脱敏配置样例、设备内存守卫 `mem-guard.mjs`、LaunchAgent 模板与 Git Data API 推送工具。
-- 网关服务端的**源码 `token-gateway.py` 已纳入本仓库**（单文件、纯 Python 标准库，`git clone` 后可直接运行）；但运行期密钥 `config.json`、TLS 证书 `certs/`、`clients/`、`logs/` 仍由 `.gitignore` 排除、不随仓库分发。
+- 本仓库是**本地局域网（LAN）**使用的 OpenAI 兼容 token 网关的「配置 + 运维 + 服务端源码」家目录：含网关服务端 `token-gateway.py`（单文件、纯标准库）、看门狗模块 `tg_watchdog.py`（可选、零依赖）、脱敏配置样例、设备内存守卫 `mem-guard.mjs`、LaunchAgent 模板与 Git Data API 推送工具。
+- 网关服务端的**源码 `token-gateway.py` 已纳入本仓库**（单文件、纯 Python 标准库，`git clone` 后可直接运行）；
+  自愈能力在同目录的 `tg_watchdog.py` 里，**缺了它网关照常工作、只是不自动重启上游**（`/health` 会报 reason）；但运行期密钥 `config.json`、TLS 证书 `certs/`、`clients/`、`logs/` 仍由 `.gitignore` 排除、不随仓库分发。
 - 仅用于可信的内网环境，不要直接暴露到公网。
 
 ## 部署 / Deploy
 
 本仓库自带网关服务端 `token-gateway.py`：**单文件、纯 Python 标准库、无第三方依赖**（无需 `pip install`）。
+同目录的 `tg_watchdog.py` 是可选模块，**要自愈就一起放上去**；只放主程序也能跑，但上游崩了不会自动恢复。
 
 ### 前置条件
 - Python 3.10+（仅标准库）
@@ -688,7 +690,7 @@ launchctl unload ~/Library/LaunchAgents/com.user.memguard.plist
 
 ## 运行时看门狗（内置自愈）
 
-网关自带一个后台线程 `flash-watchdog`，巡检上游模型服务（默认是 `flash-runtime.json` 里那个 gmlx 端口），**挂了就自己拉起来**。
+网关起一个后台线程 `flash-watchdog`，巡检上游模型服务（默认是 `flash-runtime.json` 里那个 gmlx 端口），**挂了就自己拉起来**。实现独立在同目录的 `tg_watchdog.py` 里，网关只负责把它挂到线程上并告诉它三件事：配置目录、日志函数、当前有多少请求在飞。
 
 ### 为什么不做成第二个守护进程 / cron
 
@@ -698,17 +700,46 @@ launchctl unload ~/Library/LaunchAgents/com.user.memguard.plist
 
 **分工不变**：launchd 管网关进程（`KeepAlive`），看门狗管上游（`start-flash.py`），`start-gateway.py` 只是 launchd 不可用时的兜底。
 
-### 实现与复用（想把这套逻辑搬走的话）
+### 实现与复用：`tg_watchdog.py` 可以直接拿走
 
-看门狗是纯标准库的独立线程（线程名 `flash-watchdog`，入口 `_watchdog_loop`），不依赖网关的请求处理逻辑：`_wd_targets` / `_wd_split` / `_wd_tcp_alive` / `_wd_probe` / `_wd_inflight_total` / `_wd_restart` / `_wd_tick` / `_wd_snapshot` + 状态表 `_wd_states`，约 210 行（第 4328–4537 行，非空非注释 170 行）全部在 `token-gateway.py` 内，无第三方依赖。
+看门狗的实现是**独立文件 `tg_watchdog.py`**（323 行，纯标准库，Python 3.9+），网关只是把它挂在一个后台线程上。它有自己的状态机、自己的测试，**不 import 网关的任何东西**——所以想复用时不需要理解这个 4000 行的网关。
 
-搬到别的项目时要改的只有三处：
+最小的复用路径：
 
-1. **`_wd_restart()` 里的启动命令**——这里刻意不重建上游命令行，而是调 `tools/start-flash.py`，让"启动参数的事实来源"唯一（`flash-runtime.json`）。复制一份参数进看门狗，迟早会漂移，症状是「手工起得动、自愈起不动」；
-2. **在飞计数**——接到你自己的请求计数量上，没有就退化成固定阈值（会更容易误打断长请求）；
+```bash
+cp tg_watchdog.py /your/project/
+```
+
+```python
+import tg_watchdog as wd
+
+wd.configure(
+    config_dir="/path/to/cfg",        # 读 flash-runtime.json 的端口；不传就只认 TG_WD_TARGETS
+    inflight_fn=lambda: my_inflight,  # 有多少请求在飞 → 决定阈值要不要翻倍（不给则恒为 0）
+    log_fn=print,                     # 不传则自带时间戳打 stdout
+    restart_script="/path/to/start.sh",  # 不传则用 <config_dir>/tools/start-flash.py
+)
+wd.loop(wd.targets())                 # 阻塞；只想要单次判断就调 wd.tick(base)
+```
+
+也可以直接当脚本试用，一行看它怎么判：
+
+```bash
+python3 tg_watchdog.py http://127.0.0.1:8090     # Ctrl-C 退出
+```
+
+`tg_watchdog.py` 的测试在前 4 节里**完全不加载网关**，这本身就是"能独立跑"的证据（见 `tests/test_watchdog.py`）。
+
+搬到别的项目时真正要注意的只有三处：
+
+1. **重启命令别复制一份启动参数进来**——网关这边刻意只调 `tools/start-flash.py`，让"启动参数的事实来源"唯一（`flash-runtime.json`）。把参数抄进看门狗，两处迟早漂移，症状是「手工起得动、自愈起不动」；
+2. **在飞计数接上**——不接就退化成固定阈值，长 prefill 期间更容易被误打断；
 3. **`TG_WD_GRACE` 必须大于上游冷启动时间**。这是最容易抄错的一个数：本机 111 GB 权重要约 75s 才 ready，宽限设成 30s 会让看门狗在服务还在加载时判它死、再重启一次，形成自杀循环。
 
-判据表里的其余参数一般不用动。
+> **模块是可选依赖**：`tg_watchdog.py` 不在同目录时网关照常启动，只是失去自愈能力。
+> 这种情况下启动日志会打 `⚠️ 看门狗不可用：tg_watchdog.py 未加载（...）`，`/health` 的
+> `watchdog` 字段返回 `{"enabled": false, "reason": "..."}`，**不会静默降级**。
+
 
 ### 判据（不是"ping 一下不通就重启"）
 
@@ -1134,7 +1165,7 @@ python3 tests/test_model_refresh.py # 清单巡检 + 失效模型指数退避（
 python3 tests/test_model_list_cache.py # 列举接口读缓存：不再每次探上游 / 抖动不塌成只剩 auto / 删除当场生效（19 项）
 python3 tests/test_auto_deep_only.py # 深度档白名单：轻/常规档摘掉贵模型，深度档仍可选，摘空不生效（11 项）
 python3 tests/test_model_params.py  # 参数量覆写：覆写优先于元数据与名字推断，非法值忽略（12 项）
-python3 tests/test_watchdog.py      # 看门狗：连续失败才重启 / 在飞时阈值翻倍 / 宽限期 / 退避与重置（25 项）
+python3 tests/test_watchdog.py      # 看门狗：模块自足性 / 决策矩阵 / 退避序列 / 网关集成 / 缺模块降级（33 项）
 ```
 
 十六个脚本都可通过环境变量改指向：
@@ -1151,6 +1182,7 @@ python3 tests/test_watchdog.py      # 看门狗：连续失败才重启 / 在飞
 
 | 日期 | 提交 | 内容 |
 |---|---|---|
+| 2026-11-09 | 本次推送 | **看门狗抽成独立模块 `tg_watchdog.py`**：这套逻辑被索引当作参考范例收录后，发现复用成本不对——真正难的 210 行埋在 4200 行网关里，想抄的人得先读 200 行无关代码。现在整段搬到独立文件（323 行，零依赖，Python 3.9+），只暴露 `configure()` 四个注入点（配置目录 / 日志 / 在飞计数 / 重启脚本）和 `targets` `tick` `loop` `snapshot`。网关侧从 210 行实现缩成 38 行适配层，行为与参数默认值完全不变；模块缺失时网关照常启动、只失去自愈能力，启动日志与 `/health` 都明确报 reason，不静默降级。测试前 4 节不加载网关（证明可独立跑），新增退避序列与降级行为断言，25 项 → 33 项 |
 | 2026-11-09 | 本次推送 | **launchd 加作业 EIO 已解决**：加上 `sudo` 后 `launchctl bootstrap` 成功，根因是执行上下文对该 GUI 域没有「新增作业」权限（被 launchd 泛化成 EIO），不是 I/O 层故障。接管时踩到一个必然的坑：手动起的实例还占着 `:3000`，新作业一直 `Address already in use` 退出重试（`runs` 从 3 涨到 8）——**先停手动实例再交给 launchd**。实测 `kill -9` 托管实例后 **2s 内自动重启**，`/health` 200、看门狗 `enabled`、`auto`+`tools` 仍选中 `qwen3.8-flash-next`。README 的「与 launchd 的分工」补成三方职责表，并明确**别给 gmlx 也挂 launchd**（会抢 `:8090`） |
 | 2026-11-09 | 本次推送 | **内置运行时看门狗（`flash-watchdog` 线程）**：模型服务（gmlx）挂在网关的后台线程上巡检，不再依赖第二个守护进程。判据是「连续 `TG_WD_FAIL_THRESHOLD`（默认 3）次探测 `/v1/models` 失败」，**有在飞请求时阈值自动翻倍**——正在服务用户的进程不该被巡检打断；重启后有 `TG_WD_GRACE`（150s）静默观察期（111 GB 权重冷加载约 75s，太短会把它自己打断），端口通但 300s 不响应判为卡死；连续重启按 `150 → 300 → 600 → 1200 → 1800`s 退避，恢复后需连续健康 `TG_WD_STABLE_RESET`（300s）才把重启计数清零。`/health` 增加 `watchdog` 字段（state/fails/restarts/last_check_ago_s/next_attempt_in_s）。实测 `kill -9` 后 20s 判失败、21:04 恢复，重启后 400 token / 6.12s = 65.4 tok/s（证明权重真加载）。新增 `tests/test_watchdog.py`（25 项） |
 | 2026-11-09 | 本次推送 | **`TG_MODEL_PARAMS` 参数量覆写**：换到 gmlx 后模型名是 `qwen3.8-flash-next`，`_auto_param_b` 从名字里抓不到数字、上游又没有 `/api/show` 元数据 → `tier_fit` 与 `quality` 双双落到 0.35 中性低分，**auto 的深度档不再选 125B 而退回 27B**。新增覆写表，优先级 覆写 > 元数据 > 名字推断，格式 `模型=参数量B`（如 `qwen3.8-flash-next=125`）。新增 `tests/test_model_params.py`（12 项） |
@@ -1219,4 +1251,4 @@ PAT 运行时从 `~/.git-credentials` 读取，只走内存，不落盘、不打
 - **源**：`alexjingwen/auto-florr` 的 `main` 分支，与本地 `/Users/claw/.ollama-token-gateway/` 工作副本逐字节一致。
 - **迁移约束**：本机 `github.com:443` 被代理拦截、仅 `api.github.com` 可达，故推送走 `tools/push-via-api.py`（Git Data API）。
 - **未纳入**：`config.json`（含真实 token）、`certs/`、`clients/`、`logs/` 等运维密钥在 `.gitignore` 中，不随仓库分发。
-- **服务端源码**：`token-gateway.py` 已纳入本仓库（单文件、纯标准库），`git clone` 后可直接运行。
+- **服务端源码**：`token-gateway.py` 已纳入本仓库（单文件、纯标准库），`git clone` 后可直接运行；`tg_watchdog.py` 为可选的自愈模块。

@@ -4325,214 +4325,47 @@ def _model_refresh_loop():
             log(f"⚠️ 上游模型清单巡检异常: {type(e).__name__}: {e}")
 
 
-# ========== Flash 运行时看门狗 ==========
-# 为什么放进网关而不是 cron / 第二个守护进程：
-#   ① 本机 launchd 完全不可用（bootstrap / load 一律 `5: Input/output error`，
-#      连最小 plist 都失败），gmlx 与网关都是脚本强制启动的，进程崩了没人接管；
-#   ② 网关本身就是常驻进程，把巡检挂在它的后台线程上即可获得自愈能力，
-#      少一个进程就少一个「守护者自己也挂了」的失效面；
-#   ③ 巡检需要知道「有没有请求在飞」——这个信息只有网关有，外部脚本看不到。
-WD_ENABLED = os.environ.get("TG_WD_ENABLED", "1").strip().lower() not in (
-    "0", "false", "no", "off")
-WD_INTERVAL_S = _env_num("TG_WD_INTERVAL", 20, minimum=5)
-WD_FAIL_THRESHOLD = _env_num("TG_WD_FAIL_THRESHOLD", 3, minimum=1)
-WD_PROBE_TIMEOUT_S = _env_num("TG_WD_PROBE_TIMEOUT", 5.0, cast=float, minimum=1.0)
-# 重启后多久之内只观察不动作：gmlx 加载 111 GB 权重约 75s，太短会把它自己打断
-WD_GRACE_S = _env_num("TG_WD_GRACE", 150, minimum=30)
-# 端口还在监听但一直不响应，多久之后判定为卡死（要覆盖冷加载 + 长 prefill）
-WD_HUNG_TIMEOUT_S = _env_num("TG_WD_HUNG_TIMEOUT", 300, minimum=60)
-WD_BACKOFF_BASE_S = _env_num("TG_WD_BACKOFF_BASE", 150, minimum=30)
-WD_BACKOFF_MAX_S = _env_num("TG_WD_BACKOFF_MAX", 1800, minimum=60)
-# 恢复后连续健康多久，才把「连续重启次数」归零（避免抖动时反复全速重试）
-WD_STABLE_RESET_S = _env_num("TG_WD_STABLE_RESET", 300, minimum=60)
-WD_RESTART_TIMEOUT_S = _env_num("TG_WD_RESTART_TIMEOUT", 300, minimum=60)
-
-_wd_lock = threading.Lock()
-_wd_states: Dict[str, dict] = {}
+# ========== Flash 运行时看门狗（实现抽到 tg_watchdog.py） ==========
+# 为什么抽出去：这套逻辑的难点不在"探测 + 重启"，而在**不把自己弄死**——
+# 冷加载、长 prefill、抖动重试各有一条反直觉的判断，正好是别人最想直接复用的部分。
+# 埋在 4200 行网关里，想抄的人得先读 200 行无关代码。
+#
+# 单文件运行的兼容性：本模块可选。tg_watchdog.py 不在同目录时网关照常工作，
+# 只是失去自愈能力——/health 会明确报 reason，不静默降级。
+try:
+    import tg_watchdog as wd
+except Exception as _wd_import_err:  # noqa: BLE001
+    wd = None
+    _WD_IMPORT_ERR = f"{type(_wd_import_err).__name__}: {_wd_import_err}"
 
 
-def _wd_targets() -> List[str]:
-    """巡检目标。显式 TG_WD_TARGETS 优先，否则跟随 flash-runtime.json 的端口。
-
-    跟随配置文件而不是硬编码 8090：换端口只改一处，网关不会去巡一个空端口。
-    """
-    raw = (os.environ.get("TG_WD_TARGETS") or "").strip()
-    if raw:
-        return [t.strip().rstrip("/") for t in raw.split(",") if t.strip()]
-    try:
-        with open(CONFIG_DIR / "flash-runtime.json", encoding="utf-8") as f:
-            port = int(json.load(f).get("port") or 0)
-    except (OSError, ValueError, json.JSONDecodeError):
-        return []
-    return [f"http://127.0.0.1:{port}"] if port else []
-
-
-def _wd_split(base: str) -> Tuple[str, int]:
-    try:
-        u = urllib.parse.urlsplit(base if "//" in base else "http://" + base)
-        host = u.hostname or "127.0.0.1"
-        port = u.port or (443 if u.scheme == "https" else 80)
-        return host, port
-    except ValueError:
-        return "127.0.0.1", 80
-
-
-def _wd_tcp_alive(host: str, port: int, timeout: float = 1.5) -> bool:
-    """端口有没有人在听。用 TCP 连接判断而不是 lsof：不 fork 子进程，20s 一次也不心疼。"""
-    try:
-        with socket.create_connection((host, port), timeout=timeout):
-            return True
-    except OSError:
-        return False
-
-
-def _wd_probe(base: str) -> Tuple[bool, Optional[str]]:
-    """GET {base}/v1/models，2xx 视为健康。返回 (健康, 错误描述)。"""
-    try:
-        req = urllib.request.Request(
-            base + "/v1/models", headers={"User-Agent": "token-gateway-watchdog"})
-        with urllib.request.urlopen(req, timeout=WD_PROBE_TIMEOUT_S) as r:
-            if 200 <= r.status < 300:
-                return True, None
-            return False, f"HTTP {r.status}"
-    except Exception as e:
-        return False, f"{type(e).__name__}: {e}"
-
-
-def _wd_inflight_total() -> int:
+def _wd_gw_inflight() -> int:
+    """把网关自己的在飞计数接给看门狗（决定阈值要不要翻倍）。"""
     with _model_inflight_lock:
         return sum(_model_inflight.values())
 
 
-def _wd_restart(base: str, st: dict) -> bool:
-    """调用既有的 start-flash.py 重启运行时。
-
-    故意不在这里重建 gmlx 命令行：启动参数的事实来源是 flash-runtime.json，
-    复制一份到网关里迟早会漂移（改了一处忘了另一处，症状是「手动起得好、自愈起不来」）。
-    """
-    script = CONFIG_DIR / "tools" / "start-flash.py"
-    if not script.exists():
-        log(f"🚑 看门狗想重启 {base}，但找不到启动脚本 {script}")
-        return False
-    env = dict(os.environ)
-    env["NO_PROXY"] = "*"
-    env["no_proxy"] = "*"
-    attempt = st["restarts"]
-    try:
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
-        log_path = LOG_DIR / "watchdog-restart.log"
-        fh = open(log_path, "a", encoding="utf-8")
-        fh.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} 重启 {base}"
-                 f"（第 {attempt} 次，原因：{st.get('last_error')}）=====\n")
-        fh.flush()
-        proc = subprocess.Popen(
-            [sys.executable, str(script), "--timeout", str(WD_RESTART_TIMEOUT_S)],
-            stdout=fh, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-            start_new_session=True, env=env, close_fds=True)
-        fh.close()  # 子进程已继承 fd，父进程这份关掉免得每次重启漏一个句柄
-        log(f"🚑 {base} 不可用（{st.get('last_error')}），已拉起重启脚本 pid {proc.pid}"
-            f"（第 {attempt} 次，日志 {log_path}）")
-        return True
-    except Exception as e:
-        log(f"🚑 重启 {base} 失败: {type(e).__name__}: {e}")
-        return False
+if wd is not None:
+    wd.configure(config_dir=CONFIG_DIR, log_fn=log, inflight_fn=_wd_gw_inflight)
+    WD_ENABLED = wd.WD_ENABLED
+else:
+    WD_ENABLED = False
 
 
-def _wd_tick(base: str) -> None:
-    st = _wd_states[base]
-    now = time.time()
-    host, port = _wd_split(base)
-    ok, err = _wd_probe(base)
-    st["last_check"] = now
-    if ok:
-        if st["state"] not in ("healthy", "init"):
-            log(f"✅ {base} 已恢复（{st['state']} → healthy，累计重启 {st['restarts']} 次）")
-        st["state"] = "healthy"
-        st["fails"] = 0
-        st["first_fail"] = 0.0
-        st["last_ok"] = now
-        st["last_error"] = None
-        if not st["healthy_since"]:
-            st["healthy_since"] = now
-        if st["restarts"] and now - st["healthy_since"] >= WD_STABLE_RESET_S:
-            log(f"🐕 {base} 已稳定 {int(now - st['healthy_since'])}s，重启退避计数归零")
-            st["restarts"] = 0
-        return
-
-    st["last_error"] = err
-    st["fails"] += 1
-    if not st["first_fail"]:
-        st["first_fail"] = now
-    # 宽限期 / 退避期：只观察。冷加载期间健康检查本来就是红的
-    if now < st["next_attempt"]:
-        st["state"] = "starting"
-        return
-
-    alive = _wd_tcp_alive(host, port)
-    # 有请求在飞时不轻易判死：131k 上下文的 prefill 可能把服务堵住几十秒，
-    # 这时候杀掉它等于自杀。阈值翻倍，给它把手上活干完的机会
-    need = WD_FAIL_THRESHOLD * (2 if _wd_inflight_total() else 1)
-    if alive:
-        if now - st["first_fail"] < WD_HUNG_TIMEOUT_S:
-            st["state"] = "degraded"
-            return
-        reason = f"端口在监听但 {int(now - st['first_fail'])}s 无响应"
-    else:
-        if st["fails"] < need:
-            st["state"] = "down"
-            return
-        reason = f"端口无监听（连续 {st['fails']} 次探测失败）"
-
-    st["last_error"] = reason
-    st["restarts"] += 1
-    delay = min(WD_BACKOFF_BASE_S * (2 ** (st["restarts"] - 1)), WD_BACKOFF_MAX_S)
-    st["next_attempt"] = now + max(delay, WD_GRACE_S)
-    st["fails"] = 0
-    st["first_fail"] = 0.0
-    st["state"] = "restarting"
-    if not _wd_restart(base, st):
-        st["state"] = "failed"
-
-
-def _watchdog_loop(targets: List[str]) -> None:
-    now = time.time()
-    with _wd_lock:
-        for base in targets:
-            _wd_states[base] = {
-                "state": "init", "fails": 0, "first_fail": 0.0, "restarts": 0,
-                "last_check": 0.0, "last_ok": 0.0, "last_error": None,
-                # 启动后先给一个宽限期：网关可能比运行时先起来，此时健康检查本来就红
-                "next_attempt": now + WD_GRACE_S, "healthy_since": 0.0,
-            }
-    log(f"🐕 Flash 看门狗已启动（每 {WD_INTERVAL_S}s 巡检 {', '.join(targets)}，"
-        f"失败 {WD_FAIL_THRESHOLD} 次判死 / 卡死 {WD_HUNG_TIMEOUT_S}s）")
-    while True:
-        time.sleep(WD_INTERVAL_S)
-        for base in targets:
-            try:
-                _wd_tick(base)
-            except Exception as e:
-                log(f"⚠️ 看门狗巡检 {base} 异常: {type(e).__name__}: {e}")
+def _wd_targets() -> List[str]:
+    return wd.targets() if wd is not None else []
 
 
 def _wd_snapshot() -> dict:
-    """给 /health 用的巡检快照。不带敏感信息，可在无鉴权路径暴露。"""
-    if not WD_ENABLED:
-        return {"enabled": False}
-    now = time.time()
-    with _wd_lock:
-        items = {b: st for b, st in _wd_states.items()}
-    out = {}
-    for base, st in items.items():
-        out[base] = {
-            "state": st["state"],
-            "fails": st["fails"],
-            "restarts": st["restarts"],
-            "last_check_ago_s": int(now - st["last_check"]) if st["last_check"] else None,
-            "last_error": st["last_error"],
-            "next_attempt_in_s": int(st["next_attempt"] - now) if st["next_attempt"] > now else 0,
-        }
-    return {"enabled": True, "interval_s": WD_INTERVAL_S, "targets": out}
+    """给 /health 用的巡检快照。"""
+    if wd is None:
+        return {"enabled": False,
+                "reason": f"tg_watchdog.py 未加载（{_WD_IMPORT_ERR}），自愈能力不可用"}
+    return wd.snapshot()
+
+
+def _watchdog_loop(targets: List[str]) -> None:
+    wd.loop(targets)
 
 
 def main():
@@ -4584,7 +4417,8 @@ def main():
     if MODEL_REFRESH_INTERVAL_S > 0:
         threading.Thread(target=_model_refresh_loop, daemon=True).start()
         print(f"🔍 上游模型清单巡检已启动（每 {MODEL_REFRESH_INTERVAL_S}s 一次）")
-    # Flash 运行时看门狗：本机 launchd 不可用，推理进程崩了没人接管，由网关兜底
+    # Flash 运行时看门狗：上游是我们自己拉起的进程，崩了没有别的托管方管；
+    # 而"有没有请求在飞"只有网关知道，所以巡检挂在这里（实现见 tg_watchdog.py）
     if WD_ENABLED:
         _wd_targets_resolved = _wd_targets()
         if _wd_targets_resolved:
@@ -4592,6 +4426,8 @@ def main():
                              daemon=True, name="flash-watchdog").start()
         else:
             print("🐕 看门狗已启用但没有巡检目标（TG_WD_TARGETS 为空且无 flash-runtime.json），跳过")
+    elif wd is None:
+        print(f"⚠️ 看门狗不可用：tg_watchdog.py 未加载（{_WD_IMPORT_ERR}），上游崩了不会自动恢复")
     else:
         print("🐕 看门狗已关闭（TG_WD_ENABLED=0）")
     # 启动即拉一次清单：别等第一个请求来才发现模型已经变了
