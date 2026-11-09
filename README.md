@@ -138,7 +138,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.token-gateway.server
 ```
 
 > 注：`bootstrap` **偶尔**会返回 `Bootstrap failed: 5: Input/output error` 但作业其实已经起来了——先 `curl :3000/health` 确认，别急着重试成两个实例。
-> 但若**每次**都报 EIO、`launchctl print` 也查不到该 label，那就是真的没起来，见故障排查「launchd 加作业恒定 `5: Input/output error`」。
+> 但若**每次**都报 EIO、`launchctl print` 也查不到该 label，那就是真的没起来：本机实测这种情况下加 `sudo` 就能成功（根因是执行上下文对该 GUI 域没有新增作业的权限，被泛化成 EIO），见故障排查「launchd 加作业报 `5: Input/output error`」。
 >
 > 验证是否真的生效：看启动横幅里的 `⏱️ 静默预算: 文本 600s / 带图 150s  非流式转发: 缓冲`，或 `launchctl print gui/$(id -u)/com.token-gateway.server | grep TG_`。只改 Python 代码不需要重新装载，`kickstart -k` 即可。
 
@@ -738,7 +738,16 @@ launchctl unload ~/Library/LaunchAgents/com.user.memguard.plist
 
 ### 与 launchd 的分工
 
-launchd 负责**网关自己**的存活（`KeepAlive`），看门狗负责**上游模型服务**的存活。两者不重叠：网关死了由 launchd 拉起（本机 launchd 的加作业路径坏着，退化为 `start-gateway.py` 手动/脚本拉起），模型服务死了由网关拉起。
+launchd 负责**网关自己**的存活（`KeepAlive`），看门狗负责**上游模型服务**的存活。两者不重叠，也不要重叠：
+
+| 谁 | 管谁 | 判据 | 恢复方式 |
+|---|---|---|---|
+| launchd（`com.token-gateway.server`） | 网关进程 | 进程退出 | `KeepAlive` 立即重拉（实测 `kill -9` 后 2s 内回到 200） |
+| 网关看门狗（`flash-watchdog`） | gmlx / Ollama | 连续 3 次探测 `/v1/models` 失败 | 调 `tools/start-flash.py` 重启 |
+
+**别给 gmlx 也挂 launchd**——两个托管方会抢同一个 `:8090`，症状是"起来了又被打下去"。模型服务的启动参数唯一事实来源是 `flash-runtime.json`，只有看门狗读它。
+
+本机若 launchd 的加作业路径又出问题，用 `tools/start-gateway.py` 兜底（见下方「launchd 加作业报 EIO」）。
 
 ## 故障排查 / 常见问题
 
@@ -903,7 +912,7 @@ lsof -nP -iTCP:3000 -sTCP:LISTEN
 launchctl print gui/$(id -u)/com.token-gateway.server | grep -E "state = |pid = "
 ```
 
-### launchd 加作业恒定 `5: Input/output error`（本机实测 2026-11-09）
+### launchd 加作业报 `5: Input/output error`（本机实测 2026-11-09，已解决）
 
 上一条「EIO 不等于没起来」只覆盖**偶发**误报。这台机器后来演化成**加作业恒定失败**：任何 plist、任何客户端、任何路径都报 EIO，作业确实没起来。排查顺序与实测结论：
 
@@ -921,7 +930,29 @@ launchctl print gui/$(id -u)/com.token-gateway.server | grep -E "state = |pid = 
 | `launchctl bootout gui/503/<label>` | rc=0，作业**真的被移除** | 删作业正常 |
 | `launchctl list` | rc=1，无任何输出 | 另一个独立症状 |
 
-结论：**只有「把 plist 交给 launchd 注册成作业」这条路径坏了**（`bootstrap` 与 legacy `load` 都坏），其余操作全部正常。这不是本项目代码的问题，也不是权限/语法问题。已排除的无效尝试：改属组、`chmod 600`、二进制 plist、换目录、`asuser`、`user/503` 域、`submit`、`-F`、清 xattr。
+结论：**只有「把 plist 交给 launchd 注册成作业」这条路径坏了**（`bootstrap` 与 legacy `load` 都坏），其余操作全部正常。已排除的无效尝试：改属组、`chmod 600`、二进制 plist、换目录、`asuser`、`user/503` 域、`submit`、`-F`、清 xattr。
+
+**最终解法：加上 `sudo` 就成功了。**
+
+```bash
+sudo launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.token-gateway.server.plist
+```
+
+所以根因是**这条会话所在的执行上下文对该 GUI 域没有「新增作业」的权限**，而 launchd 把这种权限失败泛化成了 `5: Input/output error`（不是 EIO 那种 I/O 层故障，别被文案带偏）。`print` / `enable` / `bootout` 只需要读和写既有状态，所以照常工作——这正是"域可读可写可删、唯独不能加"的由来。
+
+用 root 重试后实测结果：
+
+| 步骤 | 结果 |
+|---|---|
+| `sudo launchctl bootstrap` | 成功，`launchctl print` 显示 `state = running` |
+| 首次尝试 | `runs = 3, last exit code = 1`，`Address already in use`（手动实例还占着 `:3000`） |
+| 停掉手动实例 | 2s 内 `:3000` 回到 200，新 pid 由 launchd 提供 |
+| `kill -9` 托管实例 | **2s 内自动重启**（`runs 8 → 9`，新 pid），`/health` 200、看门狗 `enabled`、上游 5 个模型已同步 |
+| `auto` + `tools` 端到端 | 选中 `qwen3.8-flash-next`，答"北京"（深度档与 `TG_MODEL_PARAMS` 生效） |
+
+> 若在 root 下仍报 EIO（本机没遇到），再走 `sudo launchctl reboot userspace`（约 10s，只重启用户态，GUI 应用会退出重登）或注销重登。
+>
+> 交接要点：launchd 接管前必须停掉手动实例，否则新的那个会一直 `Address already in use` 退出重试（`KeepAlive` 会把它刷成 `runs` 不断上涨）。
 
 上面这套判据已固化成一条命令，不用每次重新摸索：
 
@@ -931,20 +962,7 @@ bash tools/fix-launchd.sh --verify     # 只看作业是否注册、/health 是�
 sudo bash tools/fix-launchd.sh --apply # 以 root 重试（能拿到真正的错误码）
 ```
 
-可用的处置（按代价排序）：
-
-```bash
-# ① 以 root 重试，能拿到真正的错误码（launchctl 自己提示的）
-sudo launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.token-gateway.server.plist
-#    root 下若成功 → 无需重启；若报的仍不是权限错，走 ②
-
-# ② 只重启用户态，不重启内核（约 10s，GUI 应用会退出重登）
-sudo launchctl reboot userspace
-
-# ③ 常规做法：注销后重新登录 / 重启
-```
-
-在修好之前，本机用 `tools/start-gateway.py` 强制拉起（见「macOS 后台运行」），网关内部的看门狗负责模型服务，不依赖 launchd。
+`tools/start-gateway.py` 保留作兜底：launchd 完全不可用时（比如换机器、尚未登录 GUI）手动拉起网关；网关内部的看门狗负责模型服务，与它无关。
 
 > 另：`pgrep -x launchd` 在本机**查不到任何 launchd 进程**（`loginwindow` / `WindowServer` 能查到），所以不要用"进程在不在"判断 launchd 是否正常——`launchctl print gui/$(id -u)` 才是可信口径。
 
@@ -1117,6 +1135,7 @@ python3 tests/test_watchdog.py      # 看门狗：连续失败才重启 / 在飞
 
 | 日期 | 提交 | 内容 |
 |---|---|---|
+| 2026-11-09 | 本次推送 | **launchd 加作业 EIO 已解决**：加上 `sudo` 后 `launchctl bootstrap` 成功，根因是执行上下文对该 GUI 域没有「新增作业」权限（被 launchd 泛化成 EIO），不是 I/O 层故障。接管时踩到一个必然的坑：手动起的实例还占着 `:3000`，新作业一直 `Address already in use` 退出重试（`runs` 从 3 涨到 8）——**先停手动实例再交给 launchd**。实测 `kill -9` 托管实例后 **2s 内自动重启**，`/health` 200、看门狗 `enabled`、`auto`+`tools` 仍选中 `qwen3.8-flash-next`。README 的「与 launchd 的分工」补成三方职责表，并明确**别给 gmlx 也挂 launchd**（会抢 `:8090`） |
 | 2026-11-09 | 本次推送 | **内置运行时看门狗（`flash-watchdog` 线程）**：模型服务（gmlx）挂在网关的后台线程上巡检，不再依赖第二个守护进程。判据是「连续 `TG_WD_FAIL_THRESHOLD`（默认 3）次探测 `/v1/models` 失败」，**有在飞请求时阈值自动翻倍**——正在服务用户的进程不该被巡检打断；重启后有 `TG_WD_GRACE`（150s）静默观察期（111 GB 权重冷加载约 75s，太短会把它自己打断），端口通但 300s 不响应判为卡死；连续重启按 `150 → 300 → 600 → 1200 → 1800`s 退避，恢复后需连续健康 `TG_WD_STABLE_RESET`（300s）才把重启计数清零。`/health` 增加 `watchdog` 字段（state/fails/restarts/last_check_ago_s/next_attempt_in_s）。实测 `kill -9` 后 20s 判失败、21:04 恢复，重启后 400 token / 6.12s = 65.4 tok/s（证明权重真加载）。新增 `tests/test_watchdog.py`（25 项） |
 | 2026-11-09 | 本次推送 | **`TG_MODEL_PARAMS` 参数量覆写**：换到 gmlx 后模型名是 `qwen3.8-flash-next`，`_auto_param_b` 从名字里抓不到数字、上游又没有 `/api/show` 元数据 → `tier_fit` 与 `quality` 双双落到 0.35 中性低分，**auto 的深度档不再选 125B 而退回 27B**。新增覆写表，优先级 覆写 > 元数据 > 名字推断，格式 `模型=参数量B`（如 `qwen3.8-flash-next=125`）。新增 `tests/test_model_params.py`（12 项） |
 | 2026-11-09 | 本次推送 | **`TG_AUTO_DEEP_ONLY` 贵模型只服务难请求**：quality 因子按参数量对数归一定标，同一池里最大的模型恒得 1.00；当大模型**比小模型慢**时（本机 125B 约 40 t/s、27B 约 90 t/s），一句「1+1」也会被判给 125B。改为显式声明：名单里的模型只在深度档参与 auto，轻量/常规档从候选池摘掉；**摘空则该档不生效**（回退全池），避免小机器上整档 502。默认空集，不改变既有行为。新增 `tests/test_auto_deep_only.py`（11 项） |
