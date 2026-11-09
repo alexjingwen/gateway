@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>NO_PROXY</key>
+		<string>*</string>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+		<key>no_proxy</key>
+		<string>*</string>
+	</dict>
+	<key>KeepAlive</key>
+	<true/>
+	<key>Label</key>
+	<string>com.llama.flash-next</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/claw/llama.cpp/build/bin/llama-server</string>
+		<string>--model</string>
+		<string>/Users/claw/models/qwen3.8-flash-next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf</string>
+		<string>--mmproj</string>
+		<string>/Users/claw/models/qwen3.8-flash-next/mmproj-F16.gguf</string>
+		<string>--alias</string>
+		<string>qwen3.8-flash-125b</string>
+		<string>--host</string>
+		<string>127.0.0.1</string>
+		<string>--port</string>
+		<string>8090</string>
+		<string>--api-key</string>
+		<string>sk-test</string>
+		<string>--ctx-size</string>
+		<string>131072</string>
+		<string>--image-min-tokens</string>
+		<string>1024</string>
+		<string>--n-gpu-layers</string>
+		<string>99</string>
+		<string>--jinja</string>
+		<string>--threads</string>
+		<string>16</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/tmp/llama-flash-next.err.log</string>
+	<key>StandardOutPath</key>
+	<string>/tmp/llama-flash-next.log</string>
+	<key>WorkingDirectory</key>
+	<string>/Users/claw/models/qwen3.8-flash-next</string>
+</dict>
+</plist>

@@ -37,7 +37,7 @@ import urllib.error
 import urllib.request
 
 API = "https://api.github.com"
-DEFAULT_REPO = "alexjingwen/gateway"
+DEFAULT_REPO = "alexjingwen/ollama-token-gateway"
 
 
 def git(*args, binary=False):
@@ -165,8 +165,11 @@ def sync_tree(api, repo, branch, files, dry_run):
         return
     entries = make_entries(api, repo, todo, dry_run)
     tree = api.call("POST", f"/repos/{repo}/git/trees", {"base_tree": base_tree, "tree": entries})
+    # 提交信息沿用本地 HEAD：远端历史里能看到真正改了什么，
+    # 而不是一条永远相同的 "chore: 本地树与远端对齐"。
+    message = git("log", "-1", "--format=%B", "HEAD").strip() or "chore: 本地树与远端对齐"
     commit = api.call("POST", f"/repos/{repo}/git/commits", {
-        "message": "chore: 本地树与远端对齐", "tree": tree["sha"], "parents": [base],
+        "message": message, "tree": tree["sha"], "parents": [base],
     })
     api.call("PATCH", f"/repos/{repo}/git/refs/heads/{branch}", {"sha": commit["sha"]})
     print(f"\n[+] 已推送 -> https://github.com/{repo}/tree/{branch}  ({commit['sha'][:8]})")
@@ -185,7 +188,7 @@ def ensure_repo(api, repo, create, private, dry_run):
     if not create:
         print("    当前 PAT 是 fine-grained token，实测**没有建库权限**（POST /user/repos -> 403）。")
         print("    请在 GitHub 网页上新建一个**空仓库**（不要勾 README / .gitignore）：")
-        print(f"        https://github.com/new  name=gateway  visibility={'private' if private else 'public'}")
+        print(f"        https://github.com/new  name=ollama-token-gateway  visibility={'private' if private else 'public'}")
         print("    或者给 PAT 加上 Administration: write（建库）权限后重跑本脚本并加 --create。")
         return False
     if dry_run:

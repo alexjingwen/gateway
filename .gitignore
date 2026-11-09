@@ -10,6 +10,8 @@ ipv6-ddns-state.json
 logs/
 mem-guard.log
 .DS_Store
+__pycache__/
+*.pyc
 
 # ── 大型二进制（Tailscale 安装包等，不进版本库）──
 clients/

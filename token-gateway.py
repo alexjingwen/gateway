@@ -14,6 +14,8 @@ Ollama Token Gateway - 多设备 Token 服务网关
 import http.server
 import http.client
 import socketserver
+import subprocess
+import urllib.parse
 import urllib.request
 import urllib.error
 import json
@@ -112,7 +114,7 @@ def _parse_model_aliases(env_val: str) -> dict:
 
 MODEL_ALIASES = _parse_model_aliases(
     os.environ.get("TG_MODEL_ALIASES", "") or
-    "qwen3.5-122b=mlx-community/Qwen3.5-122B-A10B-4bit"
+    "qwen3.8-flash=qwen3.8-flash-125b,qwen3.8-27b=qwen3.8:27b"
 )
 _MODEL_REVERSE_ALIAS = {v: k for k, v in MODEL_ALIASES.items()}
 
@@ -150,6 +152,37 @@ AUTO_EXCLUDE = {m.strip() for m in os.environ.get("TG_AUTO_EXCLUDE", "").split("
 AUTO_TIER_ENABLED = os.environ.get("TG_AUTO_TIER", "1").strip().lower() not in ("0", "false", "no", "off")
 AUTO_TIER_NAMES = ("light", "standard", "deep")
 AUTO_TIER_LABELS = {"light": "轻量", "standard": "常规", "deep": "深度"}
+
+# 仅深度档可用的大模型（逗号分隔，允许写别名）。轻量/常规档把它们从候选池里摘掉。
+#
+# 为什么需要它：balanced 打分的 quality 因子按参数量对数归一，同一候选池里 125B
+# 恒得 1.00。当大模型比小模型快很多时（例如 122B 对 8B），让 quality 说话是对的；
+# 但反过来——本机 125B 解码约 40 t/s、27B 约 90 t/s——一句"1+1"也会被判给 125B，
+# 把 111 GB 的权重和 3 倍延迟花在不需要的地方。速度因子是实测的，会部分抵消，
+# 但分数差往往只有 0.03~0.05，扛不住负载波动。
+# 这里用显式声明把"贵模型只服务难请求"从概率事件变成硬约束：默认空集（不改变
+# 既有行为），由部署方按机器实际情况配置。
+AUTO_DEEP_ONLY = {
+    m.strip() for m in os.environ.get("TG_AUTO_DEEP_ONLY", "").split(",") if m.strip()
+}
+
+# 参数量覆写（逗号分隔的 model=params_b，例如 "qwen3.8-flash-next=125"）。
+#
+# 为什么需要：_auto_param_b 对非 Ollama 上游只能从**模型名**推断参数量。换到
+# 不提供 /api/show 元数据、名字里又没数字的运行时（gmlx 的 `qwen3.8-flash-next`）
+# 后，推断结果是 None，于是 tier_fit 与 quality 双双落到 0.35 的中性低分，
+# 排在有参数量的模型（如 qwen3.8:27b）之后——实测表现为 auto 的深度档不再选
+# 125B，而退回 27B。此表让部署方直接声明真实参数量，不再依赖名字约定。
+MODEL_PARAM_OVERRIDES: Dict[str, float] = {}
+for _item in os.environ.get("TG_MODEL_PARAMS", "").split(","):
+    _k, _sep, _v = _item.partition("=")
+    _k, _v = _k.strip(), _v.strip()
+    if not _k or not _sep:
+        continue
+    try:
+        MODEL_PARAM_OVERRIDES[_k] = float(_v)
+    except ValueError:
+        continue
 
 
 def _parse_float_list(raw, default: List[float]) -> List[float]:
@@ -363,9 +396,10 @@ MLX_CIRCUIT_COOLDOWN = 30                                 # OOM 后 30s 内持�
 
 _MODEL_CONTEXT_WINDOWS: Dict[str, int] = {
     "*": 262144,
-    "nightmedia/Qwen3.5-122B-A10B-Text-mxfp4-mlx": 262144,
-    "qwen3.5-122b-mxfp4": 262144,
-    "mlx-community/Qwen3.5-122B-A10B-4bit": 262144,
+    # Qwen3.8 两档（当前架构）。值必须与上游实际开的窗口一致：给大了网关不会提前截断，
+    # 客户端发超长上下文时上游才报 400；给小了则每次长上下文都被无谓截掉。
+    "qwen3.8:27b": 262144,          # Ollama，原生 262144
+    "qwen3.8-flash-125b": 131072,   # llama-server --ctx-size 131072
 }
 
 # 模型拉取任务状态
@@ -2267,7 +2301,10 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         return best
 
     def _auto_param_b(self, model: str, host: str) -> Optional[float]:
-        """模型参数量（B）：优先用上游元数据，其次从名字推断。"""
+        """模型参数量（B）：显式覆写 > 上游元数据 > 从名字推断。"""
+        override = MODEL_PARAM_OVERRIDES.get(model)
+        if override is not None:
+            return override
         if host == OLLAMA_HOST:
             info = (self._ollama_meta_cache.get("meta") or {}).get(model)
             if info:
@@ -2495,6 +2532,22 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             policy = self._auto_policy(cfg)
             tier, tier_why = self._auto_req_tier(path, req, policy)
             self._auto_tier_label = AUTO_TIER_NAMES[tier]
+
+            # 仅深度档可用的大模型（env TG_AUTO_DEEP_ONLY + config global.auto_deep_only）
+            deep_only = {MODEL_ALIASES.get(m, m) for m in AUTO_DEEP_ONLY}
+            _cfg_deep = (cfg.get("global") or {}).get("auto_deep_only") or []
+            if isinstance(_cfg_deep, str):
+                _cfg_deep = _cfg_deep.split(",")
+            for _m in _cfg_deep:
+                if isinstance(_m, str) and _m.strip():
+                    deep_only.add(MODEL_ALIASES.get(_m.strip(), _m.strip()))
+            if deep_only and tier != len(AUTO_TIER_NAMES) - 1:
+                gated = [(m, h) for m, h in cands if m not in deep_only]
+                # 全被摘掉时不生效：宁可给贵模型，也不能因为策略配置而 503
+                if gated and len(gated) != len(cands):
+                    note += (f"；{len(cands) - len(gated)} 个模型仅限深度档，"
+                             f"本档（{AUTO_TIER_LABELS[AUTO_TIER_NAMES[tier]]}）不参与")
+                    cands = gated
             loads = {m: model_inflight_get(m) for m, _ in cands}
 
             entries = []
@@ -2638,7 +2691,10 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
 
         # 健康检查（无需鉴权）
         if path == "/health" or path == "/healthz":
-            self._send_json({"status": "ok", "version": "1.0.0", "uptime": int(time.time() - _start_ts)})
+            # watchdog 只暴露状态摘要（状态/次数/最近错误），不含权重路径等敏感信息
+            self._send_json({"status": "ok", "version": "1.0.0",
+                             "uptime": int(time.time() - _start_ts),
+                             "watchdog": _wd_snapshot()})
             return
 
         # 管理面板 UI（无需鉴权，页面内输入 Admin Token）
@@ -4269,6 +4325,216 @@ def _model_refresh_loop():
             log(f"⚠️ 上游模型清单巡检异常: {type(e).__name__}: {e}")
 
 
+# ========== Flash 运行时看门狗 ==========
+# 为什么放进网关而不是 cron / 第二个守护进程：
+#   ① 本机 launchd 完全不可用（bootstrap / load 一律 `5: Input/output error`，
+#      连最小 plist 都失败），gmlx 与网关都是脚本强制启动的，进程崩了没人接管；
+#   ② 网关本身就是常驻进程，把巡检挂在它的后台线程上即可获得自愈能力，
+#      少一个进程就少一个「守护者自己也挂了」的失效面；
+#   ③ 巡检需要知道「有没有请求在飞」——这个信息只有网关有，外部脚本看不到。
+WD_ENABLED = os.environ.get("TG_WD_ENABLED", "1").strip().lower() not in (
+    "0", "false", "no", "off")
+WD_INTERVAL_S = _env_num("TG_WD_INTERVAL", 20, minimum=5)
+WD_FAIL_THRESHOLD = _env_num("TG_WD_FAIL_THRESHOLD", 3, minimum=1)
+WD_PROBE_TIMEOUT_S = _env_num("TG_WD_PROBE_TIMEOUT", 5.0, cast=float, minimum=1.0)
+# 重启后多久之内只观察不动作：gmlx 加载 111 GB 权重约 75s，太短会把它自己打断
+WD_GRACE_S = _env_num("TG_WD_GRACE", 150, minimum=30)
+# 端口还在监听但一直不响应，多久之后判定为卡死（要覆盖冷加载 + 长 prefill）
+WD_HUNG_TIMEOUT_S = _env_num("TG_WD_HUNG_TIMEOUT", 300, minimum=60)
+WD_BACKOFF_BASE_S = _env_num("TG_WD_BACKOFF_BASE", 150, minimum=30)
+WD_BACKOFF_MAX_S = _env_num("TG_WD_BACKOFF_MAX", 1800, minimum=60)
+# 恢复后连续健康多久，才把「连续重启次数」归零（避免抖动时反复全速重试）
+WD_STABLE_RESET_S = _env_num("TG_WD_STABLE_RESET", 300, minimum=60)
+WD_RESTART_TIMEOUT_S = _env_num("TG_WD_RESTART_TIMEOUT", 300, minimum=60)
+
+_wd_lock = threading.Lock()
+_wd_states: Dict[str, dict] = {}
+
+
+def _wd_targets() -> List[str]:
+    """巡检目标。显式 TG_WD_TARGETS 优先，否则跟随 flash-runtime.json 的端口。
+
+    跟随配置文件而不是硬编码 8090：换端口只改一处，网关不会去巡一个空端口。
+    """
+    raw = (os.environ.get("TG_WD_TARGETS") or "").strip()
+    if raw:
+        return [t.strip().rstrip("/") for t in raw.split(",") if t.strip()]
+    try:
+        with open(CONFIG_DIR / "flash-runtime.json", encoding="utf-8") as f:
+            port = int(json.load(f).get("port") or 0)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return []
+    return [f"http://127.0.0.1:{port}"] if port else []
+
+
+def _wd_split(base: str) -> Tuple[str, int]:
+    try:
+        u = urllib.parse.urlsplit(base if "//" in base else "http://" + base)
+        host = u.hostname or "127.0.0.1"
+        port = u.port or (443 if u.scheme == "https" else 80)
+        return host, port
+    except ValueError:
+        return "127.0.0.1", 80
+
+
+def _wd_tcp_alive(host: str, port: int, timeout: float = 1.5) -> bool:
+    """端口有没有人在听。用 TCP 连接判断而不是 lsof：不 fork 子进程，20s 一次也不心疼。"""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _wd_probe(base: str) -> Tuple[bool, Optional[str]]:
+    """GET {base}/v1/models，2xx 视为健康。返回 (健康, 错误描述)。"""
+    try:
+        req = urllib.request.Request(
+            base + "/v1/models", headers={"User-Agent": "token-gateway-watchdog"})
+        with urllib.request.urlopen(req, timeout=WD_PROBE_TIMEOUT_S) as r:
+            if 200 <= r.status < 300:
+                return True, None
+            return False, f"HTTP {r.status}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+def _wd_inflight_total() -> int:
+    with _model_inflight_lock:
+        return sum(_model_inflight.values())
+
+
+def _wd_restart(base: str, st: dict) -> bool:
+    """调用既有的 start-flash.py 重启运行时。
+
+    故意不在这里重建 gmlx 命令行：启动参数的事实来源是 flash-runtime.json，
+    复制一份到网关里迟早会漂移（改了一处忘了另一处，症状是「手动起得好、自愈起不来」）。
+    """
+    script = CONFIG_DIR / "tools" / "start-flash.py"
+    if not script.exists():
+        log(f"🚑 看门狗想重启 {base}，但找不到启动脚本 {script}")
+        return False
+    env = dict(os.environ)
+    env["NO_PROXY"] = "*"
+    env["no_proxy"] = "*"
+    attempt = st["restarts"]
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        log_path = LOG_DIR / "watchdog-restart.log"
+        fh = open(log_path, "a", encoding="utf-8")
+        fh.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} 重启 {base}"
+                 f"（第 {attempt} 次，原因：{st.get('last_error')}）=====\n")
+        fh.flush()
+        proc = subprocess.Popen(
+            [sys.executable, str(script), "--timeout", str(WD_RESTART_TIMEOUT_S)],
+            stdout=fh, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+            start_new_session=True, env=env, close_fds=True)
+        fh.close()  # 子进程已继承 fd，父进程这份关掉免得每次重启漏一个句柄
+        log(f"🚑 {base} 不可用（{st.get('last_error')}），已拉起重启脚本 pid {proc.pid}"
+            f"（第 {attempt} 次，日志 {log_path}）")
+        return True
+    except Exception as e:
+        log(f"🚑 重启 {base} 失败: {type(e).__name__}: {e}")
+        return False
+
+
+def _wd_tick(base: str) -> None:
+    st = _wd_states[base]
+    now = time.time()
+    host, port = _wd_split(base)
+    ok, err = _wd_probe(base)
+    st["last_check"] = now
+    if ok:
+        if st["state"] not in ("healthy", "init"):
+            log(f"✅ {base} 已恢复（{st['state']} → healthy，累计重启 {st['restarts']} 次）")
+        st["state"] = "healthy"
+        st["fails"] = 0
+        st["first_fail"] = 0.0
+        st["last_ok"] = now
+        st["last_error"] = None
+        if not st["healthy_since"]:
+            st["healthy_since"] = now
+        if st["restarts"] and now - st["healthy_since"] >= WD_STABLE_RESET_S:
+            log(f"🐕 {base} 已稳定 {int(now - st['healthy_since'])}s，重启退避计数归零")
+            st["restarts"] = 0
+        return
+
+    st["last_error"] = err
+    st["fails"] += 1
+    if not st["first_fail"]:
+        st["first_fail"] = now
+    # 宽限期 / 退避期：只观察。冷加载期间健康检查本来就是红的
+    if now < st["next_attempt"]:
+        st["state"] = "starting"
+        return
+
+    alive = _wd_tcp_alive(host, port)
+    # 有请求在飞时不轻易判死：131k 上下文的 prefill 可能把服务堵住几十秒，
+    # 这时候杀掉它等于自杀。阈值翻倍，给它把手上活干完的机会
+    need = WD_FAIL_THRESHOLD * (2 if _wd_inflight_total() else 1)
+    if alive:
+        if now - st["first_fail"] < WD_HUNG_TIMEOUT_S:
+            st["state"] = "degraded"
+            return
+        reason = f"端口在监听但 {int(now - st['first_fail'])}s 无响应"
+    else:
+        if st["fails"] < need:
+            st["state"] = "down"
+            return
+        reason = f"端口无监听（连续 {st['fails']} 次探测失败）"
+
+    st["last_error"] = reason
+    st["restarts"] += 1
+    delay = min(WD_BACKOFF_BASE_S * (2 ** (st["restarts"] - 1)), WD_BACKOFF_MAX_S)
+    st["next_attempt"] = now + max(delay, WD_GRACE_S)
+    st["fails"] = 0
+    st["first_fail"] = 0.0
+    st["state"] = "restarting"
+    if not _wd_restart(base, st):
+        st["state"] = "failed"
+
+
+def _watchdog_loop(targets: List[str]) -> None:
+    now = time.time()
+    with _wd_lock:
+        for base in targets:
+            _wd_states[base] = {
+                "state": "init", "fails": 0, "first_fail": 0.0, "restarts": 0,
+                "last_check": 0.0, "last_ok": 0.0, "last_error": None,
+                # 启动后先给一个宽限期：网关可能比运行时先起来，此时健康检查本来就红
+                "next_attempt": now + WD_GRACE_S, "healthy_since": 0.0,
+            }
+    log(f"🐕 Flash 看门狗已启动（每 {WD_INTERVAL_S}s 巡检 {', '.join(targets)}，"
+        f"失败 {WD_FAIL_THRESHOLD} 次判死 / 卡死 {WD_HUNG_TIMEOUT_S}s）")
+    while True:
+        time.sleep(WD_INTERVAL_S)
+        for base in targets:
+            try:
+                _wd_tick(base)
+            except Exception as e:
+                log(f"⚠️ 看门狗巡检 {base} 异常: {type(e).__name__}: {e}")
+
+
+def _wd_snapshot() -> dict:
+    """给 /health 用的巡检快照。不带敏感信息，可在无鉴权路径暴露。"""
+    if not WD_ENABLED:
+        return {"enabled": False}
+    now = time.time()
+    with _wd_lock:
+        items = {b: st for b, st in _wd_states.items()}
+    out = {}
+    for base, st in items.items():
+        out[base] = {
+            "state": st["state"],
+            "fails": st["fails"],
+            "restarts": st["restarts"],
+            "last_check_ago_s": int(now - st["last_check"]) if st["last_check"] else None,
+            "last_error": st["last_error"],
+            "next_attempt_in_s": int(st["next_attempt"] - now) if st["next_attempt"] > now else 0,
+        }
+    return {"enabled": True, "interval_s": WD_INTERVAL_S, "targets": out}
+
+
 def main():
     # 速度因子预热：用最近的用量日志回填实测耗时，避免重启后 speed 因子失明
     _seeded = MODEL_LATENCY.seed_from_usage(USAGE_LOG)
@@ -4318,6 +4584,16 @@ def main():
     if MODEL_REFRESH_INTERVAL_S > 0:
         threading.Thread(target=_model_refresh_loop, daemon=True).start()
         print(f"🔍 上游模型清单巡检已启动（每 {MODEL_REFRESH_INTERVAL_S}s 一次）")
+    # Flash 运行时看门狗：本机 launchd 不可用，推理进程崩了没人接管，由网关兜底
+    if WD_ENABLED:
+        _wd_targets_resolved = _wd_targets()
+        if _wd_targets_resolved:
+            threading.Thread(target=_watchdog_loop, args=(_wd_targets_resolved,),
+                             daemon=True, name="flash-watchdog").start()
+        else:
+            print("🐕 看门狗已启用但没有巡检目标（TG_WD_TARGETS 为空且无 flash-runtime.json），跳过")
+    else:
+        print("🐕 看门狗已关闭（TG_WD_ENABLED=0）")
     # 启动即拉一次清单：别等第一个请求来才发现模型已经变了
     try:
         GatewayHandler._refresh_model_caches(force=True)

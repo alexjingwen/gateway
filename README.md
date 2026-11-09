@@ -83,6 +83,8 @@ TG_DISABLE_HTTPS=1 TG_PORT=3000 python3 token-gateway.py
 | TG_AUTO_QUALITY | (空) | 显式优先顺序（逗号分隔，从高到低）；表内模型优先于表外，表内再按加权排序；允许写别名 |
 | TG_AUTO_BUSY_THRESHOLD | 1 | 繁忙阈值：在飞请求数 ≥ 此值即跳过该模型（默认 1 = 有人正在用就换） |
 | TG_AUTO_EXCLUDE | (空) | `auto` 额外排除的模型（逗号分隔，叠加在 `deny_models` 与 `global.auto_exclude` 之上） |
+| TG_AUTO_DEEP_ONLY | (空) | **只允许深度档使用**的大模型（逗号分隔，允许写别名）。轻量档与常规档把它们从候选池里摘掉，深度档不受限；也可写 `global.auto_deep_only`。摘空是关键：小请求不会因为"大模型质量分更高"而落到百 GB 权重上 |
+| TG_MODEL_PARAMS | (空) | 参数量覆写，格式 `模型=参数量B`（逗号分隔，如 `qwen3.8-flash-next=125`）。优先级 **覆写 > 上游元数据 > 名字推断**；给不提供 `/api/show` 元数据、名字里又没数字的运行时（gmlx 的 `qwen3.8-flash-next`）用 |
 | TG_QPS | 5 | 每 key 每秒请求数 |
 | TG_CONCURRENCY | 10 | 全局最大并发 |
 | TG_READ_TIMEOUT | 900 | **单次静默上限**（秒），不是整段耗时上限：等上游响应头、以及每次读取响应体，连续这么久没有任何字节才判超时。5 万 token 上下文的预填充本身就要 100~150s，生产建议 ≥600 |
@@ -101,6 +103,8 @@ TG_DISABLE_HTTPS=1 TG_PORT=3000 python3 token-gateway.py
 | TG_LIST_REFRESH_WAIT | 5 | `?refresh=1` 撞上正在飞的刷新时，最多等多久让它落地（秒）。不等待会拿到旧清单，表现为"刚删掉的模型还在" |
 | TG_TOOL_CAP_TTL | 600 | 模型「是否支持 tools」这层能力判定的缓存秒数（来源：Ollama `/api/show` 的 `capabilities`，以及上游 400 的反向学习）。带 tools 的请求会跳过已判定不支持的模型；设 0 关闭缓存（每次重新探测） |
 | TG_AUTO_MODEL_FALLBACK | 2 | auto 选中的模型在上游被判定不可用时，自动换下一个候选重试的次数。**显式点名模型的请求不降级**（要的就是它，拿不到应当明确报错）；设 0 关闭降级 |
+| TG_WD_ENABLED | 1 | 内置运行时看门狗开关（巡检上游模型服务，挂了自动拉起）。设 0/false/no/off 关闭；详见「运行时看门狗（内置自愈）」 |
+| TG_WD_TARGETS | (空) | 看门狗巡检目标（逗号分隔的 base URL）。空则由 `$TG_CONFIG_DIR/flash-runtime.json` 的 `port` 推出 `http://127.0.0.1:<port>` |
 | TG_CONFIG_DIR | ~/.ollama-token-gateway | config.json / certs / logs 所在目录 |
 | TG_LOG_DIR | `$TG_CONFIG_DIR/logs` | 用量日志 `usage.jsonl` 所在目录 |
 
@@ -133,7 +137,8 @@ launchctl bootout gui/$(id -u)/com.token-gateway.server 2>/dev/null
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.token-gateway.server.plist
 ```
 
-> 注：`bootstrap` 偶尔会返回 `Bootstrap failed: 5: Input/output error` 但作业其实已经起来了——先 `curl :3000/health` 确认，别急着重试成两个实例。
+> 注：`bootstrap` **偶尔**会返回 `Bootstrap failed: 5: Input/output error` 但作业其实已经起来了——先 `curl :3000/health` 确认，别急着重试成两个实例。
+> 但若**每次**都报 EIO、`launchctl print` 也查不到该 label，那就是真的没起来，见故障排查「launchd 加作业恒定 `5: Input/output error`」。
 >
 > 验证是否真的生效：看启动横幅里的 `⏱️ 静默预算: 文本 600s / 带图 150s  非流式转发: 缓冲`，或 `launchctl print gui/$(id -u)/com.token-gateway.server | grep TG_`。只改 Python 代码不需要重新装载，`kickstart -k` 即可。
 
@@ -307,6 +312,30 @@ curl -s http://localhost:3000/v1/chat/completions -D - \
 - 被 `auto_exclude` 排除的模型**不会**从 `/v1/models` 或管理台消失——它们仍然可用，只是 `auto` 不再分配。这样既避免 `auto` 命中不合适的模型，又不影响显式调用。
 - `auto` 只出现在 `/v1/models`，且排在列表**末尾**——不改变「客户端默认取第一个模型」的既有行为；`/api/tags`（Ollama 兼容端点）不含 `auto`。
 - Web 管理台的「模型管理」页会额外显示一条 `auto`（紫色 `🎲 auto` 徽章、大小显示为 `—`），它来自 `/api/admin/models` 的虚拟条目，**不可拉取、不可删除**。
+
+#### 贵模型只服务难请求（`TG_AUTO_DEEP_ONLY`）
+
+`balanced` 的 quality 因子按参数量对数归一，同一候选池里最大的那个**恒得 1.00**。大模型比小模型快时这没关系，反过来就灾难：本机 125B 解码约 40 t/s、27B 约 90 t/s，一句「1+1」也会被判给 125B，把 111 GB 权重的加载和 3 倍延迟花在不需要的地方。速度因子是实测的，会部分抵消，但两者分差往往只有 0.03~0.05，扛不住负载波动。
+
+`TG_AUTO_DEEP_ONLY` 把「贵模型只服务难请求」从**概率事件**变成**硬约束**：
+
+```bash
+TG_AUTO_DEEP_ONLY=qwen3.8-flash-next        # 或写别名 qwen3.8-flash
+```
+
+- 只在**轻量档 / 常规档**把名单里的模型摘出候选池，**深度档不受影响**——所以大模型仍然服务长请求、带图、带 tools 的请求。
+- 「摘空」是刻意的：如果摘完候选池一个不剩，该档**不生效**（回退到全池），否则小机器上一个档位会直接 502。
+- 默认空集，不改变既有行为；等价配置项 `global.auto_deep_only`（数组）。
+
+#### 参数量覆写（`TG_MODEL_PARAMS`）
+
+`auto` 判断模型强弱要靠参数量。对 Ollama 上游能读 `/api/show` 的元数据，对其他运行时就只能**从模型名里猜数字**。换到 gmlx 之后名字是 `qwen3.8-flash-next`，猜不出 → `tier_fit` 与 `quality` 双双落到 0.35 的中性低分，排在有参数量的 `qwen3.8:27b` 之后，**表现为深度档不再选 125B 而退回 27B**（本仓库切运行时踩过的坑）。
+
+```bash
+TG_MODEL_PARAMS=qwen3.8-flash-next=125        # 逗号分隔可写多个：a=8,b=27
+```
+
+优先级：**`TG_MODEL_PARAMS` 覆写 > 上游元数据 > 名字推断**。覆写值同样参与 `TG_AUTO_TIER_IDEALS` 的分档适配度计算。
 
 ### OpenAI 兼容端点
 
@@ -650,6 +679,62 @@ launchctl unload ~/Library/LaunchAgents/com.user.memguard.plist
 
 网关本身监听 `:3000`、按 `config.json` 做 token 配额与限流。mem-guard 是**旁路守卫**：它看的是整台设备内存，越线时通过日志 / webhook / 命令提醒人或触发既定动作，**不直接改动网关进程**。
 
+## 运行时看门狗（内置自愈）
+
+网关自带一个后台线程 `flash-watchdog`，巡检上游模型服务（默认是 `flash-runtime.json` 里那个 gmlx 端口），**挂了就自己拉起来**。
+
+### 为什么不做成第二个守护进程 / cron
+
+1. 这台机器的 launchd 加作业一律 `5: Input/output error`（见故障排查），模型服务本来就是脚本强制启动的——**它崩了没有任何进程会管**；
+2. 网关本身就是常驻进程，巡检挂在它的线程上即可获得自愈能力。少一个进程就少一个「守护者自己也挂了」的失效面；
+3. 巡检需要知道**有没有请求在飞**——这个信息只有网关自己看得见，外部脚本只能靠猜。
+
+### 判据（不是"ping 一下不通就重启"）
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| TG_WD_ENABLED | 1 | 总开关 |
+| TG_WD_INTERVAL | 20 | 探测间隔（秒），下限 5 |
+| TG_WD_PROBE_TIMEOUT | 5 | 单次探测超时（秒） |
+| TG_WD_FAIL_THRESHOLD | 3 | **连续**失败多少次才动手。有在飞请求时阈值自动翻倍——正在服务用户的进程不该被巡检打断 |
+| TG_WD_GRACE | 150 | 重启后静默观察期（秒）。111 GB 权重冷加载约 75s，太短会把它自己打断 |
+| TG_WD_HUNG_TIMEOUT | 300 | 「端口还在听但一直不回」多久判为卡死。要覆盖冷加载 + 长 prefill |
+| TG_WD_BACKOFF_BASE | 150 | 连续重启的退避基数（秒） |
+| TG_WD_BACKOFF_MAX | 1800 | 退避上限（秒） |
+| TG_WD_STABLE_RESET | 300 | 恢复后连续健康多久才把「连续重启次数」清零，避免抖动时反复全速重试 |
+| TG_WD_RESTART_TIMEOUT | 300 | 拉起命令的整体超时（秒） |
+| TG_WD_TARGETS | (空) | 显式目标，逗号分隔；空则跟随 `flash-runtime.json` 的 `port` |
+
+退避序列：`150 → 300 → 600 → 1200 → 1800`（封顶）。
+
+### 怎么看它干了什么
+
+`GET /health`（免鉴权）多了一个 `watchdog` 字段：
+
+```json
+"watchdog": {
+  "enabled": true,
+  "interval_s": 20,
+  "targets": {
+    "http://127.0.0.1:8090": {
+      "state": "healthy",          // healthy | degraded | restarting | backoff | grace
+      "fails": 0,                  // 连续失败次数
+      "restarts": 0,               // 本次连续故障里重启了几次
+      "last_check_ago_s": 7,
+      "next_attempt_in_s": 0
+    }
+  }
+}
+```
+
+日志里对应 `🐕 看门狗: 目标 X 连续 N 次探测失败 → 重启`、`🐕 看门狗: 重启后恢复健康`、`🐕 看门狗: 进入退避，N 秒后再试`。
+
+> 真实自愈验证：`kill -9` 掉 gmlx（pid 30166）后，20:20:44 日志出现 `restarting`（当时已连续 8 次探测失败），20:21:04 转为 `healthy`，新 pid 35091；重启后跑 400 token 用 6.12s（65.4 tok/s）——证明权重是真加载了，不是"端口通了就算活"。
+
+### 与 launchd 的分工
+
+launchd 负责**网关自己**的存活（`KeepAlive`），看门狗负责**上游模型服务**的存活。两者不重叠：网关死了由 launchd 拉起（本机 launchd 的加作业路径坏着，退化为 `start-gateway.py` 手动/脚本拉起），模型服务死了由网关拉起。
+
 ## 故障排查 / 常见问题
 
 ### 模型列表只剩 `auto`，所有请求 502 `Connection refused`
@@ -813,6 +898,43 @@ lsof -nP -iTCP:3000 -sTCP:LISTEN
 launchctl print gui/$(id -u)/com.token-gateway.server | grep -E "state = |pid = "
 ```
 
+### launchd 加作业恒定 `5: Input/output error`（本机实测 2026-11-09）
+
+上一条「EIO 不等于没起来」只覆盖**偶发**误报。这台机器后来演化成**加作业恒定失败**：任何 plist、任何客户端、任何路径都报 EIO，作业确实没起来。排查顺序与实测结论：
+
+| 探针 | 结果 | 说明 |
+|---|---|---|
+| `plutil -lint <plist>` | OK | 语法没问题 |
+| `/var/db/com.apple.xpc.launchd/disabled*.plist` 四个文件 | 全部 lint OK，label 为 `false`（已启用） | 不是"被禁用"导致 |
+| `df -h` | 260 GiB 可用 | 不是磁盘满 |
+| plist 权限 / 属组 / xattr | `644 claw:staff`，只有 `com.apple.provenance` | 与能正常加载的 `com.ollama.custom.plist` 一致 |
+| **最小 plist**（`/bin/sleep 300`，两行） | **仍然 EIO** | 排除"我们这份 plist 复杂" |
+| XML / 二进制 / `600` / `/tmp` / `~/Library/LaunchAgents` | **全部 EIO** | 排除路径、格式、权限 |
+| 经 System Events 的 `do shell script` 执行（父进程不是本轮终端） | **仍然 EIO** | 换一个调用方也复现，不是单一 shell 的问题 |
+| `launchctl print gui/503` | 正常，454 个服务 | 域可读，服务在跑 |
+| `launchctl enable / disable` | rc=0，且**真的写进了** `disabled.503.plist` | 域可写，IPC 通 |
+| `launchctl bootout gui/503/<label>` | rc=0，作业**真的被移除** | 删作业正常 |
+| `launchctl list` | rc=1，无任何输出 | 另一个独立症状 |
+
+结论：**只有「把 plist 交给 launchd 注册成作业」这条路径坏了**（`bootstrap` 与 legacy `load` 都坏），其余操作全部正常。这不是本项目代码的问题，也不是权限/语法问题。已排除的无效尝试：改属组、`chmod 600`、二进制 plist、换目录、`asuser`、`user/503` 域、`submit`、`-F`、清 xattr。
+
+可用的处置（按代价排序）：
+
+```bash
+# ① 以 root 重试，能拿到真正的错误码（launchctl 自己提示的）
+sudo launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.token-gateway.server.plist
+#    root 下若成功 → 无需重启；若报的仍不是权限错，走 ②
+
+# ② 只重启用户态，不重启内核（约 10s，GUI 应用会退出重登）
+sudo launchctl reboot userspace
+
+# ③ 常规做法：注销后重新登录 / 重启
+```
+
+在修好之前，本机用 `tools/start-gateway.py` 强制拉起（见「macOS 后台运行」），网关内部的看门狗负责模型服务，不依赖 launchd。
+
+> 另：`pgrep -x launchd` 在本机**查不到任何 launchd 进程**（`loginwindow` / `WindowServer` 能查到），所以不要用"进程在不在"判断 launchd 是否正常——`launchctl print gui/$(id -u)` 才是可信口径。
+
 ### mem-guard 相关
 | 现象 | 原因 | 处理 |
 |---|---|---|
@@ -963,9 +1085,12 @@ python3 tests/test_upstream_proxy.py # 上游直连：HTTP_PROXY 指向死端口
 python3 tests/test_tool_capability.py # 工具能力：带 tools 时不得选中不支持 tools 的模型（21 项）
 python3 tests/test_model_refresh.py # 清单巡检 + 失效模型指数退避（删掉的模型要消失 / 探测失败要保缓存，14 项）
 python3 tests/test_model_list_cache.py # 列举接口读缓存：不再每次探上游 / 抖动不塌成只剩 auto / 删除当场生效（19 项）
+python3 tests/test_auto_deep_only.py # 深度档白名单：轻/常规档摘掉贵模型，深度档仍可选，摘空不生效（11 项）
+python3 tests/test_model_params.py  # 参数量覆写：覆写优先于元数据与名字推断，非法值忽略（12 项）
+python3 tests/test_watchdog.py      # 看门狗：连续失败才重启 / 在飞时阈值翻倍 / 宽限期 / 退避与重置（25 项）
 ```
 
-十三个脚本都可通过环境变量改指向：
+十六个脚本都可通过环境变量改指向：
 
 | 变量 | 作用 |
 |---|---|
@@ -979,6 +1104,9 @@ python3 tests/test_model_list_cache.py # 列举接口读缓存：不再每次探
 
 | 日期 | 提交 | 内容 |
 |---|---|---|
+| 2026-11-09 | 本次推送 | **内置运行时看门狗（`flash-watchdog` 线程）**：模型服务（gmlx）挂在网关的后台线程上巡检，不再依赖第二个守护进程。判据是「连续 `TG_WD_FAIL_THRESHOLD`（默认 3）次探测 `/v1/models` 失败」，**有在飞请求时阈值自动翻倍**——正在服务用户的进程不该被巡检打断；重启后有 `TG_WD_GRACE`（150s）静默观察期（111 GB 权重冷加载约 75s，太短会把它自己打断），端口通但 300s 不响应判为卡死；连续重启按 `150 → 300 → 600 → 1200 → 1800`s 退避，恢复后需连续健康 `TG_WD_STABLE_RESET`（300s）才把重启计数清零。`/health` 增加 `watchdog` 字段（state/fails/restarts/last_check_ago_s/next_attempt_in_s）。实测 `kill -9` 后 20s 判失败、21:04 恢复，重启后 400 token / 6.12s = 65.4 tok/s（证明权重真加载）。新增 `tests/test_watchdog.py`（25 项） |
+| 2026-11-09 | 本次推送 | **`TG_MODEL_PARAMS` 参数量覆写**：换到 gmlx 后模型名是 `qwen3.8-flash-next`，`_auto_param_b` 从名字里抓不到数字、上游又没有 `/api/show` 元数据 → `tier_fit` 与 `quality` 双双落到 0.35 中性低分，**auto 的深度档不再选 125B 而退回 27B**。新增覆写表，优先级 覆写 > 元数据 > 名字推断，格式 `模型=参数量B`（如 `qwen3.8-flash-next=125`）。新增 `tests/test_model_params.py`（12 项） |
+| 2026-11-09 | 本次推送 | **`TG_AUTO_DEEP_ONLY` 贵模型只服务难请求**：quality 因子按参数量对数归一定标，同一池里最大的模型恒得 1.00；当大模型**比小模型慢**时（本机 125B 约 40 t/s、27B 约 90 t/s），一句「1+1」也会被判给 125B。改为显式声明：名单里的模型只在深度档参与 auto，轻量/常规档从候选池摘掉；**摘空则该档不生效**（回退全池），避免小机器上整档 502。默认空集，不改变既有行为。新增 `tests/test_auto_deep_only.py`（11 项） |
 | 2026-11-08 | `2e143143` | **列举接口改读缓存 + 后台刷新**：`/v1/models` 与 `/api/tags` 以前每次都现场向上游发 1 + N 个同步请求（各 `timeout=3s`），于是客户端轮询列表可能卡几秒，且任一上游抖动 `except: pass` 就让列表**静默少几个模型**（最差只剩 `auto`）——客户端把这个残缺清单缓存下来，看起来就是"模型丢了"。现在列举只读缓存（`TG_MODEL_LIST_TTL`，默认 5s），过期由后台单飞线程刷新；`?refresh=1` 走同步强刷，且会先等掉正在飞的刷新（`TG_LIST_REFRESH_WAIT`），否则刚删掉的模型还会回来一次。上游原始条目（`details`/`size`/`modified_at`）一并缓存，`/api/tags` 字段不变。新增 `tests/test_model_list_cache.py`（19 项，旧版 15/19：6 次列举触发 6 次上游探测、上游 500 时列表塌成只剩 `auto`、慢上游阻塞 2.01s） |
 | 2026-11-08 | `8541cb0b` | **失效模型与拥堵同等待遇 + 上游清单定期巡检**：熔断时长改为按连续失败次数指数退避（`120s → 240s → 480s`，上限 `TG_BAD_MODEL_TTL_MAX`）——定值 120s 时，一个真正坏掉的模型每两分钟就骗走一次上游往返，客户端每次白等一轮；候选池日志与 busy 对齐（`跳过 N 个失效模型: xxx`）。新增巡检线程 `TG_MODEL_REFRESH_INTERVAL`（默认 60s，启动即拉一次），并区分「未知」与「空」：探测失败返回 `None` 保留旧缓存，上游明确答复（含空集）则无条件覆盖——旧实现两者都返回 `set()`，删除被当成失败丢弃，**删掉的模型因此长期留在候选池**。清单变化时对账：消失的模型清掉熔断/失败计数/能力缓存，重新出现的解除旧熔断。新增 `tests/test_model_refresh.py`（14 项，修复前 7/14） |
 | 2026-11-08 | `cb80121d` | **带 `tools` 的请求不再落到不支持工具调用的模型上**：`qwen2.5vl:3b` 这类视觉模型的 `capabilities` 是 `["completion","vision"]`，对话正常但不接受 `tools`，上游回 `400 ... does not support tools`（前缀是 registry 路径）。auto 分档只看请求体量、工具清单不计入字符数，带 tools 的短请求被判成轻量档 → 正好选中它们，表现为"一开工具调用每个请求都 400"。新增能力缓存（`TG_TOOL_CAP_TTL`，来源 `/api/show` 的 `capabilities`，未知一律放行），带 tools 时过滤候选；上游这句 400 按**能力边界**记账而**不进熔断表**（模型对普通对话仍可用），auto 换下一个候选重试；显式点名时直接返回 `400 model_no_tools` 并给出处置建议。新增 `tests/test_tool_capability.py`（21 项，修复前 9/21） |
