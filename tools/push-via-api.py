@@ -23,7 +23,10 @@
     python3 tools/push-via-api.py --create              # 仓库不存在时顺手创建（需要 PAT 有建库权限）
     python3 tools/push-via-api.py --repo o/r --branch main --dry-run
 
-PAT 只在运行时从 ~/.git-credentials 读出，通过内存传给 API，不落盘、不打印。
+PAT 只在运行时从 ~/.git-credentials 读出（该文件必须 600），通过内存传给 API，
+不落盘、不打印、不出现在 argv 里（argv 会被 ps / shell history 记录）。
+若 PAT 过期：生成新 fine-grained token，只需 Contents: Read and write，
+然后 `chmod 600 ~/.git-credentials` 覆盖该文件即可，脚本无需改动。
 """
 import argparse
 import base64
@@ -37,7 +40,7 @@ import urllib.error
 import urllib.request
 
 API = "https://api.github.com"
-DEFAULT_REPO = "alexjingwen/ollama-token-gateway"
+DEFAULT_REPO = "alexjingwen/gateway"
 
 
 def git(*args, binary=False):
@@ -186,10 +189,12 @@ def ensure_repo(api, repo, create, private, dry_run):
             raise
     print(f"[!] 远端仓库 {repo} 不存在（404）。")
     if not create:
-        print("    当前 PAT 是 fine-grained token，实测**没有建库权限**（POST /user/repos -> 403）。")
+        print("    fine-grained PAT 的权限是分项的：推送只需要 Contents: write，")
+        print("    **建库 / 改仓库元数据（description、topics）需要 Administration: write**，")
+        print("    缺这一项时 POST /user/repos、PATCH /repos/... 都会 403（Resource not accessible）。")
         print("    请在 GitHub 网页上新建一个**空仓库**（不要勾 README / .gitignore）：")
-        print(f"        https://github.com/new  name=ollama-token-gateway  visibility={'private' if private else 'public'}")
-        print("    或者给 PAT 加上 Administration: write（建库）权限后重跑本脚本并加 --create。")
+        print(f"        https://github.com/new  name={repo.split('/')[-1]}  visibility={'private' if private else 'public'}")
+        print("    或者给 PAT 补上 Administration: write 后重跑本脚本并加 --create。")
         return False
     if dry_run:
         print("[dry-run] 将创建仓库，实际未创建。")
