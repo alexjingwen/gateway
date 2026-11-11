@@ -1,0 +1,73 @@
+# ⚠️ 仅用于复现「双实例不可行」这个实验，**生产禁止使用**。
+#
+# 这份配置把同一个 105 GB 的 125B 再加载一份（换端口 8092、关 APC）。
+# 实测后果：两个实例各占 ~117 GB 私有内存，合计超过 256 GB 物理内存，
+# 互相驱逐权重页 —— 双方 decode 一起掉到 0.4~0.9 tok/s（正常 90+），
+# 跑完还要约 15 分钟把权重读回页缓存。详见 README
+# 「为什么"不同请求并联"在这台机器上做不到」。
+#
+# 唯一用途：验证「权重是否共享」「第二份的真实内存代价」。
+# 起之前确认没人用，跑完立刻 kill（lsof -nP -iTCP:8092 -t | xargs kill）。
+
+# gmlx 服务配置 —— 由 tools/start-flash.py 按 flash-runtime.json 的
+# "config" 字段加载（config 模式），取代原先的单模型命令行。
+#
+# 单模型（2026-11-11 晚决定：27B 先下线）
+# --------------------------------------
+# 之前挂过 qwen3.8-27b-mlx，想用"轻量请求走 27B / 长上下文走 125B"分摊排队。
+# 实测不值：27B 满血也只有 ~34 tok/s decode，而 125B 带 MTP 投机解码是 60~135
+# tok/s（服务端日志 [spec] rate=1.000），轻量请求走 27B 反而更慢；两台模型同时
+# 常驻还挤内存、拖慢加载。故只留 125B，配置留在 git 历史里，要恢复把 27B 那段
+# 加回来并把 max_models 提到 2 即可。
+#
+# 注意：改动本文件后必须重启 gmlx（会掐断在飞流），见 tools/start-flash.py。
+
+server:
+  host: 127.0.0.1
+  port: 8092
+  no_auth: true
+  menubar: false
+  max_models: 1
+  # 分块显式钉在 2048：APC 的检查点只能落在"分块网格"上（lcm(每轮步长, block_size)），
+  # 网格越粗，尾部需要重算的 tokens 越多。实测 8192 与 2048 的 prefill 吞吐一致
+  # （953 vs 952 tok/s），所以选细的。
+  prefill_step_size: 2048
+  # 前缀缓存（APC，Automatic Prefix Cache）—— 默认**关闭**。
+  # 这是本机最值钱的一个开关：客户端每一轮都把同一段长 system prompt 重发，
+  # 缓存关着就等于每轮把几万 tokens 重新 prefill 一遍（实测 24k prompt
+  # ttft=25.5s、prefill 956 tok/s）。打开后**完全相同**的 prompt 命中整段，
+  # ttft 0.21s；只有末尾几行不同的照样能从最近的检查点续算。
+  cache:
+    enabled: false
+    # 纯注意力架构用块缓存，exact_entries 给混合/循环架构留冗余快照。
+    exact_entries: 8
+    # 不开 SSD 层：本模型是混合注意力（12 qsa / 36 arr 层），APC 存的是
+    # **检查点快照**而不是 KV 块，单个 24k 上下文的快照约 180MB。开磁盘层等于
+    # 每个请求往盘上写若干 GB，写放大远大于它省下的那点重启后首次 prefill。
+    # 需要时加 disk: {path: ~/.cache/gmlx/apc, max_gb: 40} 即可（path 是开关，
+    # 只给 max_gb 不会生效）。
+
+profiles:
+  # 只关思维链，不覆盖任何采样参数（空 sampling 不会盖住 family 默认值）。
+  # 等价于原命令行里的 --thinking off。
+  nothink:
+    thinking: off
+
+models:
+  qwen3.8-flash-next:
+    path: ~/models/qwen3.8-flash-next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf
+    mmproj: ~/models/qwen3.8-flash-next/mmproj-F16.gguf
+    profile: nothink
+    # MTP 投机解码：drafter 必须与本模型配对，多模型下只能写在模型级
+    speculative: true
+    draft_gguf: ~/models/flash-drafter/Qwen3.8-Flash-Next-mtp-drafter-Q4_K_L.gguf
+    # 投机宽度上限：并发注入到繁忙 batch 时，MTP draft 张量与目标 batch 宽度
+    # 不一致会让整批报 "Cannot broadcast ..."。限 1 行可避开该形状冲突。
+    speculative_width_cap: 1
+    # 主力模型常驻，绝不因 --max-models 被换出
+    pin: true
+
+# 不在这里配 aliases。
+# gmlx 的 aliases 会被 /v1/models 当成**独立 id** 返回，且字段（resident/pinned/
+# family）与真实模型完全一样，网关无法分辨 —— 那样同一个上游模型会因为别名拿到
+# 两把串行锁，照样混批。别名统一交给网关的 TG_MODEL_ALIASES 映射到**真实 id**。
