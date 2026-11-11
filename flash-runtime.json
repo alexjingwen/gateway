@@ -6,6 +6,7 @@
   "mmproj": "~/models/qwen3.8-flash-next/mmproj-F16.gguf",
   "speculative": true,
   "draft_gguf": "~/models/flash-drafter/Qwen3.8-Flash-Next-mtp-drafter-Q4_K_L.gguf",
+  "speculative_width_cap": 1,
   "host": "127.0.0.1",
   "port": 8090,
   "no_auth": true,

@@ -91,6 +91,8 @@ TG_DISABLE_HTTPS=1 TG_PORT=3000 python3 token-gateway.py
 | TG_MODEL_PARAMS | (空) | 参数量覆写，格式 `模型=参数量B`（逗号分隔，如 `qwen3.8-flash-next=125`）。优先级 **覆写 > 上游元数据 > 名字推断**；给不提供 `/api/show` 元数据、名字里又没数字的运行时（gmlx 的 `qwen3.8-flash-next`）用 |
 | TG_QPS | 5 | 每 key 每秒请求数 |
 | TG_CONCURRENCY | 10 | 全局最大并发 |
+| TG_MLX_SERIAL | 1 | **把发往 Rapid-MLX 上游的生成请求串行化**（同一时刻只放一个进上游）。原因：gmlx 的 mid-flight 注入路径有形状缺陷 —— 一个请求正在 decode、另一个被塞进同一 batch 时，mrope 位置张量形状不符，整批 `Cannot broadcast array of shape (1,2,2) into shape (3,2,1)`，**两个并发请求 100% 双双 500**。串行是唯一不改上游又能保证 0 个 500 的修法；代价是并发吞吐退化为串行。`/v1/models` 等元数据 GET 不排队。设 0 关闭（回到会 500 的行为） |
+| TG_MLX_SERIAL_WAIT | 300 | 串行队列的最长等待（秒），超时返回 429（而非 500）。客户端侧表现是"排队"，不是"报错" |
 | TG_READ_TIMEOUT | 900 | **单次静默上限**（秒），不是整段耗时上限：等上游响应头、以及每次读取响应体，连续这么久没有任何字节才判超时。5 万 token 上下文的预填充本身就要 100~150s，生产建议 ≥600 |
 | TG_VLM_READ_TIMEOUT | 120 | 多模态（带图）请求的单次静默上限（秒） |
 | TG_BUFFER_NONSTREAM | 1 | 非流式请求**先缓冲完整响应再回给客户端**：上游失败时能返回真实 5xx 与 `Content-Length`，而不是"截断的 200"。设 0 退回旧行为（立即发头、边读边转发，失败即断流） |
@@ -416,7 +418,7 @@ curl http://127.0.0.1:3000/v1/embeddings \
 | 403 | `api_key_disabled` | 该 key 已停用（`active:false`） |
 | 429 | `rate_limit_exceeded` | 超出该 key 的 QPS 限制 |
 | 429 | `quota_exceeded` | 超出每日/每月 token 配额 |
-| 429 | `too_many_requests` | 全局并发已满，请稍后重试 |
+| 429 | `too_many_requests` | 全局并发已满，或 Rapid-MLX 上游串行队列等待超时（`TG_MLX_SERIAL_WAIT`），请稍后重试 |
 | 404 | `key_not_found` | 删除 key 时无匹配 |
 | **504** | `upstream_timeout` | 上游在静默预算（`TG_READ_TIMEOUT`）内没返回任何字节 |
 | **502** | `upstream_broken` | 上游中途断连，或声明了 `Content-Length` 却没发全 |

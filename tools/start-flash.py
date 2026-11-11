@@ -51,6 +51,12 @@ def build_cmd(conf):
         cmd += ["--mmproj", os.path.expanduser(conf["mmproj"])]
     if conf.get("speculative") and conf.get("draft_gguf"):
         cmd += ["--speculative", "--draft-gguf", os.path.expanduser(conf["draft_gguf"])]
+    # 投机宽度上限：并发注入到繁忙 batch 时，MTP draft 张量与目标 batch 宽度不一致
+    # 会让整批报 "Cannot broadcast array of shape ..."（两个并发请求即 100% 500）。
+    # 限制为 1 行投机可避开该形状冲突；0 或不设 = 不限制（原行为）。
+    cap = conf.get("speculative_width_cap")
+    if cap is not None:
+        cmd += ["--speculative-width-cap", str(int(cap))]
     cmd += ["--host", conf.get("host", "127.0.0.1"), "--port", str(conf.get("port", 8090))]
     if conf.get("no_auth", True):
         cmd += ["--no-auth"]

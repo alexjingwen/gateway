@@ -301,6 +301,20 @@ def _https_enabled() -> bool:
 DEFAULT_QPS = _env_num("TG_QPS", 5, minimum=1)     # 每个 Key 每秒请求数
 DEFAULT_MAX_CONCURRENCY = _env_num("TG_CONCURRENCY", 10, minimum=1)  # 全局最大并发
 
+# ── Rapid-MLX 上游串行化 ─────────────────────────────────────────────────────
+# 踩过的坑（真实事故，2026-11-11）：gmlx 的 mid-flight 注入路径有形状缺陷 —— 当一个
+# 请求正在 decode、另一个请求被塞进同一个 batch 时，qwen4_exp/vlm_model.py 的 mrope
+# 位置张量算出 (1,B,L) 而目标要 (3,B,L) 且末维不等，整批 ValueError：
+#     Cannot broadcast array of shape (1,2,2) into shape (3,2,1)
+# 实测：两个并发请求 100% 双双 500（2 并发 3 轮 ×2 全中）；串行 6/6 全 200。
+# 先试过 --speculative-width-cap 1（限制投机行数），**无效** —— 错误与投机宽度无关，
+# 是注入本身。修在 gmlx 内部要改 site-packages（升级即丢），因此在网关这一层排队：
+# 同一时刻只放一个生成请求进 8090。代价是并发吞吐退化为串行，收益是 0 个 500。
+# /v1/models 之类的元数据 GET 不排队（不触发 batch 注入，排队只会让客户端卡住）。
+MLX_SERIAL = os.environ.get("TG_MLX_SERIAL", "1") not in ("0", "false", "no", "off")
+MLX_SERIAL_WAIT = _env_num("TG_MLX_SERIAL_WAIT", 300, minimum=1)
+_mlx_serial_sem = threading.Semaphore(1)
+
 # ==========================
 
 # 全局运行时状态
@@ -3045,8 +3059,8 @@ iframe{{padding-top:0}}
         self._inflight_model = _inflight_model
         self._inflight_released = False
         try:
-            self._proxy("POST", client_ip, api_key, key_cfg, cfg,
-                        body_bytes=body_bytes, original_req=req, model=model)
+            self._proxy_serialized("POST", client_ip, api_key, key_cfg, cfg,
+                                   body_bytes=body_bytes, original_req=req, model=model)
         except Exception as e:
             # 兜底：所有未预期异常都不应让并发计数泄漏
             # 记录完整堆栈：仅打 type+message 时（如 KeyError: 'max_tokens'）无法定位到行号，
@@ -3105,10 +3119,42 @@ iframe{{padding-top:0}}
     # 客户端断开类异常：捕获后静默退出，避免污染日志和堆栈
     _CLIENT_GONE_ERRORS = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)
 
-    def _proxy(self, method: str, client_ip: str, api_key: str, key_cfg: dict, cfg: dict,
-               body_bytes: bytes = b"", original_req: dict = None, model: str = ""):
+    def _proxy_serialized(self, method: str, client_ip: str, api_key: str,
+                          key_cfg: dict, cfg: dict, **kw):
+        """把发往 Rapid-MLX(gmlx) 的**生成**请求串行化（同一时刻只放一个）。
 
-        upstream_host = self._resolve_upstream(model, self.path)
+        根因见 MLX_SERIAL 处的注释：gmlx 的 mid-flight 注入会让 mrope 位置张量
+        形状不符，整批 ValueError，两个并发请求 100% 双双 500。
+        串行是唯一不改上游、又能保证 0 个 500 的修法。
+        """
+        path = self.path.split("?", 1)[0]
+        is_gen = path.startswith("/v1/chat") or path.startswith("/v1/completions")
+        host = self._resolve_upstream(kw.get("model", ""), self.path)
+        if not (is_gen and MLX_SERIAL and host in RAPID_MLX_HOSTS):
+            return self._proxy(method, client_ip, api_key, key_cfg, cfg,
+                               upstream_host=host, **kw)
+        t0 = time.time()
+        got = _mlx_serial_sem.acquire(timeout=MLX_SERIAL_WAIT)
+        _wait = time.time() - t0          # 只记"等锁"的时长，不含生成耗时
+        if not got:
+            log(f"⏳ 上游 {host} 串行队列等待 {MLX_SERIAL_WAIT}s 仍未空出，拒绝本次请求")
+            self._send_error(
+                429, "too_many_requests",
+                f"上游模型正在处理其他请求，排队超过 {MLX_SERIAL_WAIT:g}s，请重试")
+            return
+        try:
+            return self._proxy(method, client_ip, api_key, key_cfg, cfg,
+                               upstream_host=host, **kw)
+        finally:
+            _mlx_serial_sem.release()
+            if _wait > 1.0:
+                log(f"⏳ 上游 {host} 串行排队 {_wait:.1f}s 后放行")
+
+    def _proxy(self, method: str, client_ip: str, api_key: str, key_cfg: dict, cfg: dict,
+               body_bytes: bytes = b"", original_req: dict = None, model: str = "",
+               upstream_host: str = ""):
+
+        upstream_host = upstream_host or self._resolve_upstream(model, self.path)
         url = f"{upstream_host}{self.path}"
         stream = bool(original_req and original_req.get("stream", False)) if original_req else False
 
