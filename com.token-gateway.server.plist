@@ -13,13 +13,17 @@
 		<key>TG_AUTO_DEEP_ONLY</key>
 		<string>qwen3.8-flash-next</string>
 		<key>TG_AUTO_EXCLUDE</key>
-		<string>gemma4:latest,qwen2.5vl:3b</string>
+		<string>gemma4:latest,qwen2.5vl:3b,qwen3.8-27b-mlx,gemma4-9b</string>
 		<key>TG_BUFFER_NONSTREAM</key>
 		<string>1</string>
 		<key>TG_DISABLE_HTTPS</key>
 		<string>1</string>
 		<key>TG_HOST</key>
 		<string>0.0.0.0</string>
+		<key>TG_LANES</key>
+		<string>flash=qwen3.8-flash-next|100|1@http://127.0.0.1:8090,mid=qwen3.8-27b-mlx|50|1@http://127.0.0.1:8090</string>
+		<key>TG_LANE_WAIT</key>
+		<string>600</string>
 		<key>TG_MLX_VLM_API_KEY</key>
 		<string>sk-test</string>
 		<key>TG_MODEL_ALIASES</key>

@@ -21,6 +21,7 @@
 - [上游加速：前缀缓存（APC）与 prefill 调优](#上游加速前缀缓存apc与-prefill-调优)
 - [小模型并行实测（两模型 × 四个并发）](#小模型并行实测两模型--四个并发)
 - [为什么"不同请求并联"在这台机器上做不到](#为什么不同请求并联在这台机器上做不到)
+- [多模型泳道（一个模型一个上下文）](#多模型泳道一个模型一个上下文)
 - [配置字段速查](#配置字段速查)
 - [安全加固](#安全加固)
 - [mem-guard.mjs —— 设备级内存守卫](#mem-guardmjs--设备级内存守卫)
@@ -787,6 +788,120 @@ NO_PROXY='*' ~/gmlx-env/bin/gmlx serve --config lane-8092.yaml   # 同 gguf、�
 python3 tools/bench-lanes.py --lanes http://127.0.0.1:8090,http://127.0.0.1:8092
 ```
 
+## 多模型泳道（一个模型一个上下文）
+
+需求一句话：**让不同模型同时干活，每个模型专门负责一个上下文，新上下文排队等空闲的模型。**
+
+上一章已经证明"同一模型内并发"这条路走不通（带 MTP 的 125B 两并发 100% 500），
+而"多开实例"在这台机器上也不成立（两份 125B 权重超物理内存）。剩下唯一安全的并发层
+就是**模型之间**：每个模型有自己的 `BatchGenerator`，一条在 decode、另一条在 prefill
+时是真并行。这个能力由网关的 `pool` 虚拟模型提供。
+
+### 三条不变量
+
+| 不变量 | 实现 | 为什么 |
+|---|---|---|
+| **粘性**：同一上下文永远用同一个模型 | `X-TG-Context` 头 → 请求体 `conversation_id`/`user` → 前两条消息的指纹，映射到泳道，TTL 30 min / 512 条 LRU | 换模型 = APC 前缀缓存全落空（20k 上下文冷 25s vs 热 0.2s），而且回答风格会跳变 |
+| **独占**：一个模型同时只服务一个上下文 | 每条泳道 `cap`（默认 1）+ `job_ends` 记账 | 带投机的模型靠这条避开 mid-flight 注入缺陷；不带投机的也保持"专门负责"的语义 |
+| **排队**：全忙时等，不拒绝 | 条件变量 + 队列上限（默认 64）+ 超时（默认 600s） | 客户端要的是"等一会出结果"，不是"立刻 429" |
+
+### 分派不是按优先级，而是按"在谁那儿先做完"
+
+第一版按 `rank` 分派（新上下文永远先给 125B，忙了就给 27B）。**实测这是错的**：
+
+| 场景 | 串行（全走 125B） | 按 rank 并行 | 结论 |
+|---|---|---|---|
+| 3 个上下文 × 120 token | 10.6s | 8.1s → **0.96x** | 27B 单请求要 8s，它成了拖后腿的那条 |
+| 5 个上下文 × 120 token | 11.9s | 14.7s → **0.81x** | 比串行还慢 |
+
+原因很简单：把一单交给慢 4 倍的模型，这一单自己就晚了 6s，而它只给快模型省下 2.1s 的排队。
+正确的判据是**预计完成时间**：
+
+```
+pred(lane) = 该泳道最早空出时间 + 每 token 秒数(spb) × 本次生成长度
+```
+
+`spb` 不是常量，而是**每条泳道自己的实测 EWMA**（`elapsed / completion_tokens`，
+只收 ≥8 token 的样本，0.7/0.3 衰减）。125B 热缓存约 0.018 s/tok，27B 约 0.065 s/tok。
+于是：
+
+- 125B 只忙 2s 时，新上下文**等它**（`pred=4.2s`）而不是去 27B（`pred=8s`）；
+- 125B 前面排了 6 单时，新上下文**改派** 27B（`pred` 反超）；
+- 老请求已经被粘住时，为了速度换模型的收益抵不上一次冷 prefill，所以**不换**
+  （想换就设 `TG_LANE_STICKY_WAIT`）。
+
+修正后的实测（同一台机器、同一批请求）：
+
+| 场景 | 串行 | 泳道池并行 | speedup |
+|---|---|---|---|
+| 3 个上下文 × 120 token | 10.6s | 7.6s | **1.39x** |
+| 5 个上下文 × 120 token | 14.8s | 11.7s | **1.26x**（修前 0.81x） |
+
+> 上限是泳道数（2.0x）。拿不到 2x 的原因不是调度，而是**第二条泳道慢 1.7~3.5 倍**：
+> 27B 每 token 0.065s vs 125B 0.018s。泳道速度接近时才能接近线性 —— 这也是"第三泳道
+> 该选谁"的唯一判据（本机的 gemma4-9B 是基座模型、qwen2.5vl:3b 只有 33 tok/s，都不合格）。
+
+### 怎么用
+
+```bash
+# 1) 网关按 TG_LANES 建池（plist 里一行，见下）
+#    紧凑写法：名字=模型[|优先级[|容量]][@上游]
+TG_LANES='flash=qwen3.8-flash-next|100|1@http://127.0.0.1:8090,mid=qwen3.8-27b-mlx|50|1@http://127.0.0.1:8090'
+
+# 2) 客户端把 model 填成 pool（虚拟模型，会出现在 /v1/models 里）
+curl -s http://127.0.0.1:3000/v1/chat/completions \
+  -H "Authorization: Bearer $KEY" -H "X-TG-Context: my-session-42" \
+  -d '{"model":"pool","messages":[{"role":"user","content":"你好"}]}'
+
+# 3) 看池子现状（谁在跑、谁在等、各泳道速度画像）
+curl -s http://127.0.0.1:3000/api/admin/lanes | python3 -m json.tool
+
+# 4) 端到端基准：串行 vs 并行，验证不 500、不粘错、真排队
+python3 tools/bench-pool.py --key "$KEY" --n 3 --gen 120 --fill 20 --rounds 2
+```
+
+响应头会带上这次落在哪、等了多久：`X-Gateway-Lane` / `X-Gateway-Model` /
+`X-Gateway-Lane-Wait` / `X-Gateway-Context`。客户端读这几个头就能自己核对粘性，
+不用翻服务端日志。
+
+`X-TG-Lane: <名字>` 可以强制指定泳道（例如把重活钉在 125B 上），未知名返回 400 并列出
+现有泳道。JSON 写法也支持（适合复杂配置）：
+
+```bash
+TG_LANES='[{"name":"flash","model":"qwen3.8-flash-next","rank":100,"cap":1}]'
+```
+
+### 配置项
+
+| 环境变量 | 默认 | 含义 |
+|---|---|---|
+| `TG_LANES` | 空 | 泳道定义；空 = 不启用（`pool` 返回 503 并提示写法） |
+| `TG_POOL_MODEL` | `pool` | 虚拟模型名 |
+| `TG_LANE_WAIT` | 600 | 排队等模型的上限（秒），超时回 429 `lane_wait_timeout` |
+| `TG_LANE_QUEUE_MAX` | 64 | 等待队列上限，满了回 429 `lane_queue_full` |
+| `TG_LANE_STICKY` | 1 | 粘性开关（0 = 每次按预测重挑） |
+| `TG_LANE_STICKY_TTL` | 1800 | 粘性记忆时长（秒） |
+| `TG_LANE_STICKY_WAIT` | 0 | 0 = 严格粘性；>0 = 等自己的模型超过这个秒数就改派（放弃缓存换时延） |
+| `TG_LANE_PREFER_WAIT` | 400 | 毫秒；最高优先级泳道马上要空出时，愿意为它多等的预算 |
+| `TG_LANE_SEED_TPS` | 30 | 冷启动的速度假设（还没测过任何一单时用它，所有泳道等价 → 退化为按 rank） |
+| `TG_LANE_FAIL_LIMIT` | 3 | 连续失败多少次隔离该泳道（默认隔离 60s 并把它的上下文改派） |
+
+### 踩过的坑
+
+1. **launchd 里的环境变量快照会过期**（这一条最坑）。改完 plist 再 `launchctl kickstart`
+   或让自愈脚本重启，跑起来的进程**还是旧环境**——`/api/admin/lanes` 一直是
+   `enabled: false`，而 plist 里明明有 `TG_LANES`。必须
+   `launchctl bootout gui/$(id -u)/com.token-gateway.server` 之后再用
+   `tools/start-gateway.py` 拉起（本机 `bootstrap` 仍然 EIO），否则 launchd 还会抢端口，
+   你启动的进程连 `Address already in use` 都只是它自己日志里的一行。
+2. **`est_tokens` 必须用生成长度**，不能把 prompt tokens 加进去：`spb` 是"每个生成
+   token 的秒数"，混进 1.6k prompt 会把一单的预计时长放大到 50s，队列预测直接失真，
+   表现就是"该等快模型却跑去了慢模型"（0.96x 那次的另一半原因）。
+3. **忙着的泳道不能返回"0 秒后就空"**：预测过期时 `end - now` 是负数，若按 0 处理，
+   调度会一直挑这条其实拿不到的泳道，最终排队超时。现在忙泳道有 0.05s 下限，
+   并且"预计完成时间已过"= 估算不可信 → 不再为它等。
+4. **`wait_s` 别用 `int()` 截断**：`wait_s=0.2` 会被截成 0，直接变成"零等待超时"。
+
 ## 配置字段速查
 
 `config.json` 顶层三块：`keys` / `global` / `admin`（以 `_comment` 开头的键为自由备注，服务端忽略）。完整样例见 [`config.example.json`](config.example.json)。
@@ -1546,11 +1661,13 @@ python3 tests/test_model_params.py  # 参数量覆写：覆写优先于元数据
 python3 tests/test_watchdog.py      # 看门狗：模块自足性 / 决策矩阵 / 退避序列 / 网关集成 / 缺模块降级（33 项）
 python3 tests/test_flash_runtime.py # gmlx 运行时：config 模式命令 / env 注入 / yaml 不变量（32 项）
 python3 tests/test_serial_lock.py   # 串行锁范围：按 speculative 分档 / 回退开关 / TTL（26 项）
+python3 tests/test_lane_pool.py     # 多模型泳道：解析 / 上下文指纹 / 粘性 / 独占 / 排队 / 速度画像 / 隔离（63 项）
 python3 tools/bench-parallel.py     # 需要真实模型，不是回归用例：并发矩阵（见「小模型并行实测」）
+python3 tools/bench-pool.py         # 需要真实模型：泳道池端到端（串行 vs 并行、粘性、排队，见「多模型泳道」）
 python3 tools/verify-watchdog.py --yes  # 端到端自愈：真 kill -9 上游并等它回来（会中断服务；不带 --yes 为只读）
 ```
 
-十八个脚本都可通过环境变量改指向：
+十九个脚本都可通过环境变量改指向：
 
 | 变量 | 作用 |
 |---|---|
@@ -1564,6 +1681,7 @@ python3 tools/verify-watchdog.py --yes  # 端到端自愈：真 kill -9 上游�
 
 | 日期 | 提交 | 内容 |
 |---|---|---|
+| 2026-11-11 | 本次推送 | **多模型泳道：一个模型一个上下文，多的排队**。新增 `pool` 虚拟模型 + `LanePool` 调度器（粘性 / 独占 / 排队三条不变量），上下文标识走 `X-TG-Context` → 请求体字段 → 前两条消息指纹；分派判据从「优先级」改成**预计完成时间**（`该泳道最早空出 + 实测 spb × 生成长度`，spb 是每条泳道自己的 EWMA）。为什么改：第一版按 rank 分派在实测里是负收益（3 上下文 **0.96×**、5 上下文 **0.81×**，因为 27B 慢 3.5 倍，接一单就晚 6s）；改成按预测后 3 上下文 **1.39×**、5 上下文 **1.26×**。新增 `/api/admin/lanes`、响应头 `X-Gateway-Lane[-Wait]`/`X-Gateway-Context`、连续失败隔离（3 次 → 60s 冷却 + 上下文改派）、`tools/bench-pool.py`（串行/并行对照）与 `tests/test_lane_pool.py`（63 项）。gmlx 恢复两模型常驻（`max_models: 2`）。**最坑的一条**：改 plist 后 launchd 用的还是旧环境快照（`/api/admin/lanes` 恒 `enabled:false`），必须 `bootout` 后再手动拉起。 |
 | 2026-11-11 | 本次推送 | **否证「不同请求并联、同上下文串联」**。三条路全部实测排除：① 同实例同模型并发崩不崩**与上下文无关** —— 两个完全不同前缀、解码 230 token 时 3/3 轮全 500（`Cannot broadcast (1,2,2)→(3,2,1)`，注入方带 draft 的 2 个位置、目标 batch 只要 1 个）；而把解码压到 1 token 就「通过」，纯属窗口太窄，不能当证据。② 双实例同 125B **内存直接否掉**：第二份不是共享，是真实 117.4 GB 私有分配，两份合计超物理内存 → 互相驱逐权重页 → 双方 decode 0.4~0.9 tok/s（正常 90+），恢复要 15 分钟。原先用 9.6 GB 模型得出的「mmap 共享」结论是假象（内存足够时看不出驱逐），已更正。③ 按上下文分锁不成立（不同上下文走同一条 batch 组装路径）。唯一通路是**跨模型**（已验证 1.99×）。新增 `tools/probe-prefix-concurrency.py`、`tools/bench-lanes.py`、`lane-8092.yaml`（复现用，标了生产禁用）。 |
 | 2026-11-11 | 本次推送 | **并行实测：小模型批处理近乎线性，串行锁按 speculative 收窄**。隔离实例上（同进程驻留 gemma4-9B + qwen3.8-27B，cache 关闭）：9B 在 n=4 时聚合 109→**216 tok/s（1.99×）**，27B 32→53（1.65×），异模型组合 50.8→77.6（1.53×）；每请求 decode 相应从 112→57 / 56→25 —— 总吞吐涨了，单请求慢一倍。关键结论：`Cannot broadcast` 只发生在**带投机**的模型上，gemma / 27B 同模型 4 并发×4 轮输出与串行**逐字节一致**、0 错误，所以网关串行锁改为按 `/v1/models` 的 `speculative` 分档（`TG_MLX_SERIAL_MODE=spec|model|host`），小模型不再白白排队。新增 `tools/bench-parallel.py`（seq/par 对照，输出 speedup / 并发度 / agg tok/s）与 `gmlx-small.yaml`（隔离实例配置，可完整复现）。 |
 | 2026-11-11 | 本次推送 | **上游开出前缀缓存（APC）+ 27B 副本下线**：gmlx 的 APC 默认关闭，`server.cache.enabled` 打开后完全相同的 prompt ttft 25.5s→**0.21s**；再把 `prefill_step_size` 钉到 2048（决定检查点网格）后，真实 agent 形态下可变尾部的 ttft 从 5.75s 降到 **1.00s**。代价是冷启动多付约 9s 的快照存储（盈亏平衡 N≈1.75 轮）。同时把 27B 副本从 gmlx 下线：它满速只有 34.6 tok/s，而 125B 带 MTP 是 60~135 tok/s，拿它分摊轻量请求反而更慢。新增 `tools/bench-prefill.py`（ttft/prefill/decode 基准，支持 system 前缀与强制冷启动）与 `tests/test_flash_runtime.py`（29 项，含 yaml/env 不变量）。 |

@@ -1,13 +1,15 @@
-# gmlx 服务配置 —— 由 tools/start-flash.py 按 flash-runtime.json 的
-# "config" 字段加载（config 模式），取代原先的单模型命令行。
-#
-# 单模型（2026-11-11 晚决定：27B 先下线）
-# --------------------------------------
-# 之前挂过 qwen3.8-27b-mlx，想用"轻量请求走 27B / 长上下文走 125B"分摊排队。
-# 实测不值：27B 满血也只有 ~34 tok/s decode，而 125B 带 MTP 投机解码是 60~135
-# tok/s（服务端日志 [spec] rate=1.000），轻量请求走 27B 反而更慢；两台模型同时
-# 常驻还挤内存、拖慢加载。故只留 125B，配置留在 git 历史里，要恢复把 27B 那段
-# 加回来并把 max_models 提到 2 即可。
+# 多模型泳道（2026-11-11 深夜改：125B + 27B + 9B 三条泳道）
+# ----------------------------------------------------------
+# 背景：单靠 125B 只能串行（带 MTP，同模型两并发 100% 500），并发请求全在网关排队。
+# 用户诉求是"不同模型同时干活、每个模型专门负责一个上下文、新上下文排队等空闲模型"，
+# 于是把并发做在最安全的那一层 —— **模型之间**：每个模型有自己的 BatchGenerator，
+# 一条在 decode、另一条在 prefill 时是真并行；同一模型内部仍然严格串行。
+# 三条模型全部 pin 住常驻（max_models=3），由网关的泳道池按优先级分派：
+#   flash(rank 100) → mid(50) → light(10)，全忙才排队。
+# 与"轻量请求走 27B"的老思路区别：老思路是**替代**（单请求变慢就是亏），这里是
+# **叠加**（125B 在忙时，27B 那条线本来闲着，用 34 tok/s 换非零吞吐是纯赚）。
+# 代价：三条模型权重合计约 95 GB（68 + 17 + 10），在 256 GB 机器上要给 125B 留够
+# 页缓存空间；若观察到 125B decode 掉到 20 tok/s 以下，说明内存吃紧，往下删一条。
 #
 # 注意：改动本文件后必须重启 gmlx（会掐断在飞流），见 tools/start-flash.py。
 
@@ -16,7 +18,7 @@ server:
   port: 8090
   no_auth: true
   menubar: false
-  max_models: 1
+  max_models: 2
   # 分块显式钉在 2048：APC 的检查点只能落在"分块网格"上（lcm(每轮步长, block_size)），
   # 网格越粗，尾部需要重算的 tokens 越多。实测 8192 与 2048 的 prefill 吞吐一致
   # （953 vs 952 tok/s），所以选细的。
@@ -55,6 +57,19 @@ models:
     speculative_width_cap: 1
     # 主力模型常驻，绝不因 --max-models 被换出
     pin: true
+
+  # 第二条泳道：125B 在忙时的**叠加**（不是替代）。34 tok/s 虽慢，但那条线本来空着。
+  # 不带投机 → 走不到 MTP 的 mid-flight 注入缺陷，即使网关放开并发也安全。
+  qwen3.8-27b-mlx:
+    path: ~/models/extra/qwen3.8-27b.gguf
+    mmproj: ~/models/extra/mmproj-qwen3.8-27b.gguf
+    profile: nothink
+    pin: true
+
+  # 曾经计划过第三条泳道 gemma4-9b（~9.6 GB），实测**不可用**：那个 blob 是基座模型，
+  # 模板只有 `{{ .Prompt }}`，chat 请求会立刻吐 EOS（返回空串），completions 则是
+  # "The Capital of France is The Capital of France is…" 的复读。所以它只留在
+  # gmlx-small.yaml 里当并发实验的负载发生器，不进生产。第三条泳道的坑见 README。
 
 # 不在这里配 aliases。
 # gmlx 的 aliases 会被 /v1/models 当成**独立 id** 返回，且字段（resident/pinned/

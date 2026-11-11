@@ -31,9 +31,10 @@ import socket
 import select
 import ssl
 import base64
+import hashlib
 import struct
 from pathlib import Path
-from collections import defaultdict, deque
+from collections import defaultdict, deque, OrderedDict
 from typing import Dict, List, Optional, Tuple
 
 
@@ -413,6 +414,394 @@ def _mlx_sem_for(key: str) -> threading.Semaphore:
             sem = threading.Semaphore(1)
             _mlx_serial_sems[key] = sem
         return sem
+
+
+# ── 多模型泳道（lane pool）───────────────────────────────────────────────────
+# 需求（2026-11-11 晚，用户表述）：让**不同模型同时干活**，每个模型专门负责一个
+# 上下文，新上下文排队等空闲模型 —— 也就是把并发做在「模型之间」，而不是「模型之内」。
+#
+# 为什么这样才是对的方向（前面三步实测的结论）：
+#   · 125B 带 MTP：同一模型两个并发 100% 双双 500（mid-flight 注入缺陷），只能串行；
+#   · 27B / 9B 不带投机：同模型 4 并发**安全**，但吞吐只有 1.65x / 1.99x（同模型
+#     共享一个 BatchGenerator，解码步长被最慢的那条拖着走）；
+#   · 不同模型各有自己的 BatchGenerator —— 一条在 decode、另一条在 prefill 时是真并行。
+# 所以"一个模型一个上下文"能拿到的并行，是任何单模型并发都拿不到的。
+#
+# 三条不变量（实现和测试都围着它们转）：
+#   1) **粘性**：同一上下文固定用同一个模型。否则多轮对话每次换模型，APC 前缀缓存
+#      全部落空（冷 25s vs 热 0.2s，差两个数量级），而且不同模型的口吻/能力会跳变。
+#   2) **独占**：一个模型同一时刻只服务一个上下文（cap 默认 1）。带投机的模型靠这条
+#      避开上面那个 500；不带投机的模型也保持独占，语义才和"专门负责一个上下文"一致。
+#   3) **排队而非拒绝**：模型全忙时新上下文进队列等，不直接 429。排队只在超时
+#      (TG_LANE_WAIT) 或队列满 (TG_LANE_QUEUE_MAX) 时才拒绝。
+#
+# 配置（TG_LANES），两种写法都支持：
+#   紧凑：flash=qwen3.8-flash-next|100|1,mid=qwen3.8-27b-mlx|50|1
+#         名字=模型[|优先级[|容量]][@http://host:port]
+#   JSON：[{"name":"flash","model":"qwen3.8-flash-next","rank":100,"cap":1}]
+# 模型名允许带 `:`（Ollama tag 如 gemma4:latest），所以分隔符用 `|` 而不是 `:`。
+LANE_POOL_MODEL = (os.environ.get("TG_POOL_MODEL", "pool") or "pool").strip()
+LANE_WAIT_S = _env_num("TG_LANE_WAIT", 600, minimum=1)
+LANE_QUEUE_MAX = _env_num("TG_LANE_QUEUE_MAX", 64, minimum=1)
+LANE_STICKY = os.environ.get("TG_LANE_STICKY", "1") not in ("0", "false", "no", "off")
+LANE_STICKY_TTL_S = _env_num("TG_LANE_STICKY_TTL", 1800, minimum=0)
+LANE_CTX_MAX = _env_num("TG_LANE_CTX_MAX", 512, minimum=1)
+LANE_FAIL_LIMIT = _env_num("TG_LANE_FAIL_LIMIT", 3, minimum=1)
+LANE_DOWN_COOLDOWN_S = _env_num("TG_LANE_DOWN_COOLDOWN", 60, minimum=1)
+# 新上下文挑泳道时的"看一眼"预算（秒）：最高优先级的模型正在收尾时，新上下文宁可等
+# 半秒也要落在好模型上。为什么需要：客户端收到最后一个字节时，服务端线程的 finally
+# 可能还没跑完（还泳道），紧接着串行发出的下一个请求就会看到"最好的模型忙"而降级到
+# 慢模型 —— 而这个上下文会被粘住半小时。只在**存在空闲泳道**时才等，绝不无谓阻塞。
+LANE_PREFER_WAIT_S = _env_num("TG_LANE_PREFER_WAIT", 400, minimum=0) / 1000.0
+# 粘性上下文的"改派预算"（秒）。默认 0 = 严格粘性：认了哪个模型就一直等它，哪怕别的
+# 模型闲着 —— 这是"一个模型专门负责一个上下文"的字面语义，也是 APC 命中率最高的做法。
+# 代价是队头阻塞：某上下文排在 flash 后面，mid 却空转。把它设成 >0（例如 5）就在
+# 等满这个时长后**改派**到空闲模型（放弃缓存换时延）。默认关，因为改派的代价
+# （一次冷 prefill，20k 上下文实测 25s）通常比多等几秒更贵。
+LANE_STICKY_WAIT_S = _env_num("TG_LANE_STICKY_WAIT", 0, minimum=0)
+# 冷启动时的"每 token 秒数"种子：还没测过任何一单时，所有泳道按同一个速度假设，
+# 选道退化为按优先级（rank）。默认 30 tok/s（实测 125B 热缓存 ~55、27B ~15）。
+LANE_DEFAULT_SPB_S = 1.0 / max(1.0, _env_num("TG_LANE_SEED_TPS", 30, minimum=1))
+# 上下文标识的请求头优先级：客户端能显式给就给，给不了就靠指纹
+LANE_CTX_HEADERS = ("x-tg-context", "x-context-id", "x-session-id", "x-conversation-id")
+LANE_CTX_BODY_KEYS = ("conversation_id", "session_id", "context_id", "user")
+
+
+def _parse_lanes(raw: str) -> List[dict]:
+    """解析 TG_LANES → [{name, model, host, rank, cap}]。非法条目跳过（不抛）。"""
+    raw = (raw or "").strip()
+    if not raw:
+        return []
+    lanes: List[dict] = []
+    if raw[:1] in "[{":
+        try:
+            data = json.loads(raw)
+        except Exception as e:
+            # 这里在模块导入期执行，log() 还没定义 → 只能直接写 stderr
+            print(f"⚠️ TG_LANES JSON 解析失败（{e}），泳道池不启用", file=sys.stderr)
+            return []
+        if isinstance(data, dict):
+            data = data.get("lanes") or []
+        for i, item in enumerate(data if isinstance(data, list) else []):
+            if not isinstance(item, dict) or not item.get("model"):
+                continue
+            lanes.append({
+                "name": str(item.get("name") or item["model"]),
+                "model": str(item["model"]),
+                "host": str(item.get("host") or "").rstrip("/"),
+                "rank": int(item.get("rank") or 100 - i),
+                "cap": max(1, int(item.get("cap") or 1)),
+            })
+        return lanes
+    for i, item in enumerate(re.split(r"[,;]", raw)):
+        item = item.strip()
+        if not item:
+            continue
+        named = "=" in item
+        name, spec = item.split("=", 1) if named else ("", item)
+        host = ""
+        if "@" in spec:
+            spec, host = spec.rsplit("@", 1)
+            host = host.strip().rstrip("/")
+        parts = [p.strip() for p in spec.split("|")]
+        model = parts[0]
+        rank = int(parts[1]) if len(parts) > 1 and parts[1].lstrip("-").isdigit() else 100 - i
+        cap = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 1
+        if not model:
+            continue
+        lanes.append({"name": (name.strip() or model), "model": model,
+                      "host": host, "rank": rank, "cap": max(1, cap)})
+    return lanes
+
+
+def _lane_context_key(headers, req: dict) -> str:
+    """一个上下文的稳定标识：显式头 > 请求体字段 > 内容指纹。
+
+    指纹取**前两条消息**（system + 首条用户消息）：多轮对话里这两条不变，
+    而后续每轮追加的历史会变，所以不能拿整段 messages 去算。
+    """
+    for h in LANE_CTX_HEADERS:
+        v = (headers.get(h) or "").strip() if headers else ""
+        if v:
+            return "h:" + v[:96]
+    for k in LANE_CTX_BODY_KEYS:
+        v = req.get(k)
+        if isinstance(v, str) and v.strip():
+            return f"b:{k}:{v.strip()[:96]}"
+    msgs = req.get("messages") or []
+    parts = []
+    for m in msgs[:2]:
+        if not isinstance(m, dict):
+            continue
+        c = m.get("content")
+        if isinstance(c, list):
+            c = "".join(str(p.get("text", "")) for p in c if isinstance(p, dict))
+        parts.append(f"{m.get('role', '')}\x1f{str(c or '')[:4000]}")
+    if not parts:
+        parts = [str(req.get("prompt", ""))[:4000]]
+    return "fp-" + hashlib.sha1("\x1e".join(parts).encode("utf-8", "replace")).hexdigest()[:12]
+
+
+class LaneTimeout(Exception):
+    """排队等空闲模型超时。"""
+
+
+class LaneQueueFull(Exception):
+    """等待中的上下文已达队列上限。"""
+
+
+class LanePool:
+    """把上下文分派到互不干扰的模型上（一个模型 = 一条泳道）。
+
+    线程安全：所有状态在 `self._cv` 里。典型的"资源池 + 粘性亲和 + FIFO 唤醒"。
+    刻意不用每泳道一把 Semaphore：粘性 + 队列上限 + 优先级挑空闲这三件事需要
+    在同一把锁里原子地决定，拆成多把锁会造出"两边都以为对方会接"的死角。
+    """
+
+    def __init__(self, lanes: List[dict], *, name: str = "", wait_s: int = 0,
+                 queue_max: int = 0, sticky: bool = True, sticky_ttl_s: int = 0,
+                 ctx_max: int = 0, fail_limit: int = 0, cooldown_s: int = 0,
+                 prefer_wait_s: Optional[float] = None, sticky_wait_s: Optional[float] = None,
+                 default_spb_s: Optional[float] = None):
+        self.name = name or LANE_POOL_MODEL
+        self.wait_s = float(wait_s) if wait_s else float(LANE_WAIT_S)
+        self.queue_max = int(queue_max or LANE_QUEUE_MAX)
+        self.sticky = sticky
+        self.sticky_ttl_s = int(sticky_ttl_s if sticky_ttl_s is not None else LANE_STICKY_TTL_S)
+        self.ctx_max = int(ctx_max or LANE_CTX_MAX)
+        self.fail_limit = int(fail_limit or LANE_FAIL_LIMIT)
+        self.cooldown_s = float(cooldown_s or LANE_DOWN_COOLDOWN_S)
+        self.prefer_wait = (LANE_PREFER_WAIT_S if prefer_wait_s is None
+                            else max(0.0, float(prefer_wait_s)))
+        self.sticky_wait = (LANE_STICKY_WAIT_S if sticky_wait_s is None
+                            else max(0.0, float(sticky_wait_s)))
+        self.default_spb = (LANE_DEFAULT_SPB_S if default_spb_s is None
+                            else max(1e-5, float(default_spb_s)))
+        self._cv = threading.Condition(threading.Lock())
+        self._lanes: List[dict] = []
+        self._by_name: Dict[str, dict] = {}
+        for spec in lanes or []:
+            lane = {
+                "name": spec["name"], "model": spec["model"], "host": spec.get("host", ""),
+                "rank": int(spec.get("rank", 0)), "cap": max(1, int(spec.get("cap", 1))),
+                "busy": 0, "served": 0, "failed": 0, "fail_streak": 0,
+                "down_until": 0.0, "ctx": None, "wait_sum": 0.0, "wait_max": 0.0,
+                "last_used": 0.0,
+                # 速度画像：spb = 每生成 token 的实测秒数（EWMA）；未知时用默认值，
+                # 于是所有泳道"看起来一样快"，选道退化成按 rank —— 首单的代价。
+                "spb": spec.get("spb"), "spb_n": 0, "job_ends": [],
+            }
+            self._lanes.append(lane)
+            self._by_name[lane["name"]] = lane
+        self._ctx: "OrderedDict[str, tuple]" = OrderedDict()   # ctx -> (lane_name, ts)
+        self._waiting = 0
+        self._tickets = itertools.count(1)
+        self._metrics = {"assigns": 0, "queued": 0, "timeouts": 0,
+                         "queue_full": 0, "failures": 0, "quarantines": 0,
+                         "migrations": 0}
+
+    # ---- 内部：选泳道 ----
+    @property
+    def enabled(self) -> bool:
+        return bool(self._lanes)
+
+    def _free(self, lane: dict, now: float) -> bool:
+        return lane["busy"] < lane["cap"] and lane["down_until"] <= now
+
+    def _pick_free(self, now: float):
+        """空闲泳道里挑一条：预测单请求耗时短者优先，其次优先级高的那条。"""
+        free = [l for l in self._lanes if self._free(l, now)]
+        if not free:
+            return None
+        return min(free, key=lambda l: (self.spb_of(l), -l["rank"]))
+
+    # ---- 速度画像：一条泳道"每个生成 token 要多少秒"（含 prefill，实测 EWMA）----
+    # 为什么需要它：不同模型的速度差可以到 4 倍（125B+MTP 热缓存 ~0.018 s/tok，
+    # 27B ~0.065 s/tok）。如果只按优先级分派，把一个请求丢给慢模型，它自己就要多花
+    # 3~4 倍时间 —— 实测 3 个上下文并行反而比串行慢（0.96x）。正确的判据是
+    # **"在谁那儿先做完"**：等快模型 t 秒 vs 立刻上慢模型，比的是预计完成时间。
+    def spb_of(self, lane: dict) -> float:
+        return lane["spb"] or self.default_spb
+
+    def _wait_of(self, lane: dict, now: float) -> float:
+        """这条泳道最早什么时候能接下一单（秒）。
+
+        忙着的泳道永远给一个下限（0.05s），不返回 0：预测已经过期（实际比估算更久）
+        时 ends[0]-now 会是负数，若就此返回 0，会和"真的空闲"混淆，导致排队逻辑
+        一直挑这条其实拿不到的泳道。
+        """
+        if lane["busy"] < lane["cap"]:
+            return 0.0
+        ends = lane["job_ends"]
+        if not ends:
+            return 0.05
+        return max(0.05, ends[0] - now)
+
+    def _pred(self, lane: dict, now: float, est_tokens: int) -> float:
+        """预计这条泳道把我的请求做完要多久（秒）。"""
+        return self._wait_of(lane, now) + self.spb_of(lane) * max(1, est_tokens)
+
+    def _overdue(self, lane: dict, now: float) -> bool:
+        """忙着的泳道是否已经超过预计完成时间（= 估算不准，别再为它等）。"""
+        if lane["busy"] < lane["cap"]:
+            return False
+        ends = lane["job_ends"]
+        return (not ends) or ends[0] <= now
+
+    def _select(self, ctx: str, forced: str, now: float, est_tokens: int,
+                allow_top_wait: bool = True):
+        """选一条泳道，返回 (lane, reason)。lane=None 表示当前没有任何可用泳道。"""
+        if forced:
+            return self._by_name.get(forced), "forced"
+        if self.sticky:
+            rec = self._ctx.get(ctx)
+            if rec and (self.sticky_ttl_s <= 0 or now - rec[1] <= self.sticky_ttl_s):
+                lane = self._by_name.get(rec[0])
+                if lane is not None and lane["down_until"] <= now:
+                    return lane, "sticky"      # 粘性优先：忙也等它
+            elif rec:
+                self._ctx.pop(ctx, None)        # 粘性过期 → 当新上下文
+        usable = [l for l in self._lanes if l["down_until"] <= now]
+        if not usable:
+            return None, "down"
+        # 优先级最高的那条马上（prefer_wait 内）就空出来 → 等它，别急着降级
+        top = max(usable, key=lambda l: (l["rank"], -l["busy"]))
+        if (allow_top_wait and not self._overdue(top, now)
+                and self._wait_of(top, now) <= self.prefer_wait):
+            return top, "top"
+        return min(usable, key=lambda l: (self._pred(l, now, est_tokens), -l["rank"])), "pred"
+
+    def _bind(self, ctx: str, lane_name: str):
+        if not self.sticky:
+            return
+        self._ctx[ctx] = (lane_name, time.time())
+        self._ctx.move_to_end(ctx)
+        while len(self._ctx) > self.ctx_max:
+            self._ctx.popitem(last=False)
+
+    # ---- 对外 ----
+    def acquire(self, ctx: str, *, lane: str = "", timeout: Optional[float] = None,
+                est_tokens: int = 0):
+        """取一条泳道。返回 (lane_dict, 等待秒数)；超时/队满抛异常。"""
+        limit = self.wait_s if timeout is None else float(timeout)
+        deadline = time.monotonic() + limit
+        t0 = time.monotonic()
+        t_pref = None
+        t_sticky = None
+        with self._cv:
+            while True:
+                now = time.time()
+                # 粘性上下文等太久 + 别的模型空着 → 允许改派（默认关，见 LANE_STICKY_WAIT_S）
+                if self.sticky_wait > 0 and not lane:
+                    _rec = self._ctx.get(ctx)
+                    _bl = self._by_name.get(_rec[0]) if _rec else None
+                    if _bl is not None and _bl["busy"] >= _bl["cap"] and self._pick_free(now) is not None:
+                        if t_sticky is None:
+                            t_sticky = now + self.sticky_wait
+                        if now >= t_sticky:
+                            self._ctx.pop(ctx, None)
+                            self._metrics["migrations"] += 1
+                            log(f"↔️ 上下文 {ctx} 等 {_bl['name']} 超过 {self.sticky_wait:g}s，改派")
+                        else:
+                            self._cv.wait(min(0.2, max(t_sticky - now, 0.01)))
+                            continue
+                chosen, why = self._select(ctx, lane, now, est_tokens,
+                                           allow_top_wait=(t_pref is None or now < t_pref))
+                if why == "top" and chosen is not None and chosen["busy"] >= chosen["cap"] and t_pref is None:
+                    # 开始等"最好的那条"，等满 prefer_wait 还没空出来就改看预测
+                    t_pref = now + self.prefer_wait
+                if chosen is not None and chosen["busy"] < chosen["cap"]:
+                    chosen["busy"] += 1
+                    chosen["last_used"] = now
+                    chosen["ctx"] = ctx
+                    # 记下预计占用时长：队列里的后来者据此算"在谁那儿先做完"
+                    chosen["job_ends"].append(now + max(0.05, self.spb_of(chosen) * max(1, est_tokens)))
+                    chosen["job_ends"].sort()
+                    self._bind(ctx, chosen["name"])
+                    waited = time.monotonic() - t0
+                    chosen["wait_sum"] += waited
+                    chosen["wait_max"] = max(chosen["wait_max"], waited)
+                    self._metrics["assigns"] += 1
+                    if waited > 0.05:
+                        self._metrics["queued"] += 1
+                    return chosen, waited
+                if time.monotonic() >= deadline:
+                    self._metrics["timeouts"] += 1
+                    raise LaneTimeout(
+                        f"等待空闲模型超过 {limit:g}s（{len(self._lanes)} 条泳道全忙，"
+                        f"队列 {self._waiting}）")
+                if self._waiting >= self.queue_max:
+                    self._metrics["queue_full"] += 1
+                    raise LaneQueueFull(f"等待队列已满（{self.queue_max}），请稍后重试")
+                self._waiting += 1
+                try:
+                    # 短轮询：任何一次 release 都会 notify，这里只是防丢通知的兜底
+                    self._cv.wait(min(max(deadline - time.monotonic(), 0.01), 0.05))
+                finally:
+                    self._waiting -= 1
+
+    def release(self, lane: dict, *, error: bool = False, tokens: int = 0,
+                elapsed: float = 0.0):
+        with self._cv:
+            lane["busy"] = max(0, lane["busy"] - 1)
+            lane["ctx"] = None
+            lane["served"] += 1
+            if lane["job_ends"]:
+                lane["job_ends"].pop(0)
+            # 更新速度画像（样本太短会被首 token 延迟主导，只收 >=8 token 的样本）
+            if tokens >= 8 and elapsed > 0:
+                s = elapsed / tokens
+                lane["spb"] = s if lane["spb"] is None else (0.7 * lane["spb"] + 0.3 * s)
+                lane["spb_n"] += 1
+            if error:
+                lane["failed"] += 1
+                lane["fail_streak"] += 1
+                self._metrics["failures"] += 1
+                if lane["fail_streak"] >= self.fail_limit:
+                    lane["down_until"] = time.time() + self.cooldown_s
+                    lane["fail_streak"] = 0
+                    self._metrics["quarantines"] += 1
+                    dropped = [c for c, (n, _t) in self._ctx.items() if n == lane["name"]]
+                    for c in dropped:
+                        self._ctx.pop(c, None)
+                    log(f"🚧 泳道 {lane['name']} 连续失败，隔离 {self.cooldown_s}s"
+                        f"（{len(dropped)} 个上下文改派）")
+            else:
+                lane["fail_streak"] = 0
+            self._cv.notify_all()
+
+    def snapshot(self) -> dict:
+        now = time.time()
+        with self._cv:
+            lanes = []
+            for lane in self._lanes:
+                lanes.append({
+                    "name": lane["name"], "model": lane["model"], "host": lane["host"],
+                    "rank": lane["rank"], "cap": lane["cap"], "busy": lane["busy"],
+                    "served": lane["served"], "failed": lane["failed"],
+                    "current_context": lane["ctx"],
+                    "avg_wait_s": round(lane["wait_sum"] / lane["served"], 3) if lane["served"] else 0,
+                    "max_wait_s": round(lane["wait_max"], 3),
+                    "spb_s_per_tok": round(self.spb_of(lane), 4),
+                    "spb_samples": lane["spb_n"],
+                    "est_wait_s": round(self._wait_of(lane, now), 2),
+                    "down_for_s": round(max(0.0, lane["down_until"] - now), 1),
+                    "idle_for_s": round(now - lane["last_used"], 1) if lane["last_used"] else None,
+                })
+            return {
+                "pool_model": self.name, "enabled": self.enabled,
+                "wait_s": self.wait_s, "queue_max": self.queue_max,
+                "sticky": self.sticky, "sticky_ttl_s": self.sticky_ttl_s,
+                "prefer_wait_s": round(self.prefer_wait, 3),
+                "waiting": self._waiting, "contexts": len(self._ctx),
+                "lanes": lanes, "metrics": dict(self._metrics),
+            }
+
+
+LANE_POOL = LanePool(_parse_lanes(os.environ.get("TG_LANES", "")),
+                     name=LANE_POOL_MODEL, sticky=LANE_STICKY,
+                     sticky_ttl_s=LANE_STICKY_TTL_S)
+
 
 # ==========================
 
@@ -1710,6 +2099,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             pass  # 客户端已断开，静默处理
 
     def _send_error(self, status: int, code: str, message: str):
+        self._resp_status = status      # 供泳道归还时判断这条是不是上游故障
         self._send_json({
             "error": {
                 "message": message,
@@ -2918,6 +3308,11 @@ iframe{{padding-top:0}}
                     all_models.append({"id": AUTO_MODEL_NAME, "object": "model",
                                        "created": 0, "owned_by": "gateway"})
                     seen.add(AUTO_MODEL_NAME)
+                # 泳道池虚拟模型：客户端把 model 填成它，网关按上下文分派到空闲模型
+                if LANE_POOL.enabled and LANE_POOL.name not in seen:
+                    all_models.append({"id": LANE_POOL.name, "object": "model",
+                                       "created": 0, "owned_by": "gateway"})
+                    seen.add(LANE_POOL.name)
                 body = json.dumps({"object": "list", "data": all_models}).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -3068,6 +3463,21 @@ iframe{{padding-top:0}}
                 path = "/v1/completions"
                 self.path = path + ("?" + self.path.split("?", 1)[1] if "?" in self.path else "")
 
+        # ---- 泳道池虚拟模型：把上下文分派到空闲的模型上 ----
+        # 解析必须在白名单/存在性检查之前：`pool` 不是真模型名。
+        # 这里只**定型**（是不是泳道请求、上下文是谁），真正的取泳道放在额度检查之后，
+        # 因为排队可能要等几十秒，不该在排队前就把额度/并发账算掉。
+        _lane_hint = (self.headers.get("X-TG-Lane") or "").strip()
+        _pool_req = bool(model == LANE_POOL_MODEL or _lane_hint) and LANE_POOL.enabled
+        _lane_ctx = ""
+        if model == LANE_POOL_MODEL and not LANE_POOL.enabled:
+            self._send_error(503, "lane_pool_disabled",
+                             f"模型 '{LANE_POOL_MODEL}' 是泳道池虚拟模型，但网关没配 TG_LANES。"
+                             f"示例：TG_LANES='flash=qwen3.8-flash-next|100|1,light=gemma4-9b|10|1'")
+            return
+        if _pool_req:
+            _lane_ctx = _lane_context_key(self.headers, req)
+
         # ---- auto 虚拟模型：从本地可用模型池自动分配 ----
         # 必须在白名单/存在性检查之前解析成真实模型名：后续上下文窗口、图片过滤、
         # 上游路由、用量记录全部按真实模型处理，行为与直接指定该模型完全一致。
@@ -3087,12 +3497,13 @@ iframe{{padding-top:0}}
             log(f"🎲 auto → {picked} @ {picked_host}（{why}）→ {self._real_ip()}")
 
         # 模型白名单（auto 的候选池已在 _auto_candidates 内按 allow/deny 过滤，此处跳过重复校验）
-        if model and not self._auto_resolved and not self._check_model_allowed(model, cfg):
+        # 泳道池请求同样跳过：真实模型由泳道配置决定，白名单在配置侧把关。
+        if model and not self._auto_resolved and not _pool_req and not self._check_model_allowed(model, cfg):
             self._send_error(403, "model_not_allowed", f"模型 '{model}' 不在白名单中")
             return
 
         # 模型存在性预检查（避免 Ollama 返回不明确的 404）
-        if model and not self._ollama_model_exists(model):
+        if model and not _pool_req and not self._ollama_model_exists(model):
             # 可用列表要排除熔断中的模型：否则会出现"模型 X 不存在，可用模型: X, Y"
             # 这种自相矛盾的话（X 仍在 /api/tags 里，但已判定加载不了）。
             ollama_models, rapid_models = self._refresh_model_caches()
@@ -3111,7 +3522,7 @@ iframe{{padding-top:0}}
 
         # 工具能力预检查：已知不支持 tools 的模型（如 qwen2.5vl:3b）不必再浪费一次上游往返，
         # 也不该让客户端收到带 registry 路径的原始 400。auto 已在上面的候选池里过滤过。
-        if (model and not self._auto_resolved and self._auto_req_has_tools(req)
+        if (model and not self._auto_resolved and not _pool_req and self._auto_req_has_tools(req)
                 and self._auto_supports_tools(model, self._resolve_upstream(model, path)) is False):
             self._send_error(400, "model_no_tools",
                              f"模型 '{model}' 不支持工具调用（tools）。"
@@ -3142,9 +3553,44 @@ iframe{{padding-top:0}}
             self._send_error(429, "quota_exceeded", reason)
             return
 
+        # ---- 取泳道（一个模型一个上下文；全忙则在此排队）----
+        # 位置很关键：在**额度检查之后、并发槽位之前**。放在前面会让排队中的请求先吃掉
+        # 额度（还没跑就记账），放在后面会让排队中的请求长期占着 max_concurrency 槽，
+        # 第 4 个上下文就被 429 挡掉 —— 而需求正是"排队等空闲模型"，不是拒绝。
+        _pool_lane = None
+        if _pool_req:
+            if _lane_hint and _lane_hint not in LANE_POOL._by_name:
+                self._send_error(400, "lane_unknown",
+                                 f"没有名为 '{_lane_hint}' 的泳道。现有："
+                                 f"{', '.join(l['name'] for l in LANE_POOL._lanes)}")
+                return
+            try:
+                # est_tokens 用**生成长度**而不是 prompt+max：spb 是"每个生成 token 的
+                # 秒数"，把 prompt tokens 也算进去会把一单的预计时长放大十几倍，
+                # 队列预测随之失真（实测表现为"明明该等快模型，却跑去慢模型"）。
+                _gen_est = int(req.get("max_tokens") or req.get("max_completion_tokens") or 512)
+                _pool_lane, _lane_wait = LANE_POOL.acquire(_lane_ctx, lane=_lane_hint,
+                                                           est_tokens=_gen_est)
+            except LaneQueueFull as e:
+                self._send_error(429, "lane_queue_full", str(e))
+                return
+            except LaneTimeout as e:
+                self._send_error(429, "lane_wait_timeout", str(e))
+                return
+            self._lane = _pool_lane
+            self._lane_ctx_key = _lane_ctx
+            self._lane_wait_s = _lane_wait
+            self._lane_t0 = time.time()
+            model = _pool_lane["model"]
+            req["model"] = model
+            body_bytes = json.dumps(req, ensure_ascii=False).encode("utf-8")
+            log(f"🚦 泳道 {_pool_lane['name']} ← {_lane_ctx}"
+                f"{'（等 %.2fs）' % _lane_wait if _lane_wait > 0.05 else ''} → {model}")
+
         # 并发检查
         with state_lock:
             if active_concurrency >= cfg["global"]["max_concurrency"]:
+                self._release_lane()
                 self._send_error(429, "too_many_requests", "服务器忙，请稍后再试")
                 return
             active_concurrency += 1
@@ -3157,20 +3603,25 @@ iframe{{padding-top:0}}
         model_inflight_inc(_inflight_model)
         self._inflight_model = _inflight_model
         self._inflight_released = False
+        _lane_err = False
         try:
             self._proxy_serialized("POST", client_ip, api_key, key_cfg, cfg,
-                                   body_bytes=body_bytes, original_req=req, model=model)
+                                   body_bytes=body_bytes, original_req=req, model=model,
+                                   upstream_host=(_pool_lane or {}).get("host", ""))
         except Exception as e:
             # 兜底：所有未预期异常都不应让并发计数泄漏
             # 记录完整堆栈：仅打 type+message 时（如 KeyError: 'max_tokens'）无法定位到行号，
             # 曾因此多花一轮排查。堆栈只写本地日志，不返回给客户端。
             log(f"❌ do_POST 未捕获异常: {type(e).__name__}: {e}\n"
                 f"{traceback.format_exc()}")
+            _lane_err = True
             try:
                 self._send_error(500, "internal_error", "服务器内部错误")
             except Exception:
                 pass
         finally:
+            # 泳道必须先还回去：漏还等于这个模型永久消失，比丢一个请求严重得多。
+            self._release_lane(error=_lane_err or (getattr(self, "_resp_status", 0) or 0) >= 500)
             # _proxy 通常已经在上游读完时释放过；这里只兜底真正漏掉的情况
             if not getattr(self, "_inflight_released", False):
                 model_inflight_dec(_inflight_model)
@@ -3179,6 +3630,20 @@ iframe{{padding-top:0}}
                 _e = _active_reqs.pop(_rid, None)
                 if _e is None or not _e.get("freed"):
                     active_concurrency = max(0, active_concurrency - 1)
+
+    def _release_lane(self, error: bool = False):
+        """归还泳道（幂等：多次调用只生效一次）。"""
+        lane = getattr(self, "_lane", None)
+        if lane is None:
+            return
+        self._lane = None
+        try:
+            # tokens/elapsed 用于更新该泳道的速度画像（决定以后"在谁那儿先做完"）
+            LANE_POOL.release(lane, error=bool(error),
+                              tokens=int(getattr(self, "_lane_ct", 0) or 0),
+                              elapsed=max(0.0, time.time() - getattr(self, "_lane_t0", time.time())))
+        except Exception as e:      # 归还路径绝不抛：抛了会盖住真正的错误
+            log(f"⚠️ 泳道归还失败 {lane.get('name')}: {type(e).__name__}: {e}")
 
     def do_PUT(self):
         self._normalize_path()
@@ -3219,7 +3684,7 @@ iframe{{padding-top:0}}
     _CLIENT_GONE_ERRORS = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)
 
     def _proxy_serialized(self, method: str, client_ip: str, api_key: str,
-                          key_cfg: dict, cfg: dict, **kw):
+                          key_cfg: dict, cfg: dict, upstream_host: str = "", **kw):
         """把发往 Rapid-MLX(gmlx) 的**生成**请求按需串行化。
 
         粒度：**只串行带投机解码（MTP）的上游模型**。缺陷在 speculative 的 mid-flight
@@ -3234,7 +3699,8 @@ iframe{{padding-top:0}}
         path = self.path.split("?", 1)[0]
         is_gen = path.startswith("/v1/chat") or path.startswith("/v1/completions")
         model = kw.get("model", "")
-        host = self._resolve_upstream(model, self.path)
+        # 泳道池会把上游 host 显式传进来（同 host 多模型时也能指定），否则按模型名解析
+        host = upstream_host or self._resolve_upstream(model, self.path)
         if not (is_gen and MLX_SERIAL and host in RAPID_MLX_HOSTS):
             return self._proxy(method, client_ip, api_key, key_cfg, cfg,
                                upstream_host=host, **kw)
@@ -3642,6 +4108,7 @@ iframe{{padding-top:0}}
         last_data_at = time.time()
 
         def _send_upstream_headers(content_length=None):
+            self._resp_status = resp.status
             self.send_response(resp.status)
             # 透传响应头
             for k, v in resp.headers.items():
@@ -3670,6 +4137,15 @@ iframe{{padding-top:0}}
                 _tier = getattr(self, "_auto_tier_label", "")
                 if _tier:
                     self.send_header("X-Gateway-Auto-Tier", _tier)
+            # 泳道池命中：告诉客户端这次落在哪条泳道、等了多久。客户端据此可以自己
+            # 观测"上下文是否粘在同一模型上"，不必翻服务端日志。
+            _lane_hit = getattr(self, "_lane", None)
+            if _lane_hit:
+                self.send_header("X-Gateway-Lane", str(_lane_hit.get("name", "")))
+                self.send_header("X-Gateway-Model", str(_lane_hit.get("model", "")))
+                self.send_header("X-Gateway-Lane-Wait",
+                                 f"{getattr(self, '_lane_wait_s', 0.0):.2f}")
+                self.send_header("X-Gateway-Context", str(getattr(self, "_lane_ctx_key", "")))
             # 推理空正文修复命中时回传实际生效的预算，便于客户端/日志侧对齐
             _rrm = getattr(self, "_reasoning_retry_mt", 0)
             if _rrm:
@@ -3940,6 +4416,7 @@ iframe{{padding-top:0}}
 
         # 记录用量
         model_name = model or (original_req or {}).get("model", "unknown")
+        self._lane_ct = total_completion      # 供泳道归还时更新速度画像
         tracker.record(api_key, model_name, total_prompt, total_completion, total,
                        elapsed, client_ip, stream)
 
@@ -3987,7 +4464,13 @@ iframe{{padding-top:0}}
                 "log_size_mb": round(USAGE_LOG.stat().st_size / 1048576, 2) if USAGE_LOG.exists() else 0,
                 "tailscale_ip": ts_ip,
                 "tailscale_dns": ts_dns,
+                "lane_pool": LANE_POOL.snapshot(),
             })
+            return
+
+        # GET /api/admin/lanes — 泳道池实时视图（谁在跑、谁在等、各模型服务了几个上下文）
+        if path == "/api/admin/lanes" and method == "GET":
+            self._send_json(LANE_POOL.snapshot())
             return
 
         # GET /api/admin/usage?key=xxx&days=7

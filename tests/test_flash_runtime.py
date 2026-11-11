@@ -129,15 +129,23 @@ def main():
     except ImportError:
         print("  （无 PyYAML，跳过交叉校验）")
     srv = y.get("server", {})
-    check("单模型：max_models == 1", srv.get("max_models") == 1, srv)
+    # 2026-11-11 深夜：泳道池要两条轨道，max_models 提到 2（125B + 27B 都 pin 常驻）
+    check("两模型：max_models == 2", srv.get("max_models") == 2, srv)
     check("前缀缓存开启", (srv.get("cache") or {}).get("enabled") is True, srv.get("cache"))
     check("prefill 分块 2048（决定检查点网格）", srv.get("prefill_step_size") == 2048, srv)
     models = y.get("models", {})
-    check("只有 qwen3.8-flash-next 一个模型", list(models) == ["qwen3.8-flash-next"], list(models))
+    check("模型集合 = 主力 + 第二泳道",
+          list(models) == ["qwen3.8-flash-next", "qwen3.8-27b-mlx"], list(models))
     main = models.get("qwen3.8-flash-next", {})
     check("主力模型 pin 常驻", main.get("pin") is True, main)
     check("主力模型带 MTP 投机", main.get("speculative") is True and "draft_gguf" in main, main)
-    check("27B 副本已下线", "qwen3.8-27b-mlx" not in models, list(models))
+    lane2 = models.get("qwen3.8-27b-mlx", {})
+    check("第二泳道也 pin 常驻（否则被 max_models 换出，泳道形同虚设）", lane2.get("pin") is True, lane2)
+    check("第二泳道不带投机（否则同样会踩 mid-flight 注入缺陷）",
+          not lane2.get("speculative"), lane2)
+    check("第二泳道配了 mmproj（它是 VLM，缺了起不来）", "mmproj" in lane2, lane2)
+    check("没有把已证实不可用的 gemma4-9b 留在生产（基座模型不会聊天）",
+          "gemma4-9b" not in models, list(models))
     check("不在上游配 aliases（别名只交网关）",
           not y.get("aliases") and "aliases" not in open(ypath, encoding="utf-8").read().split("#")[0],
           y.get("aliases"))
