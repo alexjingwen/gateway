@@ -1,0 +1,53 @@
+# gmlx 多模型服务配置 —— 由 tools/start-flash.py 按 flash-runtime.json 的
+# "config" 字段加载（config 模式），取代原先的单模型命令行。
+#
+# 为什么要多模型：
+#   gmlx 的 mid-flight 注入缺陷只在**同一个模型的 batch 内**触发
+#   （models/qwen4_exp/vlm_model.py:135 的 mrope 位置张量算出 (1,2,2) 而目标
+#    (3,2,1)，整批 ValueError，两个并发请求 100% 双双 500）。
+#   不同模型各有自己的 BatchGenerator，并发实测全 200 且墙钟短于串行
+#   （gemma4 + qwen3.8-27b：并发 5.72s vs 串行 7.78s）。
+#   所以把 27B 也挂在这里：轻量请求走 27B、长上下文走 125B，两者不再互相排队。
+#
+# 注意：改动本文件后必须重启 gmlx（会掐断在飞流），见 tools/start-flash.py。
+
+server:
+  host: 127.0.0.1
+  port: 8090
+  no_auth: true
+  menubar: false
+  max_models: 2
+
+profiles:
+  # 只关思维链，不覆盖任何采样参数（空 sampling 不会盖住 family 默认值）。
+  # 等价于原命令行里的 --thinking off。
+  nothink:
+    thinking: off
+
+models:
+  qwen3.8-flash-next:
+    path: ~/models/qwen3.8-flash-next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf
+    mmproj: ~/models/qwen3.8-flash-next/mmproj-F16.gguf
+    profile: nothink
+    # MTP 投机解码：drafter 必须与本模型配对，多模型下只能写在模型级
+    speculative: true
+    draft_gguf: ~/models/flash-drafter/Qwen3.8-Flash-Next-mtp-drafter-Q4_K_L.gguf
+    # 投机宽度上限：并发注入到繁忙 batch 时，MTP draft 张量与目标 batch 宽度
+    # 不一致会让整批报 "Cannot broadcast ..."。限 1 行可避开该形状冲突。
+    speculative_width_cap: 1
+    # 主力模型常驻，绝不因 --max-models 被换出
+    pin: true
+
+  # id 必须以 -mlx 结尾：网关的 TG_MODEL_ALIASES 把 qwen3.8-27b 改写成
+  # qwen3.8:27b（Ollama 原生名），若这里也叫 qwen3.8-27b，网关发出的名字会被
+  # 改写成 Ollama 名字，这个 gmlx 副本就永远路由不到。加后缀后两条路并存：
+  #   qwen3.8:27b / qwen3.8-27b → Ollama（11434）
+  #   qwen3.8-27b-mlx          → 本机 gmlx（8090），可与 125B 真正并行
+  qwen3.8-27b-mlx:
+    path: ~/models/extra/qwen3.8-27b.gguf
+    mmproj: ~/models/extra/mmproj-qwen3.8-27b.gguf
+
+# 不在这里配 aliases。
+# gmlx 的 aliases 会被 /v1/models 当成**独立 id** 返回，且字段（resident/pinned/
+# family）与真实模型完全一样，网关无法分辨 —— 那样同一个上游模型会因为别名拿到
+# 两把串行锁，照样混批。别名统一交给网关的 TG_MODEL_ALIASES 映射到**真实 id**。

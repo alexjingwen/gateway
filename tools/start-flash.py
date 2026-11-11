@@ -46,6 +46,18 @@ def healthy(port, timeout=3):
 
 def build_cmd(conf):
     gmlx = os.path.expanduser(conf["gmlx"])
+    cfg_file = conf.get("config")
+    if cfg_file:
+        # config 模式：模型清单、profile、投机参数全部在 YAML 里，因此可以同时
+        # 驻留多个模型（不同模型各有自己的 BatchGenerator，能真正并行；同模型并发
+        # 会触发 gmlx 的 mid-flight 注入缺陷）。host/port/no-auth 仍由
+        # flash-runtime.json 给出并作为命令行覆盖，保持单一真相源。
+        cmd = [gmlx, "serve", "--config", os.path.expanduser(cfg_file)]
+        cmd += ["--host", conf.get("host", "127.0.0.1"), "--port", str(conf.get("port", 8090))]
+        if conf.get("no_auth", True):
+            cmd += ["--no-auth"]
+        cmd += ["--no-menubar"]
+        return cmd
     cmd = [gmlx, "serve", os.path.expanduser(conf["model"])]
     if conf.get("mmproj"):
         cmd += ["--mmproj", os.path.expanduser(conf["mmproj"])]

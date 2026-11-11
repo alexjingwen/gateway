@@ -17,6 +17,7 @@
 - [部署 / Deploy](#部署--deploy)
 - [API 参考](#api-参考)
 - [auto 虚拟模型（自动分配）](#auto-虚拟模型自动分配)
+- [多模型上游（gmlx config 模式）](#多模型上游gmlx-config-模式)
 - [配置字段速查](#配置字段速查)
 - [安全加固](#安全加固)
 - [mem-guard.mjs —— 设备级内存守卫](#mem-guardmjs--设备级内存守卫)
@@ -91,7 +92,7 @@ TG_DISABLE_HTTPS=1 TG_PORT=3000 python3 token-gateway.py
 | TG_MODEL_PARAMS | (空) | 参数量覆写，格式 `模型=参数量B`（逗号分隔，如 `qwen3.8-flash-next=125`）。优先级 **覆写 > 上游元数据 > 名字推断**；给不提供 `/api/show` 元数据、名字里又没数字的运行时（gmlx 的 `qwen3.8-flash-next`）用 |
 | TG_QPS | 5 | 每 key 每秒请求数 |
 | TG_CONCURRENCY | 10 | 全局最大并发 |
-| TG_MLX_SERIAL | 1 | **把发往 Rapid-MLX 上游的生成请求串行化**（同一时刻只放一个进上游）。原因：gmlx 的 mid-flight 注入路径有形状缺陷 —— 一个请求正在 decode、另一个被塞进同一 batch 时，mrope 位置张量形状不符，整批 `Cannot broadcast array of shape (1,2,2) into shape (3,2,1)`，**两个并发请求 100% 双双 500**。串行是唯一不改上游又能保证 0 个 500 的修法；代价是并发吞吐退化为串行。`/v1/models` 等元数据 GET 不排队。设 0 关闭（回到会 500 的行为） |
+| TG_MLX_SERIAL | 1 | **把发往 Rapid-MLX 上游的生成请求串行化**。原因：gmlx 的 mid-flight 注入路径有形状缺陷 —— 一个请求正在 decode、另一个被塞进同一 batch 时，mrope 位置张量形状不符，整批 `Cannot broadcast array of shape (1,2,2) into shape (3,2,1)`，**同一个模型的两个并发请求 100% 双双 500**。串行的粒度是「上游 host + 上游真实模型 id」（见 `_mlx_lock_key`）：**同模型串行、异模型并行**；上游 `/v1/models` 探测不到或该 host 只有一个模型时退回 host 级锁。`/v1/models` 等元数据 GET 不排队。设 0 关闭（回到会 500 的行为） |
 | TG_MLX_SERIAL_WAIT | 300 | 串行队列的最长等待（秒），超时返回 429（而非 500）。客户端侧表现是"排队"，不是"报错" |
 | TG_READ_TIMEOUT | 900 | **单次静默上限**（秒），不是整段耗时上限：等上游响应头、以及每次读取响应体，连续这么久没有任何字节才判超时。5 万 token 上下文的预填充本身就要 100~150s，生产建议 ≥600 |
 | TG_VLM_READ_TIMEOUT | 120 | 多模态（带图）请求的单次静默上限（秒） |
@@ -496,6 +497,74 @@ curl -X POST http://127.0.0.1:3000/api/admin/keys -H "X-Admin-Token: $ADMIN_TOKE
   -H "Content-Type: application/json" \
   -d '{"name":"alice","daily_tokens":1000000,"monthly_tokens":30000000,"qps":5,"rate_limited":true,"active":true}'
 ```
+
+## 多模型上游（gmlx config 模式）
+
+gmlx 支持同时驻留多个模型，每个模型有自己的 `BatchGenerator`。这带来一条关键性质：
+
+> **同一个模型**的两个并发请求会触发 gmlx 的 mid-flight 注入缺陷（整批 500）；
+> **不同模型**并发则各自独立出批，可以真正并行。
+
+网关的串行锁据此按「上游 host + 上游真实模型 id」分（`_mlx_lock_key`），并据此把第二个
+模型挂上 8090 —— 轻量请求走 27B、长上下文走 125B，两者不再互相排队。
+
+### 配置
+
+`flash-runtime.json` 的 `config` 字段指向 `gmlx-serve.yaml`，由 `tools/start-flash.py`
+以 `gmlx serve --config` 启动；`host`/`port`/`no_auth` 仍由 `flash-runtime.json` 给出并作为
+命令行覆盖。不设 `config` 时退回原来的单模型命令行（llama.cpp 回退路径不受影响）。
+
+```yaml
+server: {host: 127.0.0.1, port: 8090, no_auth: true, max_models: 2}
+profiles:
+  nothink: {thinking: off}          # 等价于原来命令行的 --thinking off
+models:
+  qwen3.8-flash-next:
+    path: ~/models/qwen3.8-flash-next/....gguf
+    mmproj: ~/models/qwen3.8-flash-next/mmproj-F16.gguf
+    profile: nothink
+    speculative: true
+    draft_gguf: ~/models/flash-drafter/....gguf
+    speculative_width_cap: 1
+    pin: true                       # 主力模型常驻，绝不换出
+  qwen3.8-27b-mlx:
+    path: ~/models/extra/qwen3.8-27b.gguf
+    mmproj: ~/models/extra/mmproj-qwen3.8-27b.gguf
+```
+
+### 三个必须知道的坑
+
+1. **不要用 gmlx 的 `aliases:`**。它会把别名也当成独立 id 返回给 `/v1/models`，且
+   `resident`/`pinned`/`family` 字段与真实模型完全一样 —— 网关无法分辨，于是同一个
+   上游模型会因为别名拿到两把串行锁，照样混批。别名统一交给网关的 `TG_MODEL_ALIASES`，
+   且**必须映射到上游真实 id**。
+2. **第二个模型的 id 不能与已有别名冲突**。`TG_MODEL_ALIASES` 里有
+   `qwen3.8-27b=qwen3.8:27b`（指向 Ollama），所以 gmlx 上的副本命名为 `qwen3.8-27b-mlx`；
+   否则网关发出的名字会被改写成 Ollama 名字，这个副本永远路由不到。
+3. **Ollama 的 blob 可以直接喂给 gmlx**：`ln` 硬链接成 `.gguf` 即可，不额外占盘。已实测
+   `gemma4`、`qwen3.8:27b` 可加载；`qwen2.5vl` 的 arch 不被支持
+   （`[discover] skip (unsupported arch 'qwen25vl')`）。
+
+### 实测（本机，M3 Ultra 256 GB）
+
+| 场景 | 结果 |
+|---|---|
+| 同模型 2 并发 | 3 轮 **6/6 全 500**（`Cannot broadcast`） |
+| 异模型并发（隔离实例 gemma4 + 27B） | **4/4 全 200**，并发 5.72s < 串行 7.78s |
+| 异模型并发（生产 125B + 27B） | **时间区间重叠 60.04s**，两个请求同时 decode |
+| 27B 干净环境 decode | **34.6 tok/s**（150 tok / 4.34s） |
+| 27B 有 13 万 token prefill 并存时 | prefill 226→17 t/s、decode 34.6→2.2 t/s |
+
+最后一行是多模型并行的真实代价：**共享 GPU/内存带宽，大 prefill 会把邻居拖慢**。
+并行是"同时进行"，不等于"互不影响"。要真正的隔离只能拆到不同物理机。
+
+### 排错
+
+- `/health` 与网关日志里锁键形如 `http://127.0.0.1:8090|qwen3.8-flash-next`；若只看到
+  裸 host，说明该 host 被判定为单模型（探测失败或 `/v1/models` 只返回一个 id），此时
+  行为等同串行化首个版本。
+- 27B 返回空正文且耗时异常长：多半是触发了「推理模型空正文 → 以 max_tokens=4096 重发」
+  逻辑，不是慢。看网关日志里有没有 `🔁 推理模型空正文`。
 
 ## 配置字段速查
 

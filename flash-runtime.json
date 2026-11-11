@@ -1,5 +1,5 @@
 {
-  "note": "Qwen3.8-Flash-Next 运行时配置。llama.cpp 基线保留在 ~/llama.cpp，切回只需把 engine 改成 llama.cpp 并改回网关上游别名。",
+  "note": "Qwen3.8-Flash-Next + Qwen3.8-27B 运行时配置。config 指向 gmlx-serve.yaml（多模型：不同模型可并行，同模型并发会触发 gmlx 混批缺陷）。llama.cpp 基线保留在 ~/llama.cpp，切回只需把 engine 改成 llama.cpp 并改回网关上游别名。",
   "engine": "gmlx",
   "gmlx": "~/gmlx-env/bin/gmlx",
   "model": "~/models/qwen3.8-flash-next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf",
@@ -17,12 +17,28 @@
     "engine": "llama.cpp",
     "binary": "~/llama.cpp/build/bin/llama-server",
     "argv": [
-      "--model", "~/models/qwen3.8-flash-next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf",
-      "--mmproj", "~/models/qwen3.8-flash-next/mmproj-F16.gguf",
-      "--alias", "qwen3.8-flash-125b",
-      "--host", "127.0.0.1", "--port", "8090", "--api-key", "sk-test",
-      "--ctx-size", "131072", "--image-min-tokens", "1024",
-      "--n-gpu-layers", "99", "--jinja", "--threads", "16"
+      "--model",
+      "~/models/qwen3.8-flash-next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf",
+      "--mmproj",
+      "~/models/qwen3.8-flash-next/mmproj-F16.gguf",
+      "--alias",
+      "qwen3.8-flash-125b",
+      "--host",
+      "127.0.0.1",
+      "--port",
+      "8090",
+      "--api-key",
+      "sk-test",
+      "--ctx-size",
+      "131072",
+      "--image-min-tokens",
+      "1024",
+      "--n-gpu-layers",
+      "99",
+      "--jinja",
+      "--threads",
+      "16"
     ]
-  }
+  },
+  "config": "~/.ollama-token-gateway/gmlx-serve.yaml"
 }
