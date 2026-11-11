@@ -313,7 +313,26 @@ DEFAULT_MAX_CONCURRENCY = _env_num("TG_CONCURRENCY", 10, minimum=1)  # 全局最
 # /v1/models 之类的元数据 GET 不排队（不触发 batch 注入，排队只会让客户端卡住）。
 MLX_SERIAL = os.environ.get("TG_MLX_SERIAL", "1") not in ("0", "false", "no", "off")
 MLX_SERIAL_WAIT = _env_num("TG_MLX_SERIAL_WAIT", 300, minimum=1)
-_mlx_serial_sem = threading.Semaphore(1)
+
+# 锁按**上游 host** 分，不按模型分：
+#   · 不同 host 是不同进程，各有自己的 BatchGenerator，互不干扰 —— 绝不能串在一起。
+#     （初版用一把全局锁，多 host 时会互相阻塞，是真实的粒度错误。）
+#   · 同一 host 内不能细到模型名：gmlx 的批确实是 per-model 的（每个模型走
+#     `_new_batch_gen` 建自己的 BatchGenerator），但网关看到的是**别名** ——
+#     qwen3.8-flash / qwen3.8-flash-next / auto 解析结果可能落到同一个上游模型，
+#     按名字分锁会让它们各拿一把锁、照样混批。host 是唯一安全的下界。
+_mlx_serial_sems: Dict[str, threading.Semaphore] = {}
+_mlx_serial_sems_lock = threading.Lock()
+
+
+def _mlx_sem_for(host: str) -> threading.Semaphore:
+    """取该上游专属的串行信号量（每 host 一把，懒创建）。"""
+    with _mlx_serial_sems_lock:
+        sem = _mlx_serial_sems.get(host)
+        if sem is None:
+            sem = threading.Semaphore(1)
+            _mlx_serial_sems[host] = sem
+        return sem
 
 # ==========================
 
@@ -3133,8 +3152,9 @@ iframe{{padding-top:0}}
         if not (is_gen and MLX_SERIAL and host in RAPID_MLX_HOSTS):
             return self._proxy(method, client_ip, api_key, key_cfg, cfg,
                                upstream_host=host, **kw)
+        sem = _mlx_sem_for(host)
         t0 = time.time()
-        got = _mlx_serial_sem.acquire(timeout=MLX_SERIAL_WAIT)
+        got = sem.acquire(timeout=MLX_SERIAL_WAIT)
         _wait = time.time() - t0          # 只记"等锁"的时长，不含生成耗时
         if not got:
             log(f"⏳ 上游 {host} 串行队列等待 {MLX_SERIAL_WAIT}s 仍未空出，拒绝本次请求")
@@ -3146,7 +3166,7 @@ iframe{{padding-top:0}}
             return self._proxy(method, client_ip, api_key, key_cfg, cfg,
                                upstream_host=host, **kw)
         finally:
-            _mlx_serial_sem.release()
+            sem.release()
             if _wait > 1.0:
                 log(f"⏳ 上游 {host} 串行排队 {_wait:.1f}s 后放行")
 
