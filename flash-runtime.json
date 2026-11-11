@@ -1,5 +1,5 @@
 {
-  "note": "Qwen3.8-Flash-Next + Qwen3.8-27B 运行时配置。config 指向 gmlx-serve.yaml（多模型：不同模型可并行，同模型并发会触发 gmlx 混批缺陷）。llama.cpp 基线保留在 ~/llama.cpp，切回只需把 engine 改成 llama.cpp 并改回网关上游别名。",
+  "note": "Qwen3.8-Flash-Next 运行时配置。config 指向 gmlx-serve.yaml（单模型 + 前缀缓存 APC）。env 里的 APC_CHECKPOINT_INTERVAL_TOKENS 决定缓存检查点步长：该架构是混合注意力（12 qsa / 36 arr），APC 只能存检查点快照，步长即最多需要重算的 tokens 数。llama.cpp 基线保留在 ~/llama.cpp，切回只需把 engine 改成 llama.cpp。",
   "engine": "gmlx",
   "gmlx": "~/gmlx-env/bin/gmlx",
   "model": "~/models/qwen3.8-flash-next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf",
@@ -40,5 +40,11 @@
       "16"
     ]
   },
-  "config": "~/.ollama-token-gateway/gmlx-serve.yaml"
+  "config": "~/.ollama-token-gateway/gmlx-serve.yaml",
+  "env": {
+    "APC_CHECKPOINT_INTERVAL_TOKENS": "2048",
+    "GMLX_APC_CKPT_HEAVY": "6",
+    "GMLX_APC_CKPT_INTERVAL": "2048",
+    "GMLX_APC_CKPT_BUDGET_MB": "8192"
+  }
 }

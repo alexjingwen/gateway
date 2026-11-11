@@ -16,6 +16,7 @@
     token-gateway.py                 →  <LIVE>/token-gateway.py
     tg_watchdog.py                   →  <LIVE>/tg_watchdog.py
     flash-runtime.json               →  ~/.ollama-token-gateway/flash-runtime.json
+    gmlx-serve.yaml                  →  ~/.ollama-token-gateway/gmlx-serve.yaml
     com.token-gateway.server.plist   →  ~/Library/LaunchAgents/…
     tools/start-flash.py             →  ~/.ollama-token-gateway/tools/…
     tools/start-gateway.py           →  ~/.ollama-token-gateway/tools/…
@@ -77,6 +78,7 @@ MAPPING = {
     "token-gateway.py": LIVE / "token-gateway.py",
     "tg_watchdog.py": LIVE / "tg_watchdog.py",
     "flash-runtime.json": HOME_DIR / "flash-runtime.json",
+    "gmlx-serve.yaml": HOME_DIR / "gmlx-serve.yaml",
     "com.token-gateway.server.plist": LAUNCH_AGENTS / "com.token-gateway.server.plist",
     "tools/start-flash.py": HOME_DIR / "tools/start-flash.py",
     "tools/start-gateway.py": HOME_DIR / "tools/start-gateway.py",

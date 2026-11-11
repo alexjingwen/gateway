@@ -44,6 +44,22 @@ def healthy(port, timeout=3):
         return False
 
 
+def build_env(conf, base=None):
+    """启动 gmlx 的环境变量：继承 shell，再叠加配置里的 `env` 段。
+
+    为什么要有这个函数：gmlx 有些关键开关只有 env 入口（例如 APC 的
+    检查点步长 GMLX_APC_CKPT_INTERVAL），配置里没有对应键。写在
+    flash-runtime.json 的 `env` 段而不是依赖调用者的 shell —— 否则换一个
+    终端重启，缓存行为就静默变了，而且没人知道它变过。
+    """
+    env = dict(os.environ if base is None else base)
+    env["NO_PROXY"] = "*"
+    env["no_proxy"] = "*"
+    for key, val in (conf.get("env") or {}).items():
+        env[str(key)] = str(val)
+    return env
+
+
 def build_cmd(conf):
     gmlx = os.path.expanduser(conf["gmlx"])
     cfg_file = conf.get("config")
@@ -128,9 +144,7 @@ def main():
     log_path = os.path.expanduser(conf.get("log", "/tmp/gmlx-flash.log"))
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
     log = open(log_path, "w")
-    env = dict(os.environ)
-    env["NO_PROXY"] = "*"
-    env["no_proxy"] = "*"
+    env = build_env(conf)
 
     print(f"启动: {' '.join(cmd[:4])} …")
     proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT,

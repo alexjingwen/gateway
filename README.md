@@ -17,7 +17,8 @@
 - [部署 / Deploy](#部署--deploy)
 - [API 参考](#api-参考)
 - [auto 虚拟模型（自动分配）](#auto-虚拟模型自动分配)
-- [多模型上游（gmlx config 模式）](#多模型上游gmlx-config-模式)
+- [上游模型服务（gmlx config 模式）](#上游模型服务gmlx-config-模式)
+- [上游加速：前缀缓存（APC）与 prefill 调优](#上游加速前缀缓存apc与-prefill-调优)
 - [配置字段速查](#配置字段速查)
 - [安全加固](#安全加固)
 - [mem-guard.mjs —— 设备级内存守卫](#mem-guardmjs--设备级内存守卫)
@@ -498,15 +499,15 @@ curl -X POST http://127.0.0.1:3000/api/admin/keys -H "X-Admin-Token: $ADMIN_TOKE
   -d '{"name":"alice","daily_tokens":1000000,"monthly_tokens":30000000,"qps":5,"rate_limited":true,"active":true}'
 ```
 
-## 多模型上游（gmlx config 模式）
+## 上游模型服务（gmlx config 模式）
 
-gmlx 支持同时驻留多个模型，每个模型有自己的 `BatchGenerator`。这带来一条关键性质：
+`gmlx` 支持同时驻留多个模型，每个模型有自己的 `BatchGenerator`。这带来一条决定锁粒度的性质：
 
 > **同一个模型**的两个并发请求会触发 gmlx 的 mid-flight 注入缺陷（整批 500）；
 > **不同模型**并发则各自独立出批，可以真正并行。
 
-网关的串行锁据此按「上游 host + 上游真实模型 id」分（`_mlx_lock_key`），并据此把第二个
-模型挂上 8090 —— 轻量请求走 27B、长上下文走 125B，两者不再互相排队。
+网关的串行锁据此按「上游 host + 上游真实模型 id」分（`_mlx_lock_key`），于是在多模型下游
+仍然安全：同模型排队、异模型并行。
 
 ### 配置
 
@@ -514,10 +515,17 @@ gmlx 支持同时驻留多个模型，每个模型有自己的 `BatchGenerator`�
 以 `gmlx serve --config` 启动；`host`/`port`/`no_auth` 仍由 `flash-runtime.json` 给出并作为
 命令行覆盖。不设 `config` 时退回原来的单模型命令行（llama.cpp 回退路径不受影响）。
 
+当前生产配置（**单模型 + 前缀缓存**，2026-11-11 起）：
+
 ```yaml
-server: {host: 127.0.0.1, port: 8090, no_auth: true, max_models: 2}
+server:
+  max_models: 1
+  prefill_step_size: 2048        # 决定 APC 检查点网格，见下节
+  cache:
+    enabled: true                # 前缀缓存，默认关闭
+    exact_entries: 8
 profiles:
-  nothink: {thinking: off}          # 等价于原来命令行的 --thinking off
+  nothink: {thinking: off}       # 等价于原来命令行的 --thinking off
 models:
   qwen3.8-flash-next:
     path: ~/models/qwen3.8-flash-next/....gguf
@@ -526,11 +534,25 @@ models:
     speculative: true
     draft_gguf: ~/models/flash-drafter/....gguf
     speculative_width_cap: 1
-    pin: true                       # 主力模型常驻，绝不换出
-  qwen3.8-27b-mlx:
-    path: ~/models/extra/qwen3.8-27b.gguf
-    mmproj: ~/models/extra/mmproj-qwen3.8-27b.gguf
+    pin: true                    # 主力模型常驻，绝不换出
 ```
+
+`flash-runtime.json` 的 `env` 段负责注入只有 env 入口的开关（`GMLX_APC_CKPT_*`），
+不走调用者的 shell —— 否则换个终端重启，缓存行为会静默改变。
+
+### 为什么把 27B 副本下线
+
+曾经挂过 `qwen3.8-27b-mlx`，想让「轻量请求走 27B、长上下文走 125B」分摊排队。实测不值：
+
+| 指标 | 125B（MTP 投机） | 27B |
+|---|---|---|
+| 干净环境 decode | **60 ~ 135 tok/s**（服务端 `[spec] rate=1.000`） | 34.6 tok/s |
+| 与 13 万 token prefill 并存 | prefill 713→、decode 77.8 | decode 34.6 → **2.2** tok/s |
+| 常驻内存 | 119.5 GB（单模型） | +27B 权重与 KV |
+
+即**轻量请求走 27B 反而更慢**，而它带来的并行只在「另一个请求正在 prefill」时才体现，
+收益小于它挤占的内存与加载时间。配置留在 git 历史里，恢复只需把 `qwen3.8-27b-mlx` 段加回来
+并把 `max_models` 提到 2。
 
 ### 三个必须知道的坑
 
@@ -538,24 +560,24 @@ models:
    `resident`/`pinned`/`family` 字段与真实模型完全一样 —— 网关无法分辨，于是同一个
    上游模型会因为别名拿到两把串行锁，照样混批。别名统一交给网关的 `TG_MODEL_ALIASES`，
    且**必须映射到上游真实 id**。
-2. **第二个模型的 id 不能与已有别名冲突**。`TG_MODEL_ALIASES` 里有
-   `qwen3.8-27b=qwen3.8:27b`（指向 Ollama），所以 gmlx 上的副本命名为 `qwen3.8-27b-mlx`；
-   否则网关发出的名字会被改写成 Ollama 名字，这个副本永远路由不到。
+2. **模型 id 不能与网关已有别名冲突**。`TG_MODEL_ALIASES` 里有
+   `qwen3.8-27b=qwen3.8:27b`（指向 Ollama），所以若要在 gmlx 上也挂一份，必须叫
+   `qwen3.8-27b-mlx`；否则网关发出的名字会被改写成 Ollama 名字，这个副本永远路由不到。
 3. **Ollama 的 blob 可以直接喂给 gmlx**：`ln` 硬链接成 `.gguf` 即可，不额外占盘。已实测
    `gemma4`、`qwen3.8:27b` 可加载；`qwen2.5vl` 的 arch 不被支持
    （`[discover] skip (unsupported arch 'qwen25vl')`）。
 
-### 实测（本机，M3 Ultra 256 GB）
+### 实测（本机，M3 Ultra 274 GB）
 
 | 场景 | 结果 |
 |---|---|
-| 同模型 2 并发 | 3 轮 **6/6 全 500**（`Cannot broadcast`） |
+| 同模型 2 并发（APC 关闭时） | 3 轮 **6/6 全 500**（`Cannot broadcast`） |
+| 同模型 2 并发（串行锁 + APC 开启） | 3 轮 **6/6 全 200**，单请求 0.36~0.73s |
 | 异模型并发（隔离实例 gemma4 + 27B） | **4/4 全 200**，并发 5.72s < 串行 7.78s |
-| 异模型并发（生产 125B + 27B） | **时间区间重叠 60.04s**，两个请求同时 decode |
-| 27B 干净环境 decode | **34.6 tok/s**（150 tok / 4.34s） |
 | 27B 有 13 万 token prefill 并存时 | prefill 226→17 t/s、decode 34.6→2.2 t/s |
+| 27B 下线后独立内存占用 | active 140.1 G → **119.5 G** |
 
-最后一行是多模型并行的真实代价：**共享 GPU/内存带宽，大 prefill 会把邻居拖慢**。
+最后两行是多模型并行的真实代价：**共享 GPU/内存带宽，大 prefill 会把邻居拖慢**。
 并行是"同时进行"，不等于"互不影响"。要真正的隔离只能拆到不同物理机。
 
 ### 排错
@@ -565,6 +587,8 @@ models:
   行为等同串行化首个版本。
 - 27B 返回空正文且耗时异常长：多半是触发了「推理模型空正文 → 以 max_tokens=4096 重发」
   逻辑，不是慢。看网关日志里有没有 `🔁 推理模型空正文`。
+- `APC enabled (..., disk=False)` 里的 `block_size`/`num_blocks` 是 APC 自己的块参数，
+  与本机调优用的 `prefill_step_size` 不是一回事。
 
 ## 配置字段速查
 
@@ -1209,69 +1233,98 @@ cp ~/.ollama-token-gateway/config.json \
 - **LaunchAgent 标签**：复制 plist 后改 `Label`（如 `com.token-gateway.server2`）及 `ProgramArguments` / `WorkingDirectory`。
 - **凭据**：不同实例用不同 `admin.token` 与 key 命名空间，避免串用。
 
-## 上游加速：开启 prefix cache（APC）
+## 上游加速：前缀缓存（APC）与 prefill 调优
 
-网关本身**不缓存 KV**，每轮请求的 prefill 全部由上游承担。agent 类客户端每轮都会重发完整上下文（实测同一会话 58k → 62k tokens 递增），若上游不复用前缀，6 万 token 就要完整重算一遍。
+网关本身**不缓存 KV**，每轮请求的 prefill 全部由上游承担。agent 类客户端每轮重发完整上下文，
+上游若不复用前缀，几万 token 就要完整重算一遍。
 
 ### 现象与根因
 
-mlx_vlm 内置 APC（Automatic Prefix Caching），但**默认关闭**——`apc.from_env()` 在 `APC_ENABLED` 未设置时直接返回 `None`。表现为每轮耗时与上下文长度同阶，而输出 token 极少：
+真实请求的服务端日志（`qwen3.8-flash-next`，prompt 27661）：
 
 ```
-📊 Model:Qwen3.5-122B Tokens:62172 (P:62105+C:67) 用时:247.8s
+Request completed: ... prompt_tokens=27661 generated_tokens=382 elapsed=43.771s prefill=713.4 tok/s decode=77.8 tok/s
+[req] ... prompt=27661 gen=382 ttft=38.86s prefill=713t/s decode=77.8t/s total=43.77s
 ```
 
-6 万 prompt token、67 个输出 token、247.8 秒——时间几乎全在 prefill，且每轮重复。
+**38.9 秒的首 token 全是 prefill**，decode 只有 4.9 秒。根因是 mlx_vlm 的 APC
+（Automatic Prefix Caching）**默认关闭**：`apc.from_env()` 在 `APC_ENABLED` 未设置时
+直接返回 `None`，gmlx 也不会替你打开（它只在 `gmlx launch claude-code` 时打印一句提示：
+*"the server's prompt cache is off ... Turn the cache on with server.cache.enabled"*）。
 
-一条可复现的判据：同一 prompt 连发两次，若第二次耗时与第一次基本相同，就是没有缓存。
+判据：同一 prompt 连发两次，第二次耗时与第一次相同 = 没有缓存。
 
-### 开启方式
+### 开启方式（gmlx config 模式）
 
-在**上游**的 LaunchAgent 注入环境变量（网关侧无需改动）：
-
-```xml
-<key>EnvironmentVariables</key>
-<dict>
-    <key>APC_ENABLED</key><string>1</string>
-    <key>APC_EXACT_CACHE_ENTRIES</key><string>4</string>
-</dict>
+```yaml
+server:
+  cache:
+    enabled: true          # 对应 env APC_ENABLED；YAML 优先级高于进程环境
+    exact_entries: 8       # 混合/循环架构的整前缀快照保留份数
+  prefill_step_size: 2048  # 同时决定 APC 检查点网格，见「关键约束」
 ```
 
-重启上游后，启动日志应出现：
+重启后启动日志应出现 `APC enabled (block_size=128, num_blocks=2048, disk=False, gmlx manager)`
+与 `APC pool auto-sized: 4687 blocks (14.7 GB cap, 24.6 KB/token)`。
 
-```
-APC enabled (block_size=16, num_blocks=2048, hash=fast, disk=False)
-APC self-check ok mode=exact schema=v1 layers=48 ...
-```
+对混合架构（本模型 12 `qsa` + 36 `arr` 层，日志里的 `APC tier: ckpt`），APC 存的是
+**检查点快照**而不是逐块 KV，因此命中点只可能落在检查点位置上 —— 这一点决定了后面的调优方向。
 
-`mode=exact` 表示该模型被判为混合架构（linear attention + full attention），走"整前缀快照"路径；`mode=block` 则是逐块 KV 复用。
+### 本机实测（125B Q4 + MTP，经网关端到端）
 
-### 实测收益（29,716 token 上下文，`max_tokens=1`）
-
-| 场景 | 开启前 | 开启后 | 加速 |
+| 场景（20.6k system + 64 token user） | APC 关（基线） | APC 开·8k 网格 | APC 开·2k 网格 |
 |---|---|---|---|
-| 冷启动（首次全量 prefill） | 51.2s | 51.2s | — |
-| 完全相同前缀 | 14.3s | **0.29s** | 49× |
-| 追加一轮（agent 形态） | 14.4s | **0.50s** | 29× |
-| 经网关端到端（`auto`→122B） | — | **0.30s** | — |
+| 冷启动（首次全量 prefill） | 25.5s | 26.5s | **35.7s** |
+| 完全相同的 prompt 重发 | 25.5s | **0.21s** | 0.24s |
+| 只换最后一句（真实 agent 每轮） | 25.5s | 5.75s | **1.00s** |
 
-预填充约 581 tok/s，6 万 token 冷启动约 103s；命中后只算新增的几百 token，耗时降到亚秒级。
+（0.21s/0.24s 是服务端 `ttft`；客户端侧还会叠加解码时间，`max_tokens=32` 时约 1.3s。）
+
+读法：
+
+- **完全命中是 100 倍级**的差别（25.5s → 0.2s）。
+- 真实 agent 每轮都会追加新内容，命中点是「最后一个检查点」，所以**检查点越密，尾部越短**：
+  8k 网格要重算 8k token（5.75s），2k 网格只重算 2k（1.0s）。
+- 代价是冷启动：2k 网格意味着一个 20k 上下文要落 10 个快照（每个约 172 MB），
+  存储本身多花约 9 秒。**1 冷 + N 热**的盈亏平衡在 N≈1.75，多轮会话里 2k 网格明显更划算。
+- 关掉缓存时 prefill 恒定 **~950 tok/s**（24k prompt 冷启动 25.5s），这是这台机器的物理上限；
+  任何"调 prefill 参数提速"的尝试都要先过这一关。
 
 ### 关键约束
 
-1. **前缀必须完全一致**。APC 按 token 序列做前缀匹配，任何前缀扰动（system prompt 里塞时间戳、工具定义顺序变化、历史被编辑或摘要）都会让命中点前移甚至归零。
-2. **混合架构走 exact 快照**，按整个 `prompt_cache` 复制，内存随上下文线性增长（本例 12 个 full-attention 层，约 24 KB/token，6 万 token ≈ 1.4 GB/快照）。`APC_EXACT_CACHE_ENTRIES` 控制保留几份，建议不小于 `--max-num-seqs`。
-3. 非流式缓冲模式下**首字节时间 = 完整生成时间**；只有 prefill 接近归零，这个代价才真正可接受。
-4. 冷启动那一轮无法避免（模型刚加载、权重未热），第一次请求仍按全量计费。
+1. **前缀必须完全一致**。APC 按 token 序列做前缀哈希，system prompt 里塞时间戳、工具定义
+   顺序变化、历史被摘要改写，都会让命中点前移甚至归零。
+2. **检查点只能落在「分块网格」上**：`lcm(每轮 prefill 步长, block_size)`。网格比
+   `GMLX_APC_CKPT_INTERVAL` 粗时，interval 会被 snap 上去 —— 这就是为什么先设
+   `GMLX_APC_CKPT_INTERVAL=2048` 完全没效果，必须同时把 `prefill_step_size` 打到 2048。
+   实测两个步长的 prefill 吞吐一致（953 vs 954 tok/s），所以细网格没有吞吐代价。
+3. **快照内存随上下文线性增长**（本机约 24.6 KB/token，20k 上下文 ≈ 172 MB/快照）。
+   池子按工作集自动定容（本机 14.7 GB），`GMLX_APC_CKPT_BUDGET_MB` 控制检查点总预算。
+4. **不开 SSD 层**。`cache.disk` 只给 `max_gb` 不生效（`path` 才是开关）；而在 ckpt 架构下
+   等于每个请求往盘上写若干 GB，写放大远大于它省下的那点重启后首次 prefill。
+5. **冷启动要多付一次快照存储时间**（本机 20k/2k 网格约 +9s）。首次请求不可避免。
 
 ### 验证方法
 
-同一前缀连发两次，第二次应显著变快：
-
-```python
-# 判读：若"完全相同"那次仍接近冷启动耗时，说明 APC 未生效，
-# 先确认运行中的进程真的拿到了 APC_ENABLED
+```bash
+python3 tools/bench-prefill.py --target gateway --sizes 4096,28672 --gen 32      # 冷/热对比
+python3 tools/bench-prefill.py --system-tokens 24000 --sizes 64 --vary-tail \
+        --runs 4                                                                # 真实 agent 形态
+python3 tools/bench-prefill.py --target gateway --sizes 28672 --nonce            # 强制冷前缀
 ```
+
+判读看两个数：客户端 `ttft`，以及服务端日志 `Prefill completed: ... cached_tokens=N`
+/ `APC L1 hit: prefix=N tier=ckpt`。`cached_tokens` 就是本轮省掉的 prefill 量。
+
+### 已被证伪的做法（别再试）
+
+| 尝试 | 结果 |
+|---|---|
+| 只把 `prefill_step_size` 提到 8192 | prefill **953 vs 954 tok/s**，无差别（吞吐不吃分块大小） |
+| 只设 `APC_CHECKPOINT_INTERVAL_TOKENS=2048` | 无效：gmlx 自己把 stock 的 `checkpoint_interval_tokens` 置 0，走自家 ckpt 层 |
+| 只设 `GMLX_APC_CKPT_INTERVAL=2048`（网格仍 8192） | 无效：interval 被 snap 到网格，仍只命中 8192/16384 |
+| 只把 `GMLX_APC_CKPT_HEAVY` 提到 6 | 命中深度不变，但**消除抖动**（变尾 17.6s→9.1s，不再忽快忽慢） |
+| 拉大 SSD 缓存层 | 写放大得不偿失，且 ckpt 架构下每次请求都要写快照 |
 
 ## 自测 / Tests
 
@@ -1294,6 +1347,7 @@ python3 tests/test_model_list_cache.py # 列举接口读缓存：不再每次探
 python3 tests/test_auto_deep_only.py # 深度档白名单：轻/常规档摘掉贵模型，深度档仍可选，摘空不生效（11 项）
 python3 tests/test_model_params.py  # 参数量覆写：覆写优先于元数据与名字推断，非法值忽略（12 项）
 python3 tests/test_watchdog.py      # 看门狗：模块自足性 / 决策矩阵 / 退避序列 / 网关集成 / 缺模块降级（33 项）
+python3 tests/test_flash_runtime.py # gmlx 运行时：config 模式命令 / env 注入 / yaml 不变量（29 项）
 python3 tools/verify-watchdog.py --yes  # 端到端自愈：真 kill -9 上游并等它回来（会中断服务；不带 --yes 为只读）
 ```
 
@@ -1311,6 +1365,7 @@ python3 tools/verify-watchdog.py --yes  # 端到端自愈：真 kill -9 上游�
 
 | 日期 | 提交 | 内容 |
 |---|---|---|
+| 2026-11-11 | 本次推送 | **上游开出前缀缓存（APC）+ 27B 副本下线**：gmlx 的 APC 默认关闭，`server.cache.enabled` 打开后完全相同的 prompt ttft 25.5s→**0.21s**；再把 `prefill_step_size` 钉到 2048（决定检查点网格）后，真实 agent 形态下可变尾部的 ttft 从 5.75s 降到 **1.00s**。代价是冷启动多付约 9s 的快照存储（盈亏平衡 N≈1.75 轮）。同时把 27B 副本从 gmlx 下线：它满速只有 34.6 tok/s，而 125B 带 MTP 是 60~135 tok/s，拿它分摊轻量请求反而更慢。新增 `tools/bench-prefill.py`（ttft/prefill/decode 基准，支持 system 前缀与强制冷启动）与 `tests/test_flash_runtime.py`（29 项，含 yaml/env 不变量）。 |
 | 2026-11-09 | 本次推送 | **看门狗抽成独立模块 `tg_watchdog.py`**：这套逻辑被索引当作参考范例收录后，发现复用成本不对——真正难的 210 行埋在 4200 行网关里，想抄的人得先读 200 行无关代码。现在整段搬到独立文件（323 行，零依赖，Python 3.9+），只暴露 `configure()` 四个注入点（配置目录 / 日志 / 在飞计数 / 重启脚本）和 `targets` `tick` `loop` `snapshot`。网关侧从 210 行实现缩成 38 行适配层，行为与参数默认值完全不变；模块缺失时网关照常启动、只失去自愈能力，启动日志与 `/health` 都明确报 reason，不静默降级。测试前 4 节不加载网关（证明可独立跑），新增退避序列与降级行为断言，25 项 → 33 项 |
 | 2026-11-09 | 本次推送 | **launchd 加作业 EIO 已解决**：加上 `sudo` 后 `launchctl bootstrap` 成功，根因是执行上下文对该 GUI 域没有「新增作业」权限（被 launchd 泛化成 EIO），不是 I/O 层故障。接管时踩到一个必然的坑：手动起的实例还占着 `:3000`，新作业一直 `Address already in use` 退出重试（`runs` 从 3 涨到 8）——**先停手动实例再交给 launchd**。实测 `kill -9` 托管实例后 **2s 内自动重启**，`/health` 200、看门狗 `enabled`、`auto`+`tools` 仍选中 `qwen3.8-flash-next`。README 的「与 launchd 的分工」补成三方职责表，并明确**别给 gmlx 也挂 launchd**（会抢 `:8090`） |
 | 2026-11-09 | 本次推送 | **内置运行时看门狗（`flash-watchdog` 线程）**：模型服务（gmlx）挂在网关的后台线程上巡检，不再依赖第二个守护进程。判据是「连续 `TG_WD_FAIL_THRESHOLD`（默认 3）次探测 `/v1/models` 失败」，**有在飞请求时阈值自动翻倍**——正在服务用户的进程不该被巡检打断；重启后有 `TG_WD_GRACE`（150s）静默观察期（111 GB 权重冷加载约 75s，太短会把它自己打断），端口通但 300s 不响应判为卡死；连续重启按 `150 → 300 → 600 → 1200 → 1800`s 退避，恢复后需连续健康 `TG_WD_STABLE_RESET`（300s）才把重启计数清零。`/health` 增加 `watchdog` 字段（state/fails/restarts/last_check_ago_s/next_attempt_in_s）。实测 `kill -9` 后 20s 判失败、21:04 恢复，重启后 400 token / 6.12s = 65.4 tok/s（证明权重真加载）。新增 `tests/test_watchdog.py`（25 项） |

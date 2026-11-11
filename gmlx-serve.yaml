@@ -1,13 +1,13 @@
-# gmlx 多模型服务配置 —— 由 tools/start-flash.py 按 flash-runtime.json 的
+# gmlx 服务配置 —— 由 tools/start-flash.py 按 flash-runtime.json 的
 # "config" 字段加载（config 模式），取代原先的单模型命令行。
 #
-# 为什么要多模型：
-#   gmlx 的 mid-flight 注入缺陷只在**同一个模型的 batch 内**触发
-#   （models/qwen4_exp/vlm_model.py:135 的 mrope 位置张量算出 (1,2,2) 而目标
-#    (3,2,1)，整批 ValueError，两个并发请求 100% 双双 500）。
-#   不同模型各有自己的 BatchGenerator，并发实测全 200 且墙钟短于串行
-#   （gemma4 + qwen3.8-27b：并发 5.72s vs 串行 7.78s）。
-#   所以把 27B 也挂在这里：轻量请求走 27B、长上下文走 125B，两者不再互相排队。
+# 单模型（2026-11-11 晚决定：27B 先下线）
+# --------------------------------------
+# 之前挂过 qwen3.8-27b-mlx，想用"轻量请求走 27B / 长上下文走 125B"分摊排队。
+# 实测不值：27B 满血也只有 ~34 tok/s decode，而 125B 带 MTP 投机解码是 60~135
+# tok/s（服务端日志 [spec] rate=1.000），轻量请求走 27B 反而更慢；两台模型同时
+# 常驻还挤内存、拖慢加载。故只留 125B，配置留在 git 历史里，要恢复把 27B 那段
+# 加回来并把 max_models 提到 2 即可。
 #
 # 注意：改动本文件后必须重启 gmlx（会掐断在飞流），见 tools/start-flash.py。
 
@@ -16,7 +16,25 @@ server:
   port: 8090
   no_auth: true
   menubar: false
-  max_models: 2
+  max_models: 1
+  # 分块显式钉在 2048：APC 的检查点只能落在"分块网格"上（lcm(每轮步长, block_size)），
+  # 网格越粗，尾部需要重算的 tokens 越多。实测 8192 与 2048 的 prefill 吞吐一致
+  # （953 vs 952 tok/s），所以选细的。
+  prefill_step_size: 2048
+  # 前缀缓存（APC，Automatic Prefix Cache）—— 默认**关闭**。
+  # 这是本机最值钱的一个开关：客户端每一轮都把同一段长 system prompt 重发，
+  # 缓存关着就等于每轮把几万 tokens 重新 prefill 一遍（实测 24k prompt
+  # ttft=25.5s、prefill 956 tok/s）。打开后**完全相同**的 prompt 命中整段，
+  # ttft 0.21s；只有末尾几行不同的照样能从最近的检查点续算。
+  cache:
+    enabled: true
+    # 纯注意力架构用块缓存，exact_entries 给混合/循环架构留冗余快照。
+    exact_entries: 8
+    # 不开 SSD 层：本模型是混合注意力（12 qsa / 36 arr 层），APC 存的是
+    # **检查点快照**而不是 KV 块，单个 24k 上下文的快照约 180MB。开磁盘层等于
+    # 每个请求往盘上写若干 GB，写放大远大于它省下的那点重启后首次 prefill。
+    # 需要时加 disk: {path: ~/.cache/gmlx/apc, max_gb: 40} 即可（path 是开关，
+    # 只给 max_gb 不会生效）。
 
 profiles:
   # 只关思维链，不覆盖任何采样参数（空 sampling 不会盖住 family 默认值）。
@@ -37,15 +55,6 @@ models:
     speculative_width_cap: 1
     # 主力模型常驻，绝不因 --max-models 被换出
     pin: true
-
-  # id 必须以 -mlx 结尾：网关的 TG_MODEL_ALIASES 把 qwen3.8-27b 改写成
-  # qwen3.8:27b（Ollama 原生名），若这里也叫 qwen3.8-27b，网关发出的名字会被
-  # 改写成 Ollama 名字，这个 gmlx 副本就永远路由不到。加后缀后两条路并存：
-  #   qwen3.8:27b / qwen3.8-27b → Ollama（11434）
-  #   qwen3.8-27b-mlx          → 本机 gmlx（8090），可与 125B 真正并行
-  qwen3.8-27b-mlx:
-    path: ~/models/extra/qwen3.8-27b.gguf
-    mmproj: ~/models/extra/mmproj-qwen3.8-27b.gguf
 
 # 不在这里配 aliases。
 # gmlx 的 aliases 会被 /v1/models 当成**独立 id** 返回，且字段（resident/pinned/

@@ -1,8 +1,8 @@
 # deploy/ —— 线上部署目录的非核心文件
 
 这个目录镜像线上部署目录里**除网关主程序之外**的东西。主程序（`token-gateway.py`、
-`tg_watchdog.py`、plist、`flash-runtime.json`、`start-*.py`）在仓库根和 `tools/`，
-由 `tools/rollback.py` 的 MAPPING 负责还原到本机。
+`tg_watchdog.py`、plist、`flash-runtime.json`、`gmlx-serve.yaml`、`start-*.py`）在仓库根和
+`tools/`，由 `tools/rollback.py` 的 MAPPING 负责还原到本机。
 
 这里的文件**没有自动还原路径**：它们是参考资料 —— 想知道「这套网关周边还跑着什么、
 当初怎么装的」时看这里，而不是靠记忆。
