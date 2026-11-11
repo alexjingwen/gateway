@@ -1,0 +1,39 @@
+# 隔离测试实例（:8091）—— 只用于「小模型并行」实验，**不接入生产网关**。
+#
+# 起法：
+#   NO_PROXY='*' ~/gmlx-env/bin/gmlx serve --config gmlx-small.yaml
+# 用途：复现 README 「小模型并行实测」那张表
+#   python3 tools/bench-parallel.py --url http://127.0.0.1:8091 --models gemma4-9b,qwen3.8-27b-mlx --n 4
+#
+# 两个模型都是 Ollama blob 硬链接出来的 .gguf（ln，不额外占盘）：
+#   ~/.ollama/models/blobs/sha256-4c27e0f5…  →  ~/models/extra/gemma4-9b.gguf
+#
+# 目的：回答两个问题
+#   1) 两个**小模型**并发时是否真的重叠、吞吐是否随并发上升？
+#      实测（200 token/请求，cache 关）：gemma4-9B 109→156→216 tok/s（n=1/2/4），
+#      qwen3.8-27B 32→42→53；即 9B 近乎线性、27B 只有 1.65×。
+#   2) 同一模型 2 并发在这两个模型上会不会同样触发 "Cannot broadcast ..."？
+#      **不会**。该缺陷在 MTP 投机解码的 mid-flight 注入路径上，这两个模型都不带
+#      speculative；4 并发 ×4 轮的输出与串行基准**逐字节一致**、0 错误。
+#      这正是网关把串行锁收窄到 speculative 模型的依据（TG_MLX_SERIAL_MODE=spec）。
+#
+# 与生产实例的差别只有：端口、模型集合。cache 关闭是为了不把「缓存命中」误读成「并发收益」。
+
+server:
+  host: 127.0.0.1
+  port: 8091
+  no_auth: true
+  menubar: false
+  max_models: 2
+  prefill_step_size: 2048
+  # 关缓存：本实验比的是并发/解码，缓存命中会把 ttft 拉到亚秒，掩盖争用
+  cache:
+    enabled: false
+
+models:
+  gemma4-9b:
+    path: ~/models/extra/gemma4-9b.gguf
+
+  qwen3.8-27b-mlx:
+    path: ~/models/extra/qwen3.8-27b.gguf
+    mmproj: ~/models/extra/mmproj-qwen3.8-27b.gguf

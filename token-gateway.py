@@ -314,29 +314,44 @@ DEFAULT_MAX_CONCURRENCY = _env_num("TG_CONCURRENCY", 10, minimum=1)  # 全局最
 MLX_SERIAL = os.environ.get("TG_MLX_SERIAL", "1") not in ("0", "false", "no", "off")
 MLX_SERIAL_WAIT = _env_num("TG_MLX_SERIAL_WAIT", 300, minimum=1)
 
-# 锁按**上游 host + 上游真实驻留模型** 分：
+# 串行的**范围**（2026-11-11 晚补测后收窄）：
+#   spec  —— 只串行带投机解码（MTP）的上游模型（默认）
+#   model —— 每个上游模型各一把锁（上一版行为，一键回退用）
+#   host  —— 整个 host 一把锁（最早的行为）
+# 为什么可以这么收：缺陷发生在 speculative 的 mid-flight 注入路径（draft 张量宽度与
+# 目标 batch 不符），**不带投机的模型走不到那段代码**。实测（gmlx 单进程驻留
+# gemma4-9B + qwen3.8-27B，cache 关闭，200 token/请求）：
+#   模型      n=1      n=2      n=4      同模型并发 4×4 轮输出
+#   gemma4   109 t/s  156 t/s  216 t/s   与串行基准**逐字节一致**，0 错误
+#   qwen27B   32 t/s   42 t/s   53 t/s   同上
+# 而带 MTP 的 125B 两并发仍 100% 500。所以锁跟着 speculative 走，而不是跟着 host 走。
+MLX_SERIAL_MODE = (os.environ.get("TG_MLX_SERIAL_MODE", "spec") or "spec").strip().lower()
+if MLX_SERIAL_MODE not in ("spec", "model", "host"):
+    MLX_SERIAL_MODE = "spec"
+
+# 锁键的两层退化：
 #   · 不同 host 是不同进程，各有自己的 BatchGenerator，互不干扰 —— 绝不能串在一起。
 #     （初版用一把全局锁，多 host 时会互相阻塞，是真实的粒度错误。）
-#   · 同一 host 内的不同**模型**各有自己的 BatchGenerator（gmlx 每模型走
-#     `_new_batch_gen`），实测可真正并行且不触发混批缺陷 —— 所以模型之间允许各拿一把锁。
-#     实测（同一 gmlx 上 gemma4 + qwen3.8-27b 同时驻留）：两个不同模型并发
-#     200/200，墙钟 5.72s < 串行 7.78s；而同**一个**模型两并发 100% ValueError。
-#     即：混批缺陷只在单模型批内，模型之间是安全的。
+#   · 同一 host 内不同**模型**各有自己的 BatchGenerator，本来就并行；真正的串行需求来自
+#     "某一个模型自己不能混批"，也就是带投机的那个。所以键按模型分，而不是按 host 分。
 #   · 但不能按**请求里的模型名**分：网关看到的是别名（qwen3.8-flash →
 #     qwen3.8-flash-125b → 上游 id qwen3.8-flash-next），按名字分会让同一个上游
 #     模型拿到两把锁、照样混批。所以键必须用**上游 /v1/models 返回的真实 id**。
-#   · 上游 id 拿不到 / 该 host 只有一个模型 / 名字对不上 → 退回 host 级锁（保守）。
-#     单模型 host 下 host 锁与旧行为完全等价，所以这个改动在单模型时是 no-op。
+#   · 上游拿不到清单 / 名字对不上 → 退回 host 级锁（保守：不知道是谁就不放行）。
+#     单模型 host 下 host 锁与旧行为完全等价，所以这条退化路径是 no-op。
 _MLX_UPSTREAM_IDS_TTL = 60.0                       # 上游模型清单缓存秒数
-_mlx_upstream_ids: Dict[str, tuple] = {}           # host -> (ts, frozenset | None)
+_mlx_upstream_ids: Dict[str, tuple] = {}           # host -> (ts, {id: speculative} | None)
 _mlx_upstream_ids_lock = threading.Lock()
 _mlx_probe_lock = threading.Lock()                 # 防惊群：同一时刻只让一个线程去探测
 _mlx_serial_sems: Dict[str, threading.Semaphore] = {}
 _mlx_serial_sems_lock = threading.Lock()
 
 
-def _mlx_upstream_model_ids(host: str):
-    """上游当前可服务的真实模型 id 集合；拿不到返回 None。带 TTL，失败结果也缓存。"""
+def _mlx_upstream_models(host: str):
+    """上游真实模型 → 是否带投机解码（`{id: bool}`）；拿不到返回 None。
+
+    带 TTL；**失败结果也缓存**，否则上游挂掉时每个请求都要吃一次 5s 超时。
+    """
     now = time.time()
     with _mlx_upstream_ids_lock:
         hit = _mlx_upstream_ids.get(host)
@@ -348,28 +363,46 @@ def _mlx_upstream_model_ids(host: str):
             hit = _mlx_upstream_ids.get(host)
             if hit and time.time() - hit[0] < _MLX_UPSTREAM_IDS_TTL:
                 return hit[1]
-        ids = None
+        models = None
         try:
             status, resp = _rapid_mlx_request(host, "GET", "/v1/models", timeout=5)
             if status == 200:
                 data = json.loads(resp)
-                got = {str(m.get("id") or "") for m in (data.get("data") or []) if m.get("id")}
-                ids = frozenset(got) if got else None
+                got = {}
+                for m in (data.get("data") or []):
+                    mid = str(m.get("id") or "")
+                    if not mid:
+                        continue
+                    # 字段缺失按 True 处理（保守）：宁可多排一次队，也不放进来混批
+                    got[mid] = bool(m.get("speculative", True))
+                models = got or None
         except Exception:
-            ids = None
+            models = None
         with _mlx_upstream_ids_lock:
-            _mlx_upstream_ids[host] = (time.time(), ids)
-        return ids
+            _mlx_upstream_ids[host] = (time.time(), models)
+        return models
 
 
 def _mlx_lock_key(host: str, model: str = "") -> str:
-    """串行锁的键：`host`（保守）或 `host|真实模型id`（该 host 上确实有多个模型时）。"""
-    ids = _mlx_upstream_model_ids(host)
-    if not ids or len(ids) < 2:
-        return host                      # 单模型 / 探测失败 → host 级锁（= 旧行为）
-    if model in ids:
-        return f"{host}|{model}"
-    return host                          # 名字对不上（别名/未知名）→ 保守退 host 锁
+    """串行锁的键。返回**空串**表示该上游模型不需要排队（可安全批处理）。
+
+    分档见 MLX_SERIAL_MODE；默认 `spec`：
+      · 探测失败 → `host`（保守，等价于最早的行为）
+      · 命中真实 id 且 speculative=False → `""`（不排队）
+      · 命中真实 id 且 speculative=True  → `host|model`
+      · 名字对不上（别名 / 未知名）→ `host`（保守：不知道是谁，就不敢放行）
+    """
+    if MLX_SERIAL_MODE == "host":
+        return host
+    models = _mlx_upstream_models(host)
+    if not models:
+        return host                      # 探测失败 → host 级锁（= 最早的行为）
+    if model in models:
+        if MLX_SERIAL_MODE == "model" or models[model]:
+            return f"{host}|{model}"
+        return ""                        # 不带投机 → 放行并发
+    # 名字对不上（别名 / 未知名）→ 保守退 host 锁：不知道是谁就不放行
+    return host
 
 
 def _mlx_sem_for(key: str) -> threading.Semaphore:
@@ -3187,14 +3220,16 @@ iframe{{padding-top:0}}
 
     def _proxy_serialized(self, method: str, client_ip: str, api_key: str,
                           key_cfg: dict, cfg: dict, **kw):
-        """把发往 Rapid-MLX(gmlx) 的**生成**请求串行化。
+        """把发往 Rapid-MLX(gmlx) 的**生成**请求按需串行化。
 
-        粒度：**同一上游模型内串行**——同模型并发会触发 gmlx 的 mid-flight
-        注入缺陷（mrope 位置张量形状不符，整批 ValueError，两个并发请求
-        100% 双双 500）；**不同上游模型之间并行**——各模型有自己的
-        BatchGenerator，实测并发 200/200 且墙钟短于串行。
-        锁键的取法见 _mlx_lock_key：探测不到真实 id、或该 host 只有一个模型时，
-        退回 host 级锁（与串行化首个版本的行为完全等价）。
+        粒度：**只串行带投机解码（MTP）的上游模型**。缺陷在 speculative 的 mid-flight
+        注入路径上：当一个请求正在 decode、另一个被塞进同一 batch 时，draft 张量宽度与
+        目标 batch 不符，整批 ValueError（两个并发请求 100% 双双 500）。
+        **不带投机的模型走不到那段代码** —— 实测 gemma4-9B / qwen3.8-27B 同模型 4 并发
+        ×4 轮，输出与串行基准逐字节一致、0 错误，且 n=4 时吞吐 216 / 53 tok/s（1.99x / 1.65x）。
+        不同上游模型各有自己的 BatchGenerator，本来就互不干扰。
+        锁键的取法见 _mlx_lock_key；`TG_MLX_SERIAL_MODE=model` 可回退到"每模型都串行"，
+        `=host` 回退到最早的全 host 串行。
         """
         path = self.path.split("?", 1)[0]
         is_gen = path.startswith("/v1/chat") or path.startswith("/v1/completions")
@@ -3203,8 +3238,11 @@ iframe{{padding-top:0}}
         if not (is_gen and MLX_SERIAL and host in RAPID_MLX_HOSTS):
             return self._proxy(method, client_ip, api_key, key_cfg, cfg,
                                upstream_host=host, **kw)
-        # 键的粒度：host（保守）或 host|上游真实模型 id（该 host 上确实有多个模型）
+        # 键的粒度见 _mlx_lock_key；空串 = 该上游模型不带投机解码，可以安全并发
         lock_key = _mlx_lock_key(host, model)
+        if not lock_key:
+            return self._proxy(method, client_ip, api_key, key_cfg, cfg,
+                               upstream_host=host, **kw)
         sem = _mlx_sem_for(lock_key)
         t0 = time.time()
         got = sem.acquire(timeout=MLX_SERIAL_WAIT)

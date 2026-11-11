@@ -19,6 +19,7 @@
 - [auto 虚拟模型（自动分配）](#auto-虚拟模型自动分配)
 - [上游模型服务（gmlx config 模式）](#上游模型服务gmlx-config-模式)
 - [上游加速：前缀缓存（APC）与 prefill 调优](#上游加速前缀缓存apc与-prefill-调优)
+- [小模型并行实测（两模型 × 四个并发）](#小模型并行实测两模型--四个并发)
 - [配置字段速查](#配置字段速查)
 - [安全加固](#安全加固)
 - [mem-guard.mjs —— 设备级内存守卫](#mem-guardmjs--设备级内存守卫)
@@ -93,7 +94,8 @@ TG_DISABLE_HTTPS=1 TG_PORT=3000 python3 token-gateway.py
 | TG_MODEL_PARAMS | (空) | 参数量覆写，格式 `模型=参数量B`（逗号分隔，如 `qwen3.8-flash-next=125`）。优先级 **覆写 > 上游元数据 > 名字推断**；给不提供 `/api/show` 元数据、名字里又没数字的运行时（gmlx 的 `qwen3.8-flash-next`）用 |
 | TG_QPS | 5 | 每 key 每秒请求数 |
 | TG_CONCURRENCY | 10 | 全局最大并发 |
-| TG_MLX_SERIAL | 1 | **把发往 Rapid-MLX 上游的生成请求串行化**。原因：gmlx 的 mid-flight 注入路径有形状缺陷 —— 一个请求正在 decode、另一个被塞进同一 batch 时，mrope 位置张量形状不符，整批 `Cannot broadcast array of shape (1,2,2) into shape (3,2,1)`，**同一个模型的两个并发请求 100% 双双 500**。串行的粒度是「上游 host + 上游真实模型 id」（见 `_mlx_lock_key`）：**同模型串行、异模型并行**；上游 `/v1/models` 探测不到或该 host 只有一个模型时退回 host 级锁。`/v1/models` 等元数据 GET 不排队。设 0 关闭（回到会 500 的行为） |
+| TG_MLX_SERIAL | 1 | 总开关：是否对发往 Rapid-MLX 上游的生成请求做串行保护。原因：gmlx 的 mid-flight 注入路径有形状缺陷 —— 一个请求正在 decode、另一个被塞进同一 batch 时，mrope 位置张量形状不符，整批 `Cannot broadcast array of shape (1,2,2) into shape (3,2,1)`，**同一个模型的两个并发请求 100% 双双 500**。设 0 关闭（回到会 500 的行为） |
+| TG_MLX_SERIAL_MODE | spec | 串行**范围**。`spec`：只串行 `/v1/models` 里 `speculative=true` 的模型（默认；不带投机的模型实测 4 并发输出逐字节一致，放行可拿 2× 吞吐）；`model`：每个上游模型各一把锁；`host`：整个 host 一把锁。详见[小模型并行实测](#小模型并行实测两模型--四个并发) |
 | TG_MLX_SERIAL_WAIT | 300 | 串行队列的最长等待（秒），超时返回 429（而非 500）。客户端侧表现是"排队"，不是"报错" |
 | TG_READ_TIMEOUT | 900 | **单次静默上限**（秒），不是整段耗时上限：等上游响应头、以及每次读取响应体，连续这么久没有任何字节才判超时。5 万 token 上下文的预填充本身就要 100~150s，生产建议 ≥600 |
 | TG_VLM_READ_TIMEOUT | 120 | 多模态（带图）请求的单次静默上限（秒） |
@@ -501,13 +503,25 @@ curl -X POST http://127.0.0.1:3000/api/admin/keys -H "X-Admin-Token: $ADMIN_TOKE
 
 ## 上游模型服务（gmlx config 模式）
 
-`gmlx` 支持同时驻留多个模型，每个模型有自己的 `BatchGenerator`。这带来一条决定锁粒度的性质：
+`gmlx` 支持同时驻留多个模型，每个模型有自己的 `BatchGenerator`。
 
-> **同一个模型**的两个并发请求会触发 gmlx 的 mid-flight 注入缺陷（整批 500）；
-> **不同模型**并发则各自独立出批，可以真正并行。
+网关要不要串行化，取决于**这个上游模型自己能不能混批**，而判据是 `/v1/models` 里的
+`speculative` 字段 —— 缺陷发生在投机解码的 mid-flight 注入路径上（draft 张量宽度与目标
+batch 不符），不带投机的模型走不到那段代码：
 
-网关的串行锁据此按「上游 host + 上游真实模型 id」分（`_mlx_lock_key`），于是在多模型下游
-仍然安全：同模型排队、异模型并行。
+| 上游模型 | speculative | 同模型并发 | 网关行为 |
+|---|---|---|---|
+| qwen3.8-flash-next（MTP drafter） | `true` | 2 并发 3 轮 **6/6 全 500** | `host\|model` 排队 |
+| gemma4-9B / qwen3.8-27B | `false` | 4 并发 ×4 轮 **输出逐字节一致、0 错误** | 不排队，直接放行 |
+
+所以 `_mlx_lock_key()` 返回空串就表示「不用等」，`_proxy_serialized` 直接转发。实测数据见
+[小模型并行实测](#小模型并行实测两模型--四个并发)。回退开关：
+
+```bash
+TG_MLX_SERIAL_MODE=spec    # 默认：只串行带投机的模型
+TG_MLX_SERIAL_MODE=model   # 上一版：每个模型各一把锁（都排队）
+TG_MLX_SERIAL_MODE=host    # 最早：整个 host 一把锁
+```
 
 ### 配置
 
@@ -567,7 +581,7 @@ models:
    `gemma4`、`qwen3.8:27b` 可加载；`qwen2.5vl` 的 arch 不被支持
    （`[discover] skip (unsupported arch 'qwen25vl')`）。
 
-### 实测（本机，M3 Ultra 274 GB）
+### 实测（本机，M3 Ultra 256 GB）
 
 | 场景 | 结果 |
 |---|---|
@@ -589,6 +603,82 @@ models:
   逻辑，不是慢。看网关日志里有没有 `🔁 推理模型空正文`。
 - `APC enabled (..., disk=False)` 里的 `block_size`/`num_blocks` 是 APC 自己的块参数，
   与本机调优用的 `prefill_step_size` 不是一回事。
+
+## 小模型并行实测（两模型 × 四个并发）
+
+问题：把请求分给两个**小模型**能不能换来吞吐？还是只是把同一块内存带宽分给两拨人？
+
+环境：隔离实例 `gmlx serve --config gmlx-small.yaml`（:8091，`max_models: 2`，**cache 关闭**，
+`prefill_step_size: 2048`），同一进程驻留 gemma4-9B（9.6 GB）与 qwen3.8-27B（16.8 GB）。
+每条请求 200 token，prompt 极短（把 prefill 压到可忽略），先跑一遍串行做基线，再用同一批
+请求同时发起。工具：`tools/bench-parallel.py`。
+
+| 模型 | n | 串行 agg | 并发 agg | speedup | 并发度 | 单请求 decode |
+|---|---|---|---|---|---|---|
+| gemma4-9B | 1 | 108.9 t/s | 109.0 t/s | 1.00 | 1.00 | 112 → 112 |
+| gemma4-9B | 2 | 108.9 t/s | **156.4 t/s** | 1.44 | 2.00 | 112 → 81 |
+| gemma4-9B | 4 | 108.9 t/s | **216.4 t/s** | **1.99** | 3.98 | 112 → 57 |
+| qwen3.8-27B | 1 | 32.0 t/s | 31.9 t/s | 1.00 | 1.00 | 56 → 56 |
+| qwen3.8-27B | 2 | 32.0 t/s | **41.6 t/s** | 1.30 | 2.00 | 56 → 38 |
+| qwen3.8-27B | 4 | 31.9 t/s | **52.7 t/s** | 1.65 | 3.95 | 56 → 25 |
+| gemma + 27B（各 1） | 2 | 50.7 t/s | 58.5 t/s | 1.15 | 1.76 | — |
+| gemma×2 + 27B×2 | 4 | 50.8 t/s | 77.6 t/s | 1.53 | 3.36 | — |
+
+读法：
+
+1. **小模型批处理近乎线性**：9B 在 n=4 时聚合吞吐 1.99×（109 → 216 t/s）。decode 阶段每个
+   token 都要把全部权重读一遍，4 条请求共享一次读 → 省下的正好是权重带宽。
+2. **越大越不线性**：27B 同样 n=4 只有 1.65×（32 → 53 t/s）。它本身已经贴着带宽上限
+   （单请求 56 t/s），批处理只能摊薄一部分，注意力与 KV 的开销随 batch 线性上涨。
+3. **异模型并发不是"双倍"**：`speedup` 由最慢那条请求决定。gemma 1.8s 就跑完、27B 要 5.7s，
+   所以 2 并发的 speedup 只有 1.15 —— 收益体现在 agg（50.7 → 58.5），不是墙钟。
+4. **并发度是"平均同时在飞"**，`Σ(单请求墙钟) / 墙钟跨度`。2 请求完全重叠 ≈ 2.0，纯串行 ≈ 1.0。
+   异模型那行只有 1.76/3.36，就是因为快模型提前退场，后半程只有慢模型在跑。
+5. **跨进程没有额外魔法**：gemma 走 Ollama(:11434)、27B 走 gmlx(:8091) 时 speedup 1.19，
+   与同进程内异模型（1.15）一致 —— 决定收益的是同一块 GPU/内存，不是进程边界。
+
+### 并行 ≠ 互不影响
+
+逐条请求的 decode 从 112 → 57 t/s（gemma n=4）、56 → 25（27B n=4）。**总吞吐涨了，但每条
+请求都慢了一倍**。所以：
+
+- 交互式使用（一个人问一句等一句）开并发只会更慢；
+- 批量/多用户场景才吃得到聚合吞吐；
+- 要真正隔离只能拆物理机。
+
+### 两个测量陷阱
+
+1. **Ollama 默认不批处理**：同一台机上 `gemma4:latest` 4 并发时，单请求 decode 稳在 93 t/s
+   不降、聚合只从 73.7 涨到 85.5 —— 说明请求在排队而不是合批（`OLLAMA_NUM_PARALLEL` 默认 1）。
+   拿它当"gmlx 不行"的证据会得出反向结论。
+2. **同一台机器跨时间窗的数字不能直接比**：本机在连续压测约 40 分钟后出现过一轮所有模型
+   一起掉 30~50%（27B 56 → 29 t/s，gemma 112 → 78 t/s）的窗口，停止 Ollama 常驻后恢复。
+   A/B 复测（`ollama stop` → 起 → 停）三次数值完全一致，说明不是 Ollama 造成的，更像是
+   系统级的内存压缩/带宽抖动。**结论：只比同一个窗口内的 seq 与 par**，别拿上午的 n=1
+   去比下午的 n=4。
+
+### 复现
+
+```bash
+# 1) 起隔离实例（生产 :8090 不受影响，256 GB 机器上共存无压力）
+NO_PROXY='*' ~/gmlx-env/bin/gmlx serve --config gmlx-small.yaml     # 端口 8091
+
+# 2) 矩阵
+python3 tools/bench-parallel.py --url http://127.0.0.1:8091 --models gemma4-9b --n 4 --gen 200
+python3 tools/bench-parallel.py --url http://127.0.0.1:8091 --models qwen3.8-27b-mlx --n 4 --gen 200
+python3 tools/bench-parallel.py --url http://127.0.0.1:8091 \
+        --models gemma4-9b,qwen3.8-27b-mlx --n 4 --gen 200
+# 3) 跨引擎（模型名后加 @url）
+python3 tools/bench-parallel.py \
+        --models gemma4:latest@http://127.0.0.1:11434,qwen3.8-27b-mlx@http://127.0.0.1:8091 --n 2
+```
+
+`gmlx-small.yaml` 里两个模型都是 Ollama blob 硬链接出来的 `.gguf`（`ln`，不额外占盘）：
+`~/.ollama/models/blobs/sha256-4c27e0f5…` → `~/models/extra/gemma4-9b.gguf`。
+
+> 注意 `gemma4:latest` 这个 blob 是**基座模型**，Ollama 的模板块就是 `{{ .Prompt }}`，
+> 所以它对 chat 提示词只会做续写（长前缀还会直接吐 EOS）。上表把它当**算力负载**用，
+> 不评质量 —— 要测质量得换 instruct 权重。
 
 ## 配置字段速查
 
@@ -1347,11 +1437,13 @@ python3 tests/test_model_list_cache.py # 列举接口读缓存：不再每次探
 python3 tests/test_auto_deep_only.py # 深度档白名单：轻/常规档摘掉贵模型，深度档仍可选，摘空不生效（11 项）
 python3 tests/test_model_params.py  # 参数量覆写：覆写优先于元数据与名字推断，非法值忽略（12 项）
 python3 tests/test_watchdog.py      # 看门狗：模块自足性 / 决策矩阵 / 退避序列 / 网关集成 / 缺模块降级（33 项）
-python3 tests/test_flash_runtime.py # gmlx 运行时：config 模式命令 / env 注入 / yaml 不变量（29 项）
+python3 tests/test_flash_runtime.py # gmlx 运行时：config 模式命令 / env 注入 / yaml 不变量（32 项）
+python3 tests/test_serial_lock.py   # 串行锁范围：按 speculative 分档 / 回退开关 / TTL（26 项）
+python3 tools/bench-parallel.py     # 需要真实模型，不是回归用例：并发矩阵（见「小模型并行实测」）
 python3 tools/verify-watchdog.py --yes  # 端到端自愈：真 kill -9 上游并等它回来（会中断服务；不带 --yes 为只读）
 ```
 
-十六个脚本都可通过环境变量改指向：
+十八个脚本都可通过环境变量改指向：
 
 | 变量 | 作用 |
 |---|---|
@@ -1365,6 +1457,7 @@ python3 tools/verify-watchdog.py --yes  # 端到端自愈：真 kill -9 上游�
 
 | 日期 | 提交 | 内容 |
 |---|---|---|
+| 2026-11-11 | 本次推送 | **并行实测：小模型批处理近乎线性，串行锁按 speculative 收窄**。隔离实例上（同进程驻留 gemma4-9B + qwen3.8-27B，cache 关闭）：9B 在 n=4 时聚合 109→**216 tok/s（1.99×）**，27B 32→53（1.65×），异模型组合 50.8→77.6（1.53×）；每请求 decode 相应从 112→57 / 56→25 —— 总吞吐涨了，单请求慢一倍。关键结论：`Cannot broadcast` 只发生在**带投机**的模型上，gemma / 27B 同模型 4 并发×4 轮输出与串行**逐字节一致**、0 错误，所以网关串行锁改为按 `/v1/models` 的 `speculative` 分档（`TG_MLX_SERIAL_MODE=spec|model|host`），小模型不再白白排队。新增 `tools/bench-parallel.py`（seq/par 对照，输出 speedup / 并发度 / agg tok/s）与 `gmlx-small.yaml`（隔离实例配置，可完整复现）。 |
 | 2026-11-11 | 本次推送 | **上游开出前缀缓存（APC）+ 27B 副本下线**：gmlx 的 APC 默认关闭，`server.cache.enabled` 打开后完全相同的 prompt ttft 25.5s→**0.21s**；再把 `prefill_step_size` 钉到 2048（决定检查点网格）后，真实 agent 形态下可变尾部的 ttft 从 5.75s 降到 **1.00s**。代价是冷启动多付约 9s 的快照存储（盈亏平衡 N≈1.75 轮）。同时把 27B 副本从 gmlx 下线：它满速只有 34.6 tok/s，而 125B 带 MTP 是 60~135 tok/s，拿它分摊轻量请求反而更慢。新增 `tools/bench-prefill.py`（ttft/prefill/decode 基准，支持 system 前缀与强制冷启动）与 `tests/test_flash_runtime.py`（29 项，含 yaml/env 不变量）。 |
 | 2026-11-09 | 本次推送 | **看门狗抽成独立模块 `tg_watchdog.py`**：这套逻辑被索引当作参考范例收录后，发现复用成本不对——真正难的 210 行埋在 4200 行网关里，想抄的人得先读 200 行无关代码。现在整段搬到独立文件（323 行，零依赖，Python 3.9+），只暴露 `configure()` 四个注入点（配置目录 / 日志 / 在飞计数 / 重启脚本）和 `targets` `tick` `loop` `snapshot`。网关侧从 210 行实现缩成 38 行适配层，行为与参数默认值完全不变；模块缺失时网关照常启动、只失去自愈能力，启动日志与 `/health` 都明确报 reason，不静默降级。测试前 4 节不加载网关（证明可独立跑），新增退避序列与降级行为断言，25 项 → 33 项 |
 | 2026-11-09 | 本次推送 | **launchd 加作业 EIO 已解决**：加上 `sudo` 后 `launchctl bootstrap` 成功，根因是执行上下文对该 GUI 域没有「新增作业」权限（被 launchd 泛化成 EIO），不是 I/O 层故障。接管时踩到一个必然的坑：手动起的实例还占着 `:3000`，新作业一直 `Address already in use` 退出重试（`runs` 从 3 涨到 8）——**先停手动实例再交给 launchd**。实测 `kill -9` 托管实例后 **2s 内自动重启**，`/health` 200、看门狗 `enabled`、`auto`+`tools` 仍选中 `qwen3.8-flash-next`。README 的「与 launchd 的分工」补成三方职责表，并明确**别给 gmlx 也挂 launchd**（会抢 `:8090`） |
