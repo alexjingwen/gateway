@@ -292,15 +292,20 @@ check("冷却结束后重新可用", P2.snapshot()["lanes"][0]["down_for_s"] == 
 
 print("\n9. 容量 > 1：同一模型可以同时服务两个上下文（cap=2）")
 P = pool(("big", "m1", "", 10, 2))
-a, _ = P.acquire("A")
-b, _ = P.acquire("B")
+a, _ = P.acquire("A", est_tokens=100)
+b, _ = P.acquire("B", est_tokens=100)
 check("cap=2 时第二也能进", b["name"] == "big" and P.snapshot()["lanes"][0]["busy"] == 2)
+# 两个在飞 → job_ends 必须记两条，否则"最早空出"会被算成 0，调度以为这条泳道随便进
+check("两条在飞时记两笔占用（预测据此算最早空出）",
+      len(P._by_name["big"]["job_ends"]) == 2, P._by_name["big"]["job_ends"])
 try:
     P.acquire("C", timeout=0.2)
     check("超过 cap 应排队", False)
 except LaneTimeout:
     check("超过 cap 才排队", True)
 P.release(a)
+check("放掉一条 → busy 回到 1，还能再进一条",
+      P._by_name["big"]["busy"] == 1 and P.acquire("D", timeout=0.3)[0]["name"] == "big")
 P.release(b)
 
 print("\n10. 快照字段（/api/admin/lanes 的契约）")

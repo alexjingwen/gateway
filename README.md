@@ -841,6 +841,43 @@ TG_MODEL_EXTRA='{"gpt-oss:20b":{"reasoning_effort":"low"}}'
 > 注意 `think: false` 与 `reasoning_effort: none` 都**无效**（前者被忽略，后者直接
 > 把预算烧在思维链上、正文为空）。gemma4 这类模型则连 `reasoning_effort` 都不认。
 
+### 只跑这两个模型：再挤出一个槽（cap=2，2026-11-12）
+
+27B 撤下后，本机就是**只跑 `qwen3.8-flash-next` + `gpt-oss:20b`** 两个模型。
+在这个前提下还能再挤一档，靠的是"一条泳道当两个槽用"。
+
+**为什么合批划算**：gpt-oss 是 MoE（21B 总参 / 3.6B 激活），两条序列进同一批
+几乎不涨计算量。但 Ollama 的 `OLLAMA_NUM_PARALLEL` 默认是 **1**，此时两个请求是
+**排队**而不是合批 —— 实测两并发 2.36s + 4.33s（墙钟 4.33s ≈ 串行 2.38×2，等于没并行)。
+设成 2 之后两条各 3.30s（墙钟 3.30s，**同一条泳道 1.44×**）。
+
+A/B 对照（同一批提示、`temperature=0`、串行基线同为 9.3s，只改 `TG_LANES` 里的 cap）：
+
+| gptoss 的 cap | 3 个上下文 | speedup |
+|---|---|---|
+| 1（一单一份） | 7.2s / 6.9s | 1.29× / 1.34× |
+| **2（一单两份）** | **5.2s / 5.5s** | **1.78× / 1.70×** |
+
+5 个上下文（flash 1 槽 + gpt-oss 2 槽 = 3 槽，第二轮接着上）：10.2s vs 串行 14.9s = **1.44~1.46×**。
+所以这台机器现在的能力面是：**同时 3 个上下文，3 上下文约 1.7~1.8×，5 上下文约 1.45×**。
+
+**部署方式**：单独起一个 Ollama 实例（`:11436`），不动 App 托管的 `:11434`——
+后者 `launchctl list` 里没有对应作业、没有可靠写环境变量的位置，重启还会掐掉用户会话。
+
+```bash
+python3 tools/start-ollama-lane.py            # 起（已起则只报告）/ --restart / --status
+# 网关侧：cap 写在 TG_LANES 的第三段
+TG_LANES='flash=qwen3.8-flash-next|100|1@http://127.0.0.1:8090,gptoss=gpt-oss:20b|95|2@http://127.0.0.1:11436'
+```
+
+`maintain-gateway.sh` 加了「2b. 泳道实例」段：`/api/version` 不通就调上面这个脚本拉起来。
+
+**一个必须知道的账**：网关对 Ollama 上游有"输出预算下限"，会把 `max_tokens: 120`
+抬到 2048（初衷是防 gemma4 这类模型把预算全烧在思维链上、正文返回空）。于是 gpt-oss
+即便配了 `reasoning_effort=low` 也会生成 ~263 token 才收尾 —— 一句"数到 120"的请求
+实际按 260+ token 记账，耗时也翻倍。**这不是并发变慢**：直连同一实例、同一 payload，
+两并发只要 2.69s；同一 payload 走网关单条反而要 3.2s（因为它在生成 263 而不是 120）。
+
 ### 三条不变量
 
 | 不变量 | 实现 | 为什么 |
@@ -1734,15 +1771,16 @@ python3 tests/test_model_params.py  # 参数量覆写：覆写优先于元数据
 python3 tests/test_watchdog.py      # 看门狗：模块自足性 / 决策矩阵 / 退避序列 / 网关集成 / 缺模块降级（33 项）
 python3 tests/test_flash_runtime.py # gmlx 运行时：config 模式命令 / env 注入 / yaml 不变量（32 项）
 python3 tests/test_serial_lock.py   # 串行锁范围：按 speculative 分档 / 回退开关 / TTL（26 项）
-python3 tests/test_lane_pool.py     # 多模型泳道：解析 / 上下文指纹 / 粘性 / 独占 / 排队 / 速度画像 / 隔离 / Ollama 保活（74 项）
+python3 tests/test_lane_pool.py     # 多模型泳道：解析 / 上下文指纹 / 粘性 / 独占 / 排队 / 速度画像 / 隔离 / 保活 / cap>1（76 项）
 python3 tests/test_model_extra.py   # 按模型补缺省请求体字段：只补客户端没给的 / 坏配置忽略（19 项）
 python3 tools/bench-parallel.py     # 需要真实模型，不是回归用例：并发矩阵（见「小模型并行实测」）
 python3 tools/bench-pool.py         # 需要真实模型：泳道池端到端（串行 vs 并行、粘性、排队，见「多模型泳道」）
 python3 tools/bench-gptoss.py       # 需要真实模型：多模型并发对照（单独 vs 同时，判"能不能当泳道"）
+python3 tools/start-ollama-lane.py  # 泳道专属 Ollama 实例（:11436，NUM_PARALLEL=2）：起 / --restart / --status
 python3 tools/verify-watchdog.py --yes  # 端到端自愈：真 kill -9 上游并等它回来（会中断服务；不带 --yes 为只读）
 ```
 
-二十个脚本都可通过环境变量改指向：
+二十一个脚本都可通过环境变量改指向：
 
 | 变量 | 作用 |
 |---|---|
@@ -1756,7 +1794,8 @@ python3 tools/verify-watchdog.py --yes  # 端到端自愈：真 kill -9 上游�
 
 | 日期 | 提交 | 内容 |
 |---|---|---|
-| 2026-11-12 | 本次推送 | **第二条泳道换成 gpt-oss:20b，泳道池从 1.39× 提到 1.83×**。上一版的瓶颈不是调度而是「第二条泳道慢 1.7~3.5 倍」（27B 34 tok/s）；Ollama 上的 gpt-oss:20b（MoE 21B/3.6B 激活、MXFP4、13.6 GB）单独 decode 105 tok/s、与 125B 同时跑 83/71 tok/s，端到端 3 上下文 **1.83×**、5 上下文 **1.77×**。同时证伪「三条泳道更好」：三条同时跑 125B 98→52、gpt-oss 105→48、27B 26，总墙钟 10.6s 反而慢于「两条跑完 + 第三个排队」的 9.4s，故把 27B 从 `gmlx-serve.yaml` 与 `TG_LANES` 一并撤下（配置以注释保留）。新增 **Ollama 泳道保活**（它空闲 5 分钟卸载模型，而 `/v1` 的 `keep_alive` 被静默忽略，只能定时拍 `/api/generate`，实测 0.28s 不生成 token；MLX 泳道靠 `pin`，自动跳过）与 **`TG_MODEL_EXTRA` 按模型补缺省请求体字段**（只补客户端没给的；gpt-oss 配 `reasoning_effort=low` 可把同题从 300 token/3.35s 压到 119 token/1.51s）。两个必须知道的代价：**中文提示词 token 膨胀约 4 倍**（harmony 模板 + o200k 分词器，18 vs 75 prompt tokens）、**中文表达弱于 125B**（代码与工具调用反而不差，工具调用 1.0s vs 2.5s、参数格式一致）。新增 `tests/test_model_extra.py`（19 项），`test_lane_pool.py` 扩到 74 项（含保活 8 项、速度画像门槛修正 3 项）。 |
+| 2026-11-12 | 本次推送 | **只跑这两个模型时再挤一个槽：gpt-oss 泳道 cap=2**。`OLLAMA_NUM_PARALLEL` 默认 1，两个请求进同一模型是**排队**（两并发 2.36s + 4.33s，墙钟等于串行）；设成 2 后两条各 3.30s（同一泳道 1.44×），因为 gpt-oss 是 MoE（3.6B 激活），合批几乎不涨计算量。A/B（同提示、temperature=0、串行基线同为 9.3s）：cap=1 → 1.29/1.34×；**cap=2 → 1.78/1.70×**；5 上下文 1.44~1.46×。为不碰 App 托管的 :11434（没有可靠写 env 的位置），新增 `tools/start-ollama-lane.py` 起专属实例 :11436，`maintain-gateway.sh` 加「2b」段自动拉起。顺带查清一笔账：网关的「输出预算下限」把 `max_tokens: 120` 抬到 2048，gpt-oss 即使 `reasoning_effort=low` 也会生成 ~263 token —— 一句「数到 120」按 260+ token 记账、耗时翻倍，这不是并发变慢（直连同实例两并发仅 2.69s）。 |
+| 2026-11-12 | `cb067efc` | **第二条泳道换成 gpt-oss:20b，泳道池从 1.39× 提到 1.83×**。上一版的瓶颈不是调度而是「第二条泳道慢 1.7~3.5 倍」（27B 34 tok/s）；Ollama 上的 gpt-oss:20b（MoE 21B/3.6B 激活、MXFP4、13.6 GB）单独 decode 105 tok/s、与 125B 同时跑 83/71 tok/s，端到端 3 上下文 **1.83×**、5 上下文 **1.77×**。同时证伪「三条泳道更好」：三条同时跑 125B 98→52、gpt-oss 105→48、27B 26，总墙钟 10.6s 反而慢于「两条跑完 + 第三个排队」的 9.4s，故把 27B 从 `gmlx-serve.yaml` 与 `TG_LANES` 一并撤下（配置以注释保留）。新增 **Ollama 泳道保活**（它空闲 5 分钟卸载模型，而 `/v1` 的 `keep_alive` 被静默忽略，只能定时拍 `/api/generate`，实测 0.28s 不生成 token；MLX 泳道靠 `pin`，自动跳过）与 **`TG_MODEL_EXTRA` 按模型补缺省请求体字段**（只补客户端没给的；gpt-oss 配 `reasoning_effort=low` 可把同题从 300 token/3.35s 压到 119 token/1.51s）。两个必须知道的代价：**中文提示词 token 膨胀约 4 倍**（harmony 模板 + o200k 分词器，18 vs 75 prompt tokens）、**中文表达弱于 125B**（代码与工具调用反而不差，工具调用 1.0s vs 2.5s、参数格式一致）。新增 `tests/test_model_extra.py`（19 项），`test_lane_pool.py` 扩到 74 项（含保活 8 项、速度画像门槛修正 3 项）。 |
 | 2026-11-11 | 本次推送 | **多模型泳道：一个模型一个上下文，多的排队**。新增 `pool` 虚拟模型 + `LanePool` 调度器（粘性 / 独占 / 排队三条不变量），上下文标识走 `X-TG-Context` → 请求体字段 → 前两条消息指纹；分派判据从「优先级」改成**预计完成时间**（`该泳道最早空出 + 实测 spb × 生成长度`，spb 是每条泳道自己的 EWMA）。为什么改：第一版按 rank 分派在实测里是负收益（3 上下文 **0.96×**、5 上下文 **0.81×**，因为 27B 慢 3.5 倍，接一单就晚 6s）；改成按预测后 3 上下文 **1.39×**、5 上下文 **1.26×**。新增 `/api/admin/lanes`、响应头 `X-Gateway-Lane[-Wait]`/`X-Gateway-Context`、连续失败隔离（3 次 → 60s 冷却 + 上下文改派）、`tools/bench-pool.py`（串行/并行对照）与 `tests/test_lane_pool.py`（63 项）。gmlx 恢复两模型常驻（`max_models: 2`）。**最坑的一条**：改 plist 后 launchd 用的还是旧环境快照（`/api/admin/lanes` 恒 `enabled:false`），必须 `bootout` 后再手动拉起。 |
 | 2026-11-11 | 本次推送 | **否证「不同请求并联、同上下文串联」**。三条路全部实测排除：① 同实例同模型并发崩不崩**与上下文无关** —— 两个完全不同前缀、解码 230 token 时 3/3 轮全 500（`Cannot broadcast (1,2,2)→(3,2,1)`，注入方带 draft 的 2 个位置、目标 batch 只要 1 个）；而把解码压到 1 token 就「通过」，纯属窗口太窄，不能当证据。② 双实例同 125B **内存直接否掉**：第二份不是共享，是真实 117.4 GB 私有分配，两份合计超物理内存 → 互相驱逐权重页 → 双方 decode 0.4~0.9 tok/s（正常 90+），恢复要 15 分钟。原先用 9.6 GB 模型得出的「mmap 共享」结论是假象（内存足够时看不出驱逐），已更正。③ 按上下文分锁不成立（不同上下文走同一条 batch 组装路径）。唯一通路是**跨模型**（已验证 1.99×）。新增 `tools/probe-prefix-concurrency.py`、`tools/bench-lanes.py`、`lane-8092.yaml`（复现用，标了生产禁用）。 |
 | 2026-11-11 | 本次推送 | **并行实测：小模型批处理近乎线性，串行锁按 speculative 收窄**。隔离实例上（同进程驻留 gemma4-9B + qwen3.8-27B，cache 关闭）：9B 在 n=4 时聚合 109→**216 tok/s（1.99×）**，27B 32→53（1.65×），异模型组合 50.8→77.6（1.53×）；每请求 decode 相应从 112→57 / 56→25 —— 总吞吐涨了，单请求慢一倍。关键结论：`Cannot broadcast` 只发生在**带投机**的模型上，gemma / 27B 同模型 4 并发×4 轮输出与串行**逐字节一致**、0 错误，所以网关串行锁改为按 `/v1/models` 的 `speculative` 分档（`TG_MLX_SERIAL_MODE=spec|model|host`），小模型不再白白排队。新增 `tools/bench-parallel.py`（seq/par 对照，输出 speedup / 并发度 / agg tok/s）与 `gmlx-small.yaml`（隔离实例配置，可完整复现）。 |

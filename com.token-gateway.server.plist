@@ -19,7 +19,7 @@
 		<key>TG_HOST</key>
 		<string>0.0.0.0</string>
 		<key>TG_LANES</key>
-		<string>flash=qwen3.8-flash-next|100|1@http://127.0.0.1:8090,gptoss=gpt-oss:20b|95|1@http://127.0.0.1:11434</string>
+		<string>flash=qwen3.8-flash-next|100|1@http://127.0.0.1:8090,gptoss=gpt-oss:20b|95|2@http://127.0.0.1:11436</string>
 		<key>TG_LANE_KEEPALIVE</key>
 		<string>240</string>
 		<key>TG_LANE_WAIT</key>
@@ -28,6 +28,8 @@
 		<string>sk-test</string>
 		<key>TG_MODEL_ALIASES</key>
 		<string>qwen3.8-27b=qwen3.8:27b,qwen3.8-flash=qwen3.8-flash-next</string>
+		<key>TG_MODEL_EXTRA</key>
+		<string>{"gpt-oss:20b": {"reasoning_effort": "low"}}</string>
 		<key>TG_MODEL_PARAMS</key>
 		<string>qwen3.8-flash-next=125</string>
 		<key>TG_PORT</key>
