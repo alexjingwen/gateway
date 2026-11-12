@@ -480,11 +480,32 @@ def _mlx_sem_for(key: str) -> threading.Semaphore:
 #   3) **排队而非拒绝**：模型全忙时新上下文进队列等，不直接 429。排队只在超时
 #      (TG_LANE_WAIT) 或队列满 (TG_LANE_QUEUE_MAX) 时才拒绝。
 #
+# ── 第二步（2026-11-12 晚）：cap>1 之后，"并发"到底赚在哪里 ────────────────────
+# 实测把并发收益拆成三个来源，机制必须按这三条分开算，不能笼统地"都并行就好"：
+#
+#   A. **跨后端并行（免费）**：不同端口/不同进程/不同模型各有自己的批处理循环。
+#      gpt-oss:20b 单跑 104 tok/s，与 125B 同跑 83 / 71 —— 两边合计 154 tok/s，
+#      是单跑 1.5 倍。这条只要**选不同 host** 就能拿到，代价为 0。
+#   B. **同后端合批（有折扣）**：同一 Ollama 实例开 OLLAMA_NUM_PARALLEL=2 后，两个请求
+#      合成一批，吞吐 1.44x，但**单个请求变慢到 1.44x 时长**（83/71 vs 单跑 104）。
+#      净赚，只是赚得比 A 少。
+#   C. **超过上游并行度的排队（净亏）**：NUM_PARALLEL=1 却把 cap 设成 2，两个请求在
+#      Ollama 内部串行 —— 网关以为在并行，实际单请求时长直接翻倍（2.0x），吞吐一点没涨。
+#      这是最危险的配置错误：**cap 是网关的意愿，NUM_PARALLEL 才是上游的能力**。
+#
+# 于是分派不再用"单请求速度"一把尺子，而是**并发感知的速度画像**：
+#   · 每条泳道按并发档位（conc=1,2,3…）分别学 spb（每生成 token 秒数）；
+#   · 预测"我要加入的那一档"（busy+1），所以往忙泳道里塞第二单会被如实定价成 1.44x；
+#   · 同一时刻优先选**所在 host 最闲**的那条（把 A 类收益先吃满，再谈 B 类）；
+#   · 自动降档：某档实测膨胀到 1.75x 以上（= 落在 C 类），把该泳道的有效容量压回去，
+#     冷却后自动试探一次恢复。判据就是 B/C 的分界线（1.44 vs 2.0），不是拍脑袋。
+#
 # 配置（TG_LANES），两种写法都支持：
 #   紧凑：flash=qwen3.8-flash-next|100|1,mid=qwen3.8-27b-mlx|50|1
 #         名字=模型[|优先级[|容量]][@http://host:port]
 #   JSON：[{"name":"flash","model":"qwen3.8-flash-next","rank":100,"cap":1}]
 # 模型名允许带 `:`（Ollama tag 如 gemma4:latest），所以分隔符用 `|` 而不是 `:`。
+# 这里的 `cap` 是**网关允许的并发**；上游真能跑几路由自动降档（TG_LANE_AUTOCAP）校准。
 LANE_POOL_MODEL = (os.environ.get("TG_POOL_MODEL", "pool") or "pool").strip()
 LANE_WAIT_S = _env_num("TG_LANE_WAIT", 600, minimum=1)
 LANE_QUEUE_MAX = _env_num("TG_LANE_QUEUE_MAX", 64, minimum=1)
@@ -517,6 +538,20 @@ LANE_CTX_BODY_KEYS = ("conversation_id", "session_id", "context_id", "user")
 # 只管"用过的泳道"：没用过的模型不该为了一条可能永远不来的请求占 13GB 内存。
 LANE_KEEPALIVE_S = _env_num("TG_LANE_KEEPALIVE", 240, minimum=0)
 LANE_KEEPALIVE_TTL = (os.environ.get("TG_LANE_KEEPALIVE_TTL", "15m") or "15m").strip()
+
+# ── 自动降档：把"cap 意愿"校准到"上游并行能力" ────────────────────────────────
+# 判断依据来自实测的两个数：上游开 NUM_PARALLEL=2 时，同批两个请求各自变成 1.44x 时长
+# （合批，净赚）；NUM_PARALLEL=1 时第二个请求排在第一个后面，各自 2.0x 时长（净亏）。
+# 所以阈值取 1.75 —— 卡在 1.44 与 2.0 之间，且要求连续多个样本（EWMA 后）才动手，
+# 避免被一次冷 prefill 噪声触发。降档后冷却期内不再降；冷却到期自动试探恢复一次，
+# 因此"上游后来开了 NUM_PARALLEL"这种变化不需要重启网关。
+LANE_AUTOCAP = os.environ.get("TG_LANE_AUTOCAP", "1") not in ("0", "false", "no", "off")
+LANE_AUTOCAP_RATIO = _env_num("TG_LANE_AUTOCAP_RATIO", 175, minimum=120) / 100.0
+LANE_AUTOCAP_SAMPLES = _env_num("TG_LANE_AUTOCAP_SAMPLES", 3, minimum=1)
+LANE_AUTOCAP_COOLDOWN_S = _env_num("TG_LANE_AUTOCAP_COOLDOWN", 120, minimum=1)
+# 单请求样本门槛（token 数）：与速度画像同一条底线，短样本的 prefill 占比太高，
+# 用它算"并发膨胀倍数"会把 20 token 的工具调用读成 3 倍慢。见 release() 的注释。
+LANE_SAMPLE_MIN_TOKENS = _env_num("TG_LANE_SAMPLE_MIN", 32, minimum=1)
 
 
 def _parse_lanes(raw: str) -> List[dict]:
@@ -633,15 +668,26 @@ class LanePool:
         self._lanes: List[dict] = []
         self._by_name: Dict[str, dict] = {}
         for spec in lanes or []:
+            cap = max(1, int(spec.get("cap", 1)))
             lane = {
                 "name": spec["name"], "model": spec["model"], "host": spec.get("host", ""),
-                "rank": int(spec.get("rank", 0)), "cap": max(1, int(spec.get("cap", 1))),
+                "rank": int(spec.get("rank", 0)), "cap": cap,
                 "busy": 0, "served": 0, "failed": 0, "fail_streak": 0,
                 "down_until": 0.0, "ctx": None, "wait_sum": 0.0, "wait_max": 0.0,
                 "last_used": 0.0,
                 # 速度画像：spb = 每生成 token 的实测秒数（EWMA）；未知时用默认值，
                 # 于是所有泳道"看起来一样快"，选道退化成按 rank —— 首单的代价。
-                "spb": spec.get("spb"), "spb_n": 0, "job_ends": [],
+                # spb_by_conc 是**按并发档位分开**的画像：同一条泳道上，1 个请求和
+                # 2 个合批请求的每 token 成本不是一回事（1.44x），混在一起学出来的
+                # 是一个谁都不准的平均值。
+                "spb": spec.get("spb"), "spb_n": 0,
+                "spb_by_conc": {}, "spb_conc_n": {},
+                # 并发膨胀倍数（同档实测 spb / 单档 spb）的 EWMA，自动降档的依据
+                "ratio_by_conc": {}, "ratio_n": {},
+                # eff_cap = 当前**有效**容量（自动降档会把它压到 cap 以下，冷却后试探恢复）
+                "eff_cap": cap, "cap_down_until": 0.0, "cap_down_strikes": 0,
+                "cap_reason": "",
+                "job_ends": [],
                 # Ollama 类上游的保活记账（见 keepalive_targets）
                 "last_ping": 0.0, "ping_ok": 0, "ping_fail": 0,
             }
@@ -650,9 +696,12 @@ class LanePool:
         self._ctx: "OrderedDict[str, tuple]" = OrderedDict()   # ctx -> (lane_name, ts)
         self._waiting = 0
         self._tickets = itertools.count(1)
+        # 取道时的并发档位（thread-local）：acquire 在请求线程里决定 conc，release 也在
+        # 同一个线程里归还，所以不需要把它塞进返回值（返回值是给调用方的 2 元组契约）。
+        self._tls = threading.local()
         self._metrics = {"assigns": 0, "queued": 0, "timeouts": 0,
                          "queue_full": 0, "failures": 0, "quarantines": 0,
-                         "migrations": 0}
+                         "migrations": 0, "autocap_down": 0, "autocap_trials": 0}
 
     # ---- 内部：选泳道 ----
     @property
@@ -660,14 +709,41 @@ class LanePool:
         return bool(self._lanes)
 
     def _free(self, lane: dict, now: float) -> bool:
-        return lane["busy"] < lane["cap"] and lane["down_until"] <= now
+        return lane["busy"] < self._cap_of(lane, now) and lane["down_until"] <= now
+
+    # ---- 有效容量：配置容量 → 被实测校准后的容量 ----
+    def _cap_of(self, lane: dict, now: float) -> int:
+        """当前这条泳道真正能接几路（≤ 配置 cap）。**必须在 self._cv 里调用**。
+
+        冷却到期就试探性恢复：把 eff_cap 还给 cap，记住 reason="trial"。如果上游其实
+        一直在排队，接下来的样本会重新把它压下去（strikes 翻倍，冷却变长）；如果上游
+        真开了并行，就自然留在高档。这样"上游能力变了"不需要重启网关。
+        """
+        if lane["cap_down_until"] and now >= lane["cap_down_until"]:
+            if lane["eff_cap"] < lane["cap"]:
+                lane["eff_cap"] = lane["cap"]
+                lane["cap_reason"] = "trial"
+                self._metrics["autocap_trials"] += 1
+            lane["cap_down_until"] = 0.0
+        return lane["eff_cap"]
+
+    def _host_load(self) -> Dict[str, int]:
+        """每个 host 上正在跑的请求总数。同一 host = 同一个批处理循环 = 会互相拖慢；
+        不同 host 才是 A 类"免费并行"。**必须在 self._cv 里调用**。"""
+        load: Dict[str, int] = {}
+        for l in self._lanes:
+            h = l["host"] or "local"
+            load[h] = load.get(h, 0) + l["busy"]
+        return load
 
     def _pick_free(self, now: float):
-        """空闲泳道里挑一条：预测单请求耗时短者优先，其次优先级高的那条。"""
+        """空闲泳道里挑一条：并发档位预测最快者优先，其次 host 最闲的，再其次优先级。"""
         free = [l for l in self._lanes if self._free(l, now)]
         if not free:
             return None
-        return min(free, key=lambda l: (self.spb_of(l), -l["rank"]))
+        load = self._host_load()
+        return min(free, key=lambda l: (self.spb_at(l, l["busy"] + 1),
+                                        load.get(l["host"] or "local", 0), -l["rank"]))
 
     # ---- 速度画像：一条泳道"每个生成 token 要多少秒"（含 prefill，实测 EWMA）----
     # 为什么需要它：不同模型的速度差可以到 4 倍（125B+MTP 热缓存 ~0.018 s/tok，
@@ -675,7 +751,27 @@ class LanePool:
     # 3~4 倍时间 —— 实测 3 个上下文并行反而比串行慢（0.96x）。正确的判据是
     # **"在谁那儿先做完"**：等快模型 t 秒 vs 立刻上慢模型，比的是预计完成时间。
     def spb_of(self, lane: dict) -> float:
-        return lane["spb"] or self.default_spb
+        """单请求（conc=1）的每 token 秒数 —— 兼容旧语义与外部观测。"""
+        return self.spb_at(lane, 1)
+
+    def spb_at(self, lane: dict, conc: int) -> float:
+        """**并发档位 conc 下**的每 token 秒数。
+
+        为什么不直接复用单请求画像：往一条已经在跑 1 单的泳道塞第 2 单，那一路的真实
+        成本是 1.44x（合批）或 2.0x（排队），不是 1.0x。用 1.0x 去比"等它 vs 上别的
+        模型"，会系统性地高估这条泳道 —— 表现就是"两个请求都堆到最快的那条上，把它的
+        批处理塞满，而另一台后端在空转"。
+        """
+        conc = max(1, int(conc or 1))
+        table = lane["spb_by_conc"]
+        if conc in table:
+            return table[conc]
+        if conc == 1 or not table:
+            base = lane.get("spb")
+            return base if base else self.default_spb
+        # 没测过这一档：用已知最高档兜底（并发只会更慢，用更低的档会低估成本）。
+        known = max(table)
+        return table[known]
 
     def _wait_of(self, lane: dict, now: float) -> float:
         """这条泳道最早什么时候能接下一单（秒）。
@@ -684,7 +780,7 @@ class LanePool:
         时 ends[0]-now 会是负数，若就此返回 0，会和"真的空闲"混淆，导致排队逻辑
         一直挑这条其实拿不到的泳道。
         """
-        if lane["busy"] < lane["cap"]:
+        if lane["busy"] < self._cap_of(lane, now):
             return 0.0
         ends = lane["job_ends"]
         if not ends:
@@ -692,12 +788,17 @@ class LanePool:
         return max(0.05, ends[0] - now)
 
     def _pred(self, lane: dict, now: float, est_tokens: int) -> float:
-        """预计这条泳道把我的请求做完要多久（秒）。"""
-        return self._wait_of(lane, now) + self.spb_of(lane) * max(1, est_tokens)
+        """预计这条泳道把我的请求做完要多久（秒）。
+
+        速度按"我要加入的那一档并发"取：空泳道 → conc=1（全速）；已经在跑 1 单的
+        cap=2 泳道 → conc=2（合批/排队后的真实速率）。这是整套分派的核心等式。
+        """
+        return (self._wait_of(lane, now)
+                + self.spb_at(lane, lane["busy"] + 1) * max(1, est_tokens))
 
     def _overdue(self, lane: dict, now: float) -> bool:
         """忙着的泳道是否已经超过预计完成时间（= 估算不准，别再为它等）。"""
-        if lane["busy"] < lane["cap"]:
+        if lane["busy"] < self._cap_of(lane, now):
             return False
         ends = lane["job_ends"]
         return (not ends) or ends[0] <= now
@@ -718,12 +819,19 @@ class LanePool:
         usable = [l for l in self._lanes if l["down_until"] <= now]
         if not usable:
             return None, "down"
-        # 优先级最高的那条马上（prefer_wait 内）就空出来 → 等它，别急着降级
+        # 优先级最高的那条马上（prefer_wait 内）就空出来 → 等它，别急着降级。
+        # 注意这里要求它**确实满了**（_wait_of > 0）：如果它本来就还能接（cap>1 且
+        # busy<cap），就不该走"等它"的捷径 —— 那样会绕开并发档位成本，把第二个请求
+        # 又塞进同一条泳道，而另一台后端在空转。空闲的情况交给下面的预测比较。
         top = max(usable, key=lambda l: (l["rank"], -l["busy"]))
-        if (allow_top_wait and not self._overdue(top, now)
+        if (allow_top_wait and self._wait_of(top, now) > 0
+                and not self._overdue(top, now)
                 and self._wait_of(top, now) <= self.prefer_wait):
             return top, "top"
-        return min(usable, key=lambda l: (self._pred(l, now, est_tokens), -l["rank"])), "pred"
+        load = self._host_load()
+        return min(usable, key=lambda l: (self._pred(l, now, est_tokens),
+                                          load.get(l["host"] or "local", 0),
+                                          -l["rank"])), "pred"
 
     def _bind(self, ctx: str, lane_name: str):
         if not self.sticky:
@@ -745,7 +853,7 @@ class LanePool:
         out = []
         with self._cv:
             for lane in self._lanes:
-                if lane["busy"] >= lane["cap"] or lane["down_until"] > now:
+                if lane["busy"] >= self._cap_of(lane, now) or lane["down_until"] > now:
                     continue                       # 正在跑/隔离中：本来就热，或别添乱
                 if lane["last_used"] <= 0:
                     continue                       # 从没接过单：不值得为它预占内存
@@ -769,6 +877,14 @@ class LanePool:
                 lane["ping_fail"] += 1
 
     # ---- 对外 ----
+    def admit_conc(self) -> int:
+        """本线程刚取到那一单"加入时的并发档位"（acquire 写在 thread-local 里）。
+
+        为什么不是让 acquire 返回三元组：调用方和 76 个既有断言都按 2 元组解包，
+        为了一个只给画像用的标签去破坏这个契约不值得。
+        """
+        return max(1, int(getattr(self._tls, "conc", 1) or 1))
+
     def acquire(self, ctx: str, *, lane: str = "", timeout: Optional[float] = None,
                 est_tokens: int = 0):
         """取一条泳道。返回 (lane_dict, 等待秒数)；超时/队满抛异常。"""
@@ -784,7 +900,7 @@ class LanePool:
                 if self.sticky_wait > 0 and not lane:
                     _rec = self._ctx.get(ctx)
                     _bl = self._by_name.get(_rec[0]) if _rec else None
-                    if _bl is not None and _bl["busy"] >= _bl["cap"] and self._pick_free(now) is not None:
+                    if _bl is not None and _bl["busy"] >= self._cap_of(_bl, now) and self._pick_free(now) is not None:
                         if t_sticky is None:
                             t_sticky = now + self.sticky_wait
                         if now >= t_sticky:
@@ -796,17 +912,21 @@ class LanePool:
                             continue
                 chosen, why = self._select(ctx, lane, now, est_tokens,
                                            allow_top_wait=(t_pref is None or now < t_pref))
-                if why == "top" and chosen is not None and chosen["busy"] >= chosen["cap"] and t_pref is None:
+                if why == "top" and chosen is not None and chosen["busy"] >= self._cap_of(chosen, now) and t_pref is None:
                     # 开始等"最好的那条"，等满 prefer_wait 还没空出来就改看预测
                     t_pref = now + self.prefer_wait
-                if chosen is not None and chosen["busy"] < chosen["cap"]:
+                if chosen is not None and chosen["busy"] < self._cap_of(chosen, now):
                     chosen["busy"] += 1
                     chosen["last_used"] = now
                     chosen["ctx"] = ctx
-                    # 记下预计占用时长：队列里的后来者据此算"在谁那儿先做完"
-                    chosen["job_ends"].append(now + max(0.05, self.spb_of(chosen) * max(1, est_tokens)))
+                    # 记下预计占用时长：队列里的后来者据此算"在谁那儿先做完"。
+                    # 用**加入后这一档**的速率（合批后每 token 更慢），否则一条 cap=2 的
+                    # 泳道会被算成两单都能全速跑完，排队者会误以为它马上就空。
+                    chosen["job_ends"].append(
+                        now + max(0.05, self.spb_at(chosen, chosen["busy"]) * max(1, est_tokens)))
                     chosen["job_ends"].sort()
                     self._bind(ctx, chosen["name"])
+                    self._tls.conc = chosen["busy"]      # release 里学"这一档"的画像
                     waited = time.monotonic() - t0
                     chosen["wait_sum"] += waited
                     chosen["wait_max"] = max(chosen["wait_max"], waited)
@@ -830,7 +950,9 @@ class LanePool:
                     self._waiting -= 1
 
     def release(self, lane: dict, *, error: bool = False, tokens: int = 0,
-                elapsed: float = 0.0):
+                elapsed: float = 0.0, conc: int = 0):
+        _conc_hint = int(conc or getattr(self._tls, "conc", 0) or 0)
+        self._tls.conc = 0          # 用掉即清：同一线程连着归还两单时，第二单不能沿用第一单的档位
         with self._cv:
             lane["busy"] = max(0, lane["busy"] - 1)
             lane["ctx"] = None
@@ -842,10 +964,18 @@ class LanePool:
             # 实测给 125B 学出 0.0948 s/tok（≈10 tok/s，真值 98）—— 单样本把这条
             # 泳道的画像拉垮 10 倍，要 5 个正常样本才纠回来。样本长一些，prefill 占比
             # 就摊薄了。上下限再兜一道：冷 prefill 的 20k 上下文会算出 0.5 s/tok。
-            if tokens >= 32 and elapsed > 0:
+            if tokens >= LANE_SAMPLE_MIN_TOKENS and elapsed > 0:
+                k = max(1, _conc_hint or 1)
                 s = min(0.2, max(0.002, elapsed / tokens))
-                lane["spb"] = s if lane["spb"] is None else (0.7 * lane["spb"] + 0.3 * s)
-                lane["spb_n"] += 1
+                prev = lane["spb_by_conc"].get(k)
+                lane["spb_by_conc"][k] = s if prev is None else (0.7 * prev + 0.3 * s)
+                lane["spb_conc_n"][k] = lane["spb_conc_n"].get(k, 0) + 1
+                if k == 1:
+                    # 单请求画像仍是"最快能多快"的基准，兼容旧的 spb/spb_n 观测
+                    lane["spb"] = lane["spb_by_conc"][1]
+                    lane["spb_n"] += 1
+                else:
+                    self._maybe_downshift(lane, k, s)
             if error:
                 lane["failed"] += 1
                 lane["fail_streak"] += 1
@@ -863,6 +993,40 @@ class LanePool:
                 lane["fail_streak"] = 0
             self._cv.notify_all()
 
+    def _maybe_downshift(self, lane: dict, conc: int, s: float):
+        """并发档位实测比单档慢太多 → 判定"上游其实在排队"，把有效容量压回去。
+
+        判据：ratio = 本档 spb / 单档 spb。实测边界很干净 ——
+          合批（NUM_PARALLEL>=conc）：1.44x；排队（NUM_PARALLEL=1）：2.0x。
+        所以默认阈值 1.75 两边都留了余量，还要 EWMA + 连续 N 个样本才动手。
+        **必须在 self._cv 里调用**（由 release 持有）。
+        """
+        if not LANE_AUTOCAP:
+            return
+        base = lane["spb_by_conc"].get(1)
+        if not base or lane["spb_conc_n"].get(1, 0) < 1:
+            return                     # 单档还没测过，比不出倍数，先别动容量
+        ratio = min(4.0, max(0.2, s / base))
+        prev = lane["ratio_by_conc"].get(conc)
+        lane["ratio_by_conc"][conc] = ratio if prev is None else (0.6 * prev + 0.4 * ratio)
+        lane["ratio_n"][conc] = lane["ratio_n"].get(conc, 0) + 1
+        if lane["ratio_n"][conc] < LANE_AUTOCAP_SAMPLES:
+            return
+        if lane["ratio_by_conc"][conc] < LANE_AUTOCAP_RATIO:
+            return
+        if lane["eff_cap"] < conc:
+            return                     # 已经压到更低档了，别再重复降
+        lane["eff_cap"] = max(1, conc - 1)
+        lane["cap_down_strikes"] += 1
+        cool = LANE_AUTOCAP_COOLDOWN_S * (2 ** min(3, lane["cap_down_strikes"] - 1))
+        lane["cap_down_until"] = time.time() + cool
+        lane["cap_reason"] = f"conc{conc} x{lane['ratio_by_conc'][conc]:.2f}"
+        lane["ratio_n"][conc] = 0       # 降档后重新计数，避免同一批证据连着触发
+        self._metrics["autocap_down"] += 1
+        log(f"🔽 泳道 {lane['name']} 并发 {conc} 档实测慢 {lane['ratio_by_conc'][conc]:.2f}x"
+            f"（上游并行度可能只有 {lane['eff_cap']}），有效容量 {lane['cap']}→{lane['eff_cap']}，"
+            f"{cool:.0f}s 后试探恢复")
+
     def snapshot(self) -> dict:
         now = time.time()
         with self._cv:
@@ -871,11 +1035,17 @@ class LanePool:
                 lanes.append({
                     "name": lane["name"], "model": lane["model"], "host": lane["host"],
                     "rank": lane["rank"], "cap": lane["cap"], "busy": lane["busy"],
+                    # eff_cap < cap 说明自动降档在起作用（上游并行度不够）；cap_reason
+                    # 直接写着证据（例如 "conc2 x2.04"），排障时不用翻日志。
+                    "eff_cap": self._cap_of(lane, now), "cap_reason": lane["cap_reason"],
+                    "cap_down_for_s": round(max(0.0, lane["cap_down_until"] - now), 1),
                     "served": lane["served"], "failed": lane["failed"],
                     "current_context": lane["ctx"],
                     "avg_wait_s": round(lane["wait_sum"] / lane["served"], 3) if lane["served"] else 0,
                     "max_wait_s": round(lane["wait_max"], 3),
                     "spb_s_per_tok": round(self.spb_of(lane), 4),
+                    "spb_by_conc": {str(k): round(v, 4) for k, v in sorted(lane["spb_by_conc"].items())},
+                    "conc_ratio": {str(k): round(v, 2) for k, v in sorted(lane["ratio_by_conc"].items())},
                     "spb_samples": lane["spb_n"],
                     "est_wait_s": round(self._wait_of(lane, now), 2),
                     "down_for_s": round(max(0.0, lane["down_until"] - now), 1),
@@ -890,6 +1060,9 @@ class LanePool:
                 "sticky": self.sticky, "sticky_ttl_s": self.sticky_ttl_s,
                 "prefer_wait_s": round(self.prefer_wait, 3),
                 "keepalive_s": LANE_KEEPALIVE_S,
+                "autocap": {"on": bool(LANE_AUTOCAP), "ratio": LANE_AUTOCAP_RATIO,
+                            "samples": LANE_AUTOCAP_SAMPLES,
+                            "cooldown_s": LANE_AUTOCAP_COOLDOWN_S},
                 "waiting": self._waiting, "contexts": len(self._ctx),
                 "lanes": lanes, "metrics": dict(self._metrics),
             }
@@ -3678,10 +3851,14 @@ iframe{{padding-top:0}}
             self._lane_ctx_key = _lane_ctx
             self._lane_wait_s = _lane_wait
             self._lane_t0 = time.time()
+            # 加入时的并发档位（1=独占独占档，2=与另一单共享上游）：归还时要按这一档
+            # 记速度画像，否则合批/排队带来的单请求变慢会被算进"单请求速度"里。
+            self._lane_conc = LANE_POOL.admit_conc()
             model = _pool_lane["model"]
             req["model"] = model
             body_bytes = json.dumps(req, ensure_ascii=False).encode("utf-8")
             log(f"🚦 泳道 {_pool_lane['name']} ← {_lane_ctx}"
+                f"{' ×%d' % self._lane_conc if self._lane_conc > 1 else ''}"
                 f"{'（等 %.2fs）' % _lane_wait if _lane_wait > 0.05 else ''} → {model}")
 
         # 并发检查
@@ -3735,10 +3912,12 @@ iframe{{padding-top:0}}
             return
         self._lane = None
         try:
-            # tokens/elapsed 用于更新该泳道的速度画像（决定以后"在谁那儿先做完"）
+            # tokens/elapsed 用于更新该泳道的速度画像（决定以后"在谁那儿先做完"）；
+            # conc 让画像分档记（1 档 vs 合批档），也是自动降档的输入。
             LANE_POOL.release(lane, error=bool(error),
                               tokens=int(getattr(self, "_lane_ct", 0) or 0),
-                              elapsed=max(0.0, time.time() - getattr(self, "_lane_t0", time.time())))
+                              elapsed=max(0.0, time.time() - getattr(self, "_lane_t0", time.time())),
+                              conc=int(getattr(self, "_lane_conc", 0) or 0))
         except Exception as e:      # 归还路径绝不抛：抛了会盖住真正的错误
             log(f"⚠️ 泳道归还失败 {lane.get('name')}: {type(e).__name__}: {e}")
 

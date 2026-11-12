@@ -878,6 +878,49 @@ TG_LANES='flash=qwen3.8-flash-next|100|1@http://127.0.0.1:8090,gptoss=gpt-oss:20
 实际按 260+ token 记账，耗时也翻倍。**这不是并发变慢**：直连同一实例、同一 payload，
 两并发只要 2.69s；同一 payload 走网关单条反而要 3.2s（因为它在生成 263 而不是 120）。
 
+### 并发档位：cap>1 之后，"并行"要按三种收益分开算（2026-11-12）
+
+cap=2 一落地就冒出个新问题：既然一条泳道能接两单，调度器怎么判断"再塞一单进去"是赚还是亏？
+把并发收益拆开实测，来源有三条，量级完全不同：
+
+| 来源 | 机制 | 实测 | 结论 |
+|---|---|---|---|
+| **A 跨后端** | 不同 host 各有自己的批处理循环 | gpt-oss 单跑 104 tok/s；与 125B 同跑 83 / 71（合计 154） | **免费**，优先吃满 |
+| **B 同后端合批** | `OLLAMA_NUM_PARALLEL` ≥ 2，两条进同一批 | 吞吐 1.44×，但**单请求变成 1.44× 时长** | **净赚，但打折扣** |
+| **C 超过上游并行度** | `NUM_PARALLEL=1` 却配 `cap=2` | 两并发 1.96s / 3.59s，第二单纯排队 | **净亏**（最危险的配置错误） |
+
+老的分派公式拿"单请求的 spb"给所有泳道定价，等于默认 B、C 都免费 —— 结果是两个请求
+都往最快那条上堆，另一台后端空转。机制改成四件事：
+
+1. **分档速度画像**：每条泳道按"加入时的并发档位"（1 / 2 / 3…）分别学 EWMA，不再只有一个数；
+2. **按"我要加入的那一档"预测**：`pred = 最早空出 + spb[busy+1] × 生成长度`。
+   往跑着 1 单的 cap=2 泳道塞第二单，会被如实定价成 1.44×，于是"去另一条独占泳道"就自然赢了；
+3. **同分时优先空闲 host**：`pred` 相同时比该 host 上在飞的请求数 —— A 类免费收益先吃满；
+4. **自动降档**：某档实测膨胀 ≥1.75×（B/C 的分界线是 1.44 与 2.0，阈值卡在中间）且连续
+   3 个样本，就把**有效容量** `eff_cap` 压回去；冷却 120s 后自动试探恢复一次，仍挤就再降、
+   冷却翻倍。所以"后来给上游开了 `NUM_PARALLEL`"不需要重启网关。
+
+两类真实结果（都在本机跑出来的）：
+
+```text
+# B 类：生产池 gptoss（:11436，NUM_PARALLEL=2）—— 合批甚至比单跑更快，不该降档
+spb_by_conc={'1': 0.021, '2': 0.0193}   conc_ratio={'2': 0.86}   eff_cap=2
+
+# C 类：故意给 NUM_PARALLEL=1 的 :11434 配 cap=2（qwen2.5vl:3b）
+两路 1.96s / 3.59s（第二单在排队，网关却以为在并行）
+🔽 泳道 small 并发 2 档实测慢 1.77x（上游并行度可能只有 1），有效容量 2→1，120s 后试探恢复
+之后新请求「等 2.69s」——排队等，而不是假并行
+```
+
+`/api/admin/lanes` 因此多出 `eff_cap`（当前真能接几路）、`cap_reason`（直接写证据，如
+`conc2 x1.77`）、`cap_down_for_s`、`spb_by_conc`、`conc_ratio`，顶层多一个 `autocap`
+配置块（on / ratio / samples / cooldown_s）。开关与阈值见下面「配置项」表的最后五行。
+
+**已知限制（实测踩到，不是猜的）**：`elapsed` 含 prefill，短样本会高估 spb —— 一个 43 token
+的冷请求把 125B 的画像从 0.029 拉到 0.064 s/tok（真值约 0.034），要 5 个正常样本才纠回来。
+所以样本门槛是 32 token，且**画像只影响"去哪条泳道"，不影响正确性**；急着把某类请求钉在
+某个模型上就用 `X-TG-Lane`，别指望画像立刻准。
+
 ### 三条不变量
 
 | 不变量 | 实现 | 为什么 |
@@ -902,9 +945,9 @@ TG_LANES='flash=qwen3.8-flash-next|100|1@http://127.0.0.1:8090,gptoss=gpt-oss:20
 pred(lane) = 该泳道最早空出时间 + 每 token 秒数(spb) × 本次生成长度
 ```
 
-`spb` 不是常量，而是**每条泳道自己的实测 EWMA**（`elapsed / completion_tokens`，
-只收 ≥8 token 的样本，0.7/0.3 衰减）。实测：125B 热缓存约 0.018 s/tok，
-gpt-oss:20b 约 0.0095 s/tok，27B 约 0.065 s/tok。于是：
+`spb` 不是常量，而是**每条泳道、每个并发档位**的实测 EWMA（`elapsed / completion_tokens`，
+只收 ≥32 token 的样本，0.7/0.3 衰减；分档与自动降档见上一节）。实测：125B 热缓存约
+0.018~0.034 s/tok，gpt-oss:20b 约 0.0095~0.021 s/tok，27B 约 0.065 s/tok。于是：
 
 - 125B 只忙 2s 时，新上下文**等它**（`pred=4.2s`）而不是去 27B（`pred=8s`）；
 - 125B 前面排了 6 单时，新上下文**改派** 27B（`pred` 反超）；
@@ -971,6 +1014,11 @@ TG_LANES='[{"name":"flash","model":"qwen3.8-flash-next","rank":100,"cap":1}]'
 | `TG_LANE_FAIL_LIMIT` | 3 | 连续失败多少次隔离该泳道（默认隔离 60s 并把它的上下文改派） |
 | `TG_LANE_KEEPALIVE` | 240 | Ollama 类泳道的保活间隔（秒，0 关闭）；只管"用过且空闲"的泳道 |
 | `TG_LANE_KEEPALIVE_TTL` | `15m` | 保活请求里的 `keep_alive` 值 |
+| `TG_LANE_AUTOCAP` | 1 | 自动降档开关（0 = 只学分档画像，不动有效容量） |
+| `TG_LANE_AUTOCAP_RATIO` | 175 | 判定"上游其实在排队"的膨胀百分比（1.75×；合批 1.44、排队 2.0） |
+| `TG_LANE_AUTOCAP_SAMPLES` | 3 | 连续几个样本才降档 |
+| `TG_LANE_AUTOCAP_COOLDOWN` | 120 | 降档冷却（秒）；每多降一次翻倍，到期自动试探恢复 |
+| `TG_LANE_SAMPLE_MIN` | 32 | 参与学习的样本最短生成 token 数（短样本被 prefill 主导） |
 | `TG_MODEL_EXTRA` | 空 | 按模型补**缺省**请求体字段（JSON），只补客户端没给的 |
 
 ### 为什么需要保活（Ollama 类上游）
@@ -1772,15 +1820,17 @@ python3 tests/test_watchdog.py      # 看门狗：模块自足性 / 决策矩阵
 python3 tests/test_flash_runtime.py # gmlx 运行时：config 模式命令 / env 注入 / yaml 不变量（32 项）
 python3 tests/test_serial_lock.py   # 串行锁范围：按 speculative 分档 / 回退开关 / TTL（26 项）
 python3 tests/test_lane_pool.py     # 多模型泳道：解析 / 上下文指纹 / 粘性 / 独占 / 排队 / 速度画像 / 隔离 / 保活 / cap>1（76 项）
+python3 tests/test_lane_capacity.py # 并发感知分派：分档画像 / 按加入档位预测 / host 摊平 / 自动降档与试探恢复（45 项）
 python3 tests/test_model_extra.py   # 按模型补缺省请求体字段：只补客户端没给的 / 坏配置忽略（19 项）
 python3 tools/bench-parallel.py     # 需要真实模型，不是回归用例：并发矩阵（见「小模型并行实测」）
 python3 tools/bench-pool.py         # 需要真实模型：泳道池端到端（串行 vs 并行、粘性、排队，见「多模型泳道」）
 python3 tools/bench-gptoss.py       # 需要真实模型：多模型并发对照（单独 vs 同时，判"能不能当泳道"）
 python3 tools/start-ollama-lane.py  # 泳道专属 Ollama 实例（:11436，NUM_PARALLEL=2）：起 / --restart / --status
 python3 tools/verify-watchdog.py --yes  # 端到端自愈：真 kill -9 上游并等它回来（会中断服务；不带 --yes 为只读）
+python3 tools/mirror-from-github.py --dest ~/gateway-repo  # 用 API 重建本地工作副本（逐 blob 校验 sha）
 ```
 
-二十一个脚本都可通过环境变量改指向：
+二十二个脚本都可通过环境变量改指向：
 
 | 变量 | 作用 |
 |---|---|
@@ -1794,6 +1844,7 @@ python3 tools/verify-watchdog.py --yes  # 端到端自愈：真 kill -9 上游�
 
 | 日期 | 提交 | 内容 |
 |---|---|---|
+| 2026-11-12 | 本次推送 | **并行模型机制升级：从"单请求速度"到"并发感知分派 + 自动降档"**。cap=2 之后调度器必须回答"再塞一单是赚是亏"，实测把并发收益拆成三类：A 跨后端（免费，gpt-oss 与 125B 同跑 83/71，合计 154 tok/s）、B 同后端合批（吞吐 1.44×，但单请求 1.44× 时长）、C 超过 `NUM_PARALLEL` 的排队（单请求 2.0×+，吞吐不涨，净亏）。机制四项：① `spb_by_conc` 按加入时的并发档位分别学 EWMA；② 预测改成 `最早空出 + spb[busy+1] × 生成长度`（往忙泳道塞第二单会被如实定价）；③ `pred` 同分时优先 host 上没人跑的那条（先吃 A 类）；④ **自动降档**——某档膨胀 ≥1.75×（B/C 分界线 1.44 vs 2.0）且连续 3 个样本，就把 `eff_cap` 压回去，冷却 120s 后试探恢复、再挤则冷却翻倍，上游后来开了并行度无需重启。端到端验证两例：生产池 gptoss（NUM_PARALLEL=2）`conc_ratio=0.86` **不降档**；故意给 NUM_PARALLEL=1 的 :11434 配 cap=2（qwen2.5vl:3b）→ 两路 1.96s/3.59s（第二单在排队），日志 `并发 2 档实测慢 1.77x…有效容量 2→1`，之后新请求改为"等 2.69s"而不是假并行。`/api/admin/lanes` 增 `eff_cap`/`cap_reason`/`cap_down_for_s`/`spb_by_conc`/`conc_ratio` 与顶层 `autocap`。新增 `tests/test_lane_capacity.py`（45 项），`test_lane_pool.py` 保持 76 项全绿，全仓 21 个测试文件 0 失败。**已知限制**：`elapsed` 含 prefill，43 token 的冷样本曾把 125B 画像从 0.029 拉到 0.064 s/tok（真值 0.034），故样本门槛 32 token。 |
 | 2026-11-12 | 本次推送 | **只跑这两个模型时再挤一个槽：gpt-oss 泳道 cap=2**。`OLLAMA_NUM_PARALLEL` 默认 1，两个请求进同一模型是**排队**（两并发 2.36s + 4.33s，墙钟等于串行）；设成 2 后两条各 3.30s（同一泳道 1.44×），因为 gpt-oss 是 MoE（3.6B 激活），合批几乎不涨计算量。A/B（同提示、temperature=0、串行基线同为 9.3s）：cap=1 → 1.29/1.34×；**cap=2 → 1.78/1.70×**；5 上下文 1.44~1.46×。为不碰 App 托管的 :11434（没有可靠写 env 的位置），新增 `tools/start-ollama-lane.py` 起专属实例 :11436，`maintain-gateway.sh` 加「2b」段自动拉起。顺带查清一笔账：网关的「输出预算下限」把 `max_tokens: 120` 抬到 2048，gpt-oss 即使 `reasoning_effort=low` 也会生成 ~263 token —— 一句「数到 120」按 260+ token 记账、耗时翻倍，这不是并发变慢（直连同实例两并发仅 2.69s）。 |
 | 2026-11-12 | `cb067efc` | **第二条泳道换成 gpt-oss:20b，泳道池从 1.39× 提到 1.83×**。上一版的瓶颈不是调度而是「第二条泳道慢 1.7~3.5 倍」（27B 34 tok/s）；Ollama 上的 gpt-oss:20b（MoE 21B/3.6B 激活、MXFP4、13.6 GB）单独 decode 105 tok/s、与 125B 同时跑 83/71 tok/s，端到端 3 上下文 **1.83×**、5 上下文 **1.77×**。同时证伪「三条泳道更好」：三条同时跑 125B 98→52、gpt-oss 105→48、27B 26，总墙钟 10.6s 反而慢于「两条跑完 + 第三个排队」的 9.4s，故把 27B 从 `gmlx-serve.yaml` 与 `TG_LANES` 一并撤下（配置以注释保留）。新增 **Ollama 泳道保活**（它空闲 5 分钟卸载模型，而 `/v1` 的 `keep_alive` 被静默忽略，只能定时拍 `/api/generate`，实测 0.28s 不生成 token；MLX 泳道靠 `pin`，自动跳过）与 **`TG_MODEL_EXTRA` 按模型补缺省请求体字段**（只补客户端没给的；gpt-oss 配 `reasoning_effort=low` 可把同题从 300 token/3.35s 压到 119 token/1.51s）。两个必须知道的代价：**中文提示词 token 膨胀约 4 倍**（harmony 模板 + o200k 分词器，18 vs 75 prompt tokens）、**中文表达弱于 125B**（代码与工具调用反而不差，工具调用 1.0s vs 2.5s、参数格式一致）。新增 `tests/test_model_extra.py`（19 项），`test_lane_pool.py` 扩到 74 项（含保活 8 项、速度画像门槛修正 3 项）。 |
 | 2026-11-11 | 本次推送 | **多模型泳道：一个模型一个上下文，多的排队**。新增 `pool` 虚拟模型 + `LanePool` 调度器（粘性 / 独占 / 排队三条不变量），上下文标识走 `X-TG-Context` → 请求体字段 → 前两条消息指纹；分派判据从「优先级」改成**预计完成时间**（`该泳道最早空出 + 实测 spb × 生成长度`，spb 是每条泳道自己的 EWMA）。为什么改：第一版按 rank 分派在实测里是负收益（3 上下文 **0.96×**、5 上下文 **0.81×**，因为 27B 慢 3.5 倍，接一单就晚 6s）；改成按预测后 3 上下文 **1.39×**、5 上下文 **1.26×**。新增 `/api/admin/lanes`、响应头 `X-Gateway-Lane[-Wait]`/`X-Gateway-Context`、连续失败隔离（3 次 → 60s 冷却 + 上下文改派）、`tools/bench-pool.py`（串行/并行对照）与 `tests/test_lane_pool.py`（63 项）。gmlx 恢复两模型常驻（`max_models: 2`）。**最坑的一条**：改 plist 后 launchd 用的还是旧环境快照（`/api/admin/lanes` 恒 `enabled:false`），必须 `bootout` 后再手动拉起。 |
@@ -1857,6 +1908,17 @@ PAT 运行时从 `~/.git-credentials` 读取，只走内存，不落盘、不打
 |---|---|---|
 | `bootstrap` | 远端分支不存在（刚建的空仓库） | 建 blob → tree → **无父**根提交 → 创建 `refs/heads/main`。会把本地多个提交压成一个 |
 | `sync-tree` | 远端已有提交 | 以远端 tip 为 base_tree 补齐本地条目，**只增改，绝不删** |
+
+**本地没有工作副本时**（换机器、临时目录被清、只想看历史）：
+
+```bash
+python3 tools/mirror-from-github.py --dest ~/gateway-repo   # 拉远端 main 的每个 blob
+cd ~/gateway-repo && git init -b main && git add -A && git commit -m baseline
+```
+
+它对每个文件按 git 的 blob 算法校验（`sha1("blob <len>\0" + 内容)`），字节对不上就中止而不是
+静默生成坏副本；代理偶发 502 时每个请求重试 5 次。重建出的副本与远端逐字节相同时，
+`push-via-api.py` 会直接报「远端已与本地一致，无需推送」。
 
 > ⚠️ 若仓库还不存在：本机两个凭据（`~/.git-credentials` 与 `~/.netrc`）都是 fine-grained PAT，实测**均没有建库权限**（`POST /user/repos` → 403）。请在 GitHub 网页上新建**空仓库**（不要勾 README / .gitignore），再跑 `python3 tools/push-via-api.py`。若推送仍 403，说明该 PAT 被限定为「Only select repositories」，需要把新仓库加进它的授权列表。
 
