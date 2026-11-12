@@ -82,6 +82,7 @@ def load_module(src_path):
         "itertools": itertools, "hashlib": hashlib, "OrderedDict": OrderedDict,
         "Dict": Dict, "List": List, "Optional": Optional, "Tuple": Tuple,
         "os": os, "_env_num": _env_num,
+        "RAPID_MLX_HOSTS": ["http://127.0.0.1:8090"],
         "log": lambda *a, **k: None,
     }
     for n in nodes:
@@ -421,7 +422,19 @@ check("第二单把 spb 往下拉（EWMA 0.7/0.3）",
       0.01 < P.spb_of(a) < 0.05, P.spb_of(a))
 a, _ = P.acquire("C", est_tokens=100)
 P.release(a, tokens=2, elapsed=9.0)
-check("样本太短（<8 token）不参与学习", a["spb_n"] == 2, a["spb_n"])
+check("样本太短（<32 token）不参与学习", a["spb_n"] == 2, a["spb_n"])
+
+# 真实踩到的一例：工具调用请求（长 schema 的 prefill + 很短正文）曾把 125B 的
+# spb 学成 0.0948（≈10 tok/s，真值 98），单样本偏差 10 倍，要 5 个正常样本才纠回来。
+a, _ = P.acquire("D", est_tokens=100)
+P.release(a, tokens=20, elapsed=1.0)
+check("工具调用式的短样本（20 token / 1s = 0.05 s/tok 的假信号）也不学",
+      a["spb_n"] == 2, a["spb_n"])
+_before = P.spb_of(a)
+a, _ = P.acquire("E", est_tokens=100)
+P.release(a, tokens=64, elapsed=200.0)       # 冷 prefill 的 20k 上下文：3.1 s/tok
+check("离谱样本被夹到 0.2 s/tok（而不是 3.1）", P.spb_of(a) <= 0.2 + 1e-9, P.spb_of(a))
+check("夹断后仍然往上偏（说明真的学到了「这条慢」）", P.spb_of(a) > _before, (_before, P.spb_of(a)))
 
 print("\n15. 粘性 TTL：过期后允许换模型")
 P = LanePool(lanes(*[L1, L2]), wait_s=5, sticky=True, sticky_ttl_s=0.2)
@@ -435,6 +448,43 @@ P.release(b)
 a2, _ = P.acquire("A")    # 绑定过期 → 可以换到 mid
 check("TTL 过期后上下文可改派（不再死等旧模型）", a2["name"] in ("flash", "mid"), a2["name"])
 P.release(a2)
+
+print("\n16. Ollama 泳道保活：只给「用过的、空闲的、非 MLX」的续命")
+OLL = ("gptoss", "gpt-oss:20b", "http://127.0.0.1:11434", 95, 1)
+P = pool(*[L1, OLL])
+t0 = time.time()
+check("从没接过单的泳道不保活（不为一条可能不来的请求预占 13GB）",
+      P.keepalive_targets(t0, 240) == [], P.keepalive_targets(t0, 240))
+a, _ = P.acquire("A")                 # 走 flash（rank 高，速度未知时按 rank）
+P.release(a)
+b, _ = P.acquire("B", lane="gptoss")
+P.release(b)
+tg = P.keepalive_targets(t0, 240)
+check("只拍 Ollama 那条（MLX 侧靠 pin 常驻，不该被 /api/generate 打扰）",
+      [l["name"] for l in tg] == ["gptoss"], [l["name"] for l in tg])
+check("间隔未到不重复拍", P.keepalive_targets(t0 + 10, 240) == [])
+check("间隔到了会再拍",
+      [l["name"] for l in P.keepalive_targets(t0 + 300, 240)] == ["gptoss"])
+check("间隔 0 = 关闭保活", P.keepalive_targets(t0 + 9999, 0) == [])
+
+P2 = pool(*[L1, OLL])
+c, _ = P2.acquire("C", lane="gptoss")     # 不 release：一直忙
+check("正在跑的泳道不拍（本来就热）",
+      P2.keepalive_targets(time.time() + 300, 240) == [])
+P2.release(c)
+
+P3 = pool(*[L1, OLL])
+d, _ = P3.acquire("D", lane="gptoss")
+P3.release(d)
+P3._by_name["gptoss"]["down_until"] = time.time() + 60
+check("隔离中的泳道不拍（别往正在报错的模型上加压）",
+      P3.keepalive_targets(time.time(), 240) == [])
+P3.note_ping("gptoss", True)
+P3.note_ping("gptoss", False)
+P3.note_ping("no-such-lane", True)        # 不该炸
+check("击活记账（供 /api/admin/lanes 观测）",
+      (P3._by_name["gptoss"]["ping_ok"], P3._by_name["gptoss"]["ping_fail"]) == (1, 1),
+      P3._by_name["gptoss"])
 
 print(f"\n{PASS} 通过 / {FAIL} 失败")
 sys.exit(1 if FAIL else 0)

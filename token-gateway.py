@@ -186,6 +186,51 @@ for _item in os.environ.get("TG_MODEL_PARAMS", "").split(","):
         continue
 
 
+def _parse_model_extra(env_val: str) -> Dict[str, dict]:
+    """解析 TG_MODEL_EXTRA：按模型注入**缺省**请求体字段（JSON）。
+
+    用途：有些上游能力只能靠请求体字段控制，而客户端不会传。最典型的是
+    gpt-oss 的 `reasoning_effort` —— 同一个问题，默认（medium）300 个 token、
+    3.35s；`low` 只要 119 个 token、1.51s（实测，见 README）。
+    它既影响时延也影响额度（网关按上游 usage 记账），所以做成部署方可调的开关。
+
+    语义刻意保守：**只补客户端没给的字段**。客户端显式设了就不动，
+    免得"服务端偷偷改采样参数"这种最难排查的问题。非法 JSON 整体忽略。
+    """
+    if not env_val or not env_val.strip():
+        return {}
+    try:
+        raw = json.loads(env_val)
+    except Exception:
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    out: Dict[str, dict] = {}
+    for k, v in raw.items():
+        if isinstance(k, str) and isinstance(v, dict) and k.strip():
+            out[k.strip()] = {kk: vv for kk, vv in v.items()
+                              if isinstance(kk, str) and kk.strip()}
+    return out
+
+
+MODEL_EXTRA: Dict[str, dict] = _parse_model_extra(os.environ.get("TG_MODEL_EXTRA", ""))
+
+
+def _apply_model_extra(req: dict, model: str) -> dict:
+    """把 MODEL_EXTRA[model] 中**客户端没给**的字段补进 req，返回实际补上的部分。
+
+    拆成独立函数只为可测：这条语义（"只补缺省、绝不覆盖"）是它唯一的价值，
+    放在 handler 中间就没人能验证了。
+    """
+    extra = MODEL_EXTRA.get(model) if model else None
+    if not extra or not isinstance(req, dict):
+        return {}
+    added = {k: v for k, v in extra.items() if k not in req}
+    if added:
+        req.update(added)
+    return added
+
+
 def _parse_float_list(raw, default: List[float]) -> List[float]:
     """解析 '8,30,122' / [8, 30, 122] 为浮点列表；非法项忽略，空结果返回 default。"""
     if isinstance(raw, (list, tuple)):
@@ -466,6 +511,13 @@ LANE_DEFAULT_SPB_S = 1.0 / max(1.0, _env_num("TG_LANE_SEED_TPS", 30, minimum=1))
 LANE_CTX_HEADERS = ("x-tg-context", "x-context-id", "x-session-id", "x-conversation-id")
 LANE_CTX_BODY_KEYS = ("conversation_id", "session_id", "context_id", "user")
 
+# Ollama 类上游的保活间隔（秒，0=关闭）。Ollama 默认 5 分钟无请求就卸载模型，而它的
+# OpenAI 兼容接口**不认**请求体里的 keep_alive（只有 /api/generate 与 /api/chat 认），
+# 所以由网关自己定时发一个空 prompt 的 /api/generate 续命（实测 0.28s、不生成 token）。
+# 只管"用过的泳道"：没用过的模型不该为了一条可能永远不来的请求占 13GB 内存。
+LANE_KEEPALIVE_S = _env_num("TG_LANE_KEEPALIVE", 240, minimum=0)
+LANE_KEEPALIVE_TTL = (os.environ.get("TG_LANE_KEEPALIVE_TTL", "15m") or "15m").strip()
+
 
 def _parse_lanes(raw: str) -> List[dict]:
     """解析 TG_LANES → [{name, model, host, rank, cap}]。非法条目跳过（不抛）。"""
@@ -590,6 +642,8 @@ class LanePool:
                 # 速度画像：spb = 每生成 token 的实测秒数（EWMA）；未知时用默认值，
                 # 于是所有泳道"看起来一样快"，选道退化成按 rank —— 首单的代价。
                 "spb": spec.get("spb"), "spb_n": 0, "job_ends": [],
+                # Ollama 类上游的保活记账（见 keepalive_targets）
+                "last_ping": 0.0, "ping_ok": 0, "ping_fail": 0,
             }
             self._lanes.append(lane)
             self._by_name[lane["name"]] = lane
@@ -679,6 +733,41 @@ class LanePool:
         while len(self._ctx) > self.ctx_max:
             self._ctx.popitem(last=False)
 
+    # ---- Ollama 类上游保活 ----
+    def keepalive_targets(self, now: float, interval_s: float):
+        """挑出这次该"拍一下"的泳道：只含用过、当前空闲、非 MLX 上游的。
+
+        MLX 侧（gmlx）靠 `pin: true` 常驻，不需要也不该被 /api/generate 打扰。
+        返回的是副本，调用方在锁外发 HTTP，不会拖住取道。
+        """
+        if interval_s <= 0:
+            return []
+        out = []
+        with self._cv:
+            for lane in self._lanes:
+                if lane["busy"] >= lane["cap"] or lane["down_until"] > now:
+                    continue                       # 正在跑/隔离中：本来就热，或别添乱
+                if lane["last_used"] <= 0:
+                    continue                       # 从没接过单：不值得为它预占内存
+                host = (lane["host"] or "").rstrip("/")
+                if host and host in RAPID_MLX_HOSTS:
+                    continue                       # MLX 上游：pin 常驻，跳过
+                if now - lane["last_ping"] < interval_s:
+                    continue
+                lane["last_ping"] = now
+                out.append(dict(lane))
+        return out
+
+    def note_ping(self, lane_name: str, ok: bool):
+        with self._cv:
+            lane = self._by_name.get(lane_name)
+            if lane is None:
+                return
+            if ok:
+                lane["ping_ok"] += 1
+            else:
+                lane["ping_fail"] += 1
+
     # ---- 对外 ----
     def acquire(self, ctx: str, *, lane: str = "", timeout: Optional[float] = None,
                 est_tokens: int = 0):
@@ -748,9 +837,13 @@ class LanePool:
             lane["served"] += 1
             if lane["job_ends"]:
                 lane["job_ends"].pop(0)
-            # 更新速度画像（样本太短会被首 token 延迟主导，只收 >=8 token 的样本）
-            if tokens >= 8 and elapsed > 0:
-                s = elapsed / tokens
+            # 更新速度画像。为什么门槛是 32 token 而不是 8：
+            # elapsed 里含 prefill，工具调用那种"长 schema + 20 token 正文"的请求，
+            # 实测给 125B 学出 0.0948 s/tok（≈10 tok/s，真值 98）—— 单样本把这条
+            # 泳道的画像拉垮 10 倍，要 5 个正常样本才纠回来。样本长一些，prefill 占比
+            # 就摊薄了。上下限再兜一道：冷 prefill 的 20k 上下文会算出 0.5 s/tok。
+            if tokens >= 32 and elapsed > 0:
+                s = min(0.2, max(0.002, elapsed / tokens))
                 lane["spb"] = s if lane["spb"] is None else (0.7 * lane["spb"] + 0.3 * s)
                 lane["spb_n"] += 1
             if error:
@@ -787,12 +880,16 @@ class LanePool:
                     "est_wait_s": round(self._wait_of(lane, now), 2),
                     "down_for_s": round(max(0.0, lane["down_until"] - now), 1),
                     "idle_for_s": round(now - lane["last_used"], 1) if lane["last_used"] else None,
+                    "ping_ok": lane["ping_ok"], "ping_fail": lane["ping_fail"],
+                    "last_ping_for_s": (round(now - lane["last_ping"], 1)
+                                        if lane["last_ping"] else None),
                 })
             return {
                 "pool_model": self.name, "enabled": self.enabled,
                 "wait_s": self.wait_s, "queue_max": self.queue_max,
                 "sticky": self.sticky, "sticky_ttl_s": self.sticky_ttl_s,
                 "prefer_wait_s": round(self.prefer_wait, 3),
+                "keepalive_s": LANE_KEEPALIVE_S,
                 "waiting": self._waiting, "contexts": len(self._ctx),
                 "lanes": lanes, "metrics": dict(self._metrics),
             }
@@ -3771,6 +3868,14 @@ iframe{{padding-top:0}}
                 body_bytes = json.dumps(original_req, ensure_ascii=False).encode("utf-8")
                 log(f"🖼️  已过滤图片请求（{model} 不支持多模态）→ 来自:{client_ip}")
 
+        # ========= 按模型的缺省请求体字段（TG_MODEL_EXTRA） =========
+        # 只补客户端没给的字段；客户端显式设了就一律不动。
+        if original_req is not None and self.path.startswith("/v1/chat"):
+            _added = _apply_model_extra(original_req, model)
+            if _added:
+                body_bytes = json.dumps(original_req, ensure_ascii=False).encode("utf-8")
+                log(f"🎛️  补默认请求字段 {_added} → {model}")
+
         # ========= 输出预算下限（Ollama 等非 Rapid-MLX 上游） =========
         # 下方"Context Window 自动截断降级"整块嵌在 `upstream_host in RAPID_MLX_HOSTS`
         # 里，所以 Ollama 侧原本**完全没有** max_tokens 下限：gemma4 这类会"思考"的模型
@@ -3780,8 +3885,9 @@ iframe{{padding-top:0}}
         #   max_tokens=192 → 同样为空；4096 时 reasoning 可到 1960 字符才出正文
         # 且 gemma4 是否触发思维链是概率性的（同一句提示另一次直接 34 token 出结果），
         # 所以下限只能降低概率，真正兜底的是后面的"推理模型空正文修复"。
-        # 注意：Ollama 的 OpenAI 兼容端点会**忽略** think / reasoning_effort（已实测），
-        # 无法从根上关掉思维链，只能给预算。
+        # 注：gemma4 确实忽略 think / reasoning_effort（已实测），但 gpt-oss **认**
+        # reasoning_effort（low 让同题从 300 token/3.35s 降到 119 token/1.51s），
+        # 想压低它的思考量请用 TG_MODEL_EXTRA 显式配置，不要指望全局开关。
         if (original_req and self.path.startswith("/v1/chat")
                 and upstream_host not in RAPID_MLX_HOSTS):
             try:
@@ -4947,6 +5053,40 @@ _cfg = load_config()
 auth_result_ok = None
 
 
+def _lane_keepalive_loop():
+    """给 Ollama 类泳道续命（间隔 TG_LANE_KEEPALIVE，0 关闭）。
+
+    不这么做的话：Ollama 空闲 5 分钟就把模型卸了，下一次请求要重新读 13GB
+    （gpt-oss:20b 实测冷加载 1.8s）。而 /v1/chat/completions 不认 keep_alive，
+    所以只能走 /api/generate 的空 prompt —— 实测 0.28s、done_reason=load、不生成 token。
+    """
+    sleep_s = max(5.0, LANE_KEEPALIVE_S / 2.0)
+    while True:
+        time.sleep(sleep_s)
+        try:
+            for lane in LANE_POOL.keepalive_targets(time.time(), LANE_KEEPALIVE_S):
+                host = (lane.get("host") or OLLAMA_HOST).rstrip("/")
+                body = json.dumps({"model": lane["model"],
+                                   "keep_alive": LANE_KEEPALIVE_TTL}).encode()
+                req = urllib.request.Request(host + "/api/generate", data=body,
+                                             headers={"Content-Type": "application/json"})
+                t0 = time.time()
+                ok = False
+                try:
+                    with urllib.request.urlopen(req, timeout=20) as resp:
+                        resp.read()
+                    ok = True
+                    log(f"💓 泳道保活 {lane['name']}（{lane['model']}，"
+                        f"{time.time()-t0:.2f}s）")
+                except Exception as e:      # noqa: BLE001
+                    log(f"⚠️ 泳道保活失败 {lane['name']}（{lane['model']}）: "
+                        f"{type(e).__name__}: {e}")
+                finally:
+                    LANE_POOL.note_ping(lane["name"], ok)
+        except Exception as e:              # noqa: BLE001
+            log(f"⚠️ 保活巡检异常: {type(e).__name__}: {e}")
+
+
 def _model_refresh_loop():
     """定期刷新上游模型清单（间隔 TG_MODEL_REFRESH_INTERVAL，0 关闭）。
 
@@ -5057,6 +5197,12 @@ def main():
     if MODEL_REFRESH_INTERVAL_S > 0:
         threading.Thread(target=_model_refresh_loop, daemon=True).start()
         print(f"🔍 上游模型清单巡检已启动（每 {MODEL_REFRESH_INTERVAL_S}s 一次）")
+    # 泳道保活：Ollama 类上游空闲 5 分钟就卸载模型，而它的 OpenAI 兼容接口不认
+    # keep_alive，只能由网关定时拍 /api/generate 续命（MLX 侧靠 pin，自动跳过）
+    if LANE_POOL.enabled and LANE_KEEPALIVE_S > 0:
+        threading.Thread(target=_lane_keepalive_loop, daemon=True,
+                         name="lane-keepalive").start()
+        print(f"💓 泳道保活已启动（每 {LANE_KEEPALIVE_S}s 一次，keep_alive={LANE_KEEPALIVE_TTL}）")
     # Flash 运行时看门狗：上游是我们自己拉起的进程，崩了没有别的托管方管；
     # 而"有没有请求在飞"只有网关知道，所以巡检挂在这里（实现见 tg_watchdog.py）
     if WD_ENABLED:
