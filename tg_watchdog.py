@@ -143,12 +143,34 @@ def tcp_alive(host: str, port: int, timeout: float = 1.5) -> bool:
         return False
 
 
+_OPENER: Optional[urllib.request.OpenerDirector] = None
+
+
+def _opener() -> urllib.request.OpenerDirector:
+    """探测专用的 opener：**显式空代理表**。
+
+    为什么不能用裸 `urllib.request.urlopen`：默认 opener 在**每次请求时**读
+    `HTTP_PROXY` / `HTTPS_PROXY`（macOS 上还会读系统代理），而被探对象永远是
+    本机或内网的上游 —— 走代理必然失败。实测：一个完全健康的上游，只要进程环境里
+    存在一个死代理，探测就报不健康；此后看门狗会重启一个没病的服务，重启完再探
+    还是红，于是形成「健康时的自杀循环」。
+
+    此前靠部署方在 plist 里写 `NO_PROXY=*` 规避，但那是**环境约定**，改一次 plist
+    漏掉就复发（而且失败方向是最坏的：把健康判成死亡）。现在改成**代码保证**：
+    `ProxyHandler({})` 让这条链路与代理配置彻底解耦。
+    """
+    global _OPENER
+    if _OPENER is None:
+        _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    return _OPENER
+
+
 def probe(base: str) -> Tuple[bool, Optional[str]]:
     """GET {base}/v1/models，2xx 视为健康。返回 (健康, 错误描述)。"""
     try:
         req = urllib.request.Request(
             base + "/v1/models", headers={"User-Agent": "tg-watchdog"})
-        with urllib.request.urlopen(req, timeout=WD_PROBE_TIMEOUT_S) as r:
+        with _opener().open(req, timeout=WD_PROBE_TIMEOUT_S) as r:
             if 200 <= r.status < 300:
                 return True, None
             return False, f"HTTP {r.status}"
@@ -261,6 +283,13 @@ def tick(base: str) -> None:
     st["fails"] = 0
     st["grace_fails"] = 0
     st["first_fail"] = 0.0
+    # `healthy_since` 的语义是「自**这一次**连续健康起」，不是「自上次重启起」。
+    # 判死时必须清零：否则长跑数小时后再崩，恢复的第一探会拿几小时前的起点去比
+    # STABLE_RESET_S，瞬间判定「已稳定」并把 restarts 归零 —— 退避 300/600/1200/1800
+    # 与封顶全部失效，抖动期退化成每 150s 捅一次上游。线上留痕：
+    #   [16:36:58] 🚑 8090 不可用（连续 3 次探测失败），已拉起重启脚本
+    #   [16:37:18] 🐕 8090 已稳定 149972s，重启退避计数归零   ← 20 秒后判「已稳定 41.6 小时」
+    st["healthy_since"] = 0.0
     st["state"] = "restarting"
     if not restart(base, st):
         st["state"] = "failed"

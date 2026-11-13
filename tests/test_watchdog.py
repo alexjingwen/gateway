@@ -16,6 +16,8 @@
        这时候杀掉它等于自杀
     ⑦ 恢复后稳定足够久 → 退避计数归零，避免抖动期反复全速重试
     ⑧ /health 暴露巡检摘要（无鉴权路径，只放状态不放敏感信息）
+    ⑨ 探测与代理配置解耦 —— 启动时有死代理，健康上游也不能被误判（2b，子进程）
+    ⑩ 判死时 healthy_since 必须清零 —— 否则「重启→恢复→又挂」会把退避序列废掉（3b）
 
   第 1–4 节**完全不加载网关**，直接测 tg_watchdog 模块——这本身就是"能独立复用"
   的证明；第 5 节才加载网关，验证两边接口接得对。
@@ -148,6 +150,42 @@ check("探测 500 → 不健康", ok is False and "500" in (err or ""), err)
 ok, err = wd.probe(f"http://127.0.0.1:{closed_port()}")
 check("探测拒绝连接 → 不健康", ok is False and err, err)
 
+print("\n== 2b. 探测必须与代理配置解耦 ==")
+# 回归（2026-11-12 定位）：probe 曾用裸 `urlopen`，默认 opener 在**首次使用**时读
+# HTTP_PROXY 并缓存。一个完全健康的上游，只要进程启动时环境里有死代理就被判不健康 ——
+# 看门狗于是重启一个没病的服务，重启完再探还是红，形成「健康时的自杀循环」。当时靠
+# plist 里的 NO_PROXY=* 遮蔽，但那是环境约定，漏一次就复发。
+#
+# 必须用**子进程**才测得出来：默认 opener 的代理表是在第一次 urlopen 时抓取并缓存的，
+# 父进程早先的探测已经把它建好了，之后再改环境变量不会生效。生产里 launchd 是在
+# 进程启动前注入环境的，正好对应这里「env 先置、模块后加载」的顺序。
+_proxy_keys = ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy",
+               "NO_PROXY", "no_proxy", "ALL_PROXY", "all_proxy")
+_child = (
+    "import importlib.util,sys\n"
+    f"spec=importlib.util.spec_from_file_location('wd_child', {str(WD_SRC)!r})\n"
+    "m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
+    "ok,err=m.probe(sys.argv[1])\n"
+    "print(('HEALTHY' if ok else 'UNHEALTHY'), '|', err)\n"
+)
+
+
+def probe_in_child(url, proxy):
+    env = {k: v for k, v in os.environ.items() if k not in _proxy_keys}
+    env["HTTP_PROXY"] = env["http_proxy"] = proxy
+    env["HTTPS_PROXY"] = env["https_proxy"] = proxy
+    r = __import__("subprocess").run([sys.executable, "-c", _child, url],
+                                     capture_output=True, text=True, timeout=60, env=env)
+    return (r.stdout or r.stderr).strip()
+
+
+out = probe_in_child(f"http://127.0.0.1:{p_ok}", "http://127.0.0.1:1")
+check("启动时就有死代理、且无 NO_PROXY → 健康上游仍判健康",
+      out.startswith("HEALTHY"), out[-160:])
+out = probe_in_child(f"http://127.0.0.1:{p_bad}", "http://127.0.0.1:1")
+check("同环境下 500 上游仍判不健康（确实连上了，不是无脑返回健康）",
+      out.startswith("UNHEALTHY") and "500" in out, out[-160:])
+
 print("\n== 3. 决策矩阵 ==")
 base_ok = f"http://127.0.0.1:{p_ok}"
 st = new_state(wd, base_ok)
@@ -218,6 +256,42 @@ check("稳定足够久 → 退避计数归零", st["restarts"] == 0, st)
 st = new_state(wd, base_ok, restarts=3, healthy_since=time.time() - 10)
 wd.tick(base_ok)
 check("刚恢复不久 → 保留退避计数（防抖动）", st["restarts"] == 3, st)
+
+print("\n== 3b. 退避序列必须扛住「重启 → 恢复 → 又挂」 ==")
+# 回归（2026-11-12 定位）：`healthy_since` 曾只写不清 —— 长跑数小时后再崩，恢复的
+# 第一探拿几小时前的起点去比 STABLE_RESET_S，瞬间判定「已稳定」并把 restarts 归零，
+# 于是退避 300/600/1200/1800 与封顶永不生效，抖动期退化成每 150s 捅一次上游。
+# 线上留痕：16:36:58 判死 → 16:37:18 报「已稳定 149972s，重启退避计数归零」。
+_alive = {"v": True}
+_real_probe = wd.probe
+wd.probe = lambda b: (True, None) if _alive["v"] else (False, "ConnectionRefusedError: refused")
+try:
+    base_flap = f"http://127.0.0.1:{closed_port()}"
+    # 关键前提：崩溃之前它已经连续健康 2.7 小时，healthy_since 非 0
+    st = new_state(wd, base_flap, state="healthy", healthy_since=time.time() - 10000)
+    wd.WD_FAIL_THRESHOLD = 1
+    wd.tick(base_flap)
+    check("健康态 tick 不改写已存在的 healthy_since",
+          st["healthy_since"] > 0 and time.time() - st["healthy_since"] > 9000, st["healthy_since"])
+    _alive["v"] = False
+    wd.tick(base_flap)
+    d1 = st["next_attempt"] - time.time()
+    check("第 1 次判死：restarts=1、退避≈150s",
+          st["restarts"] == 1 and 140 <= d1 <= 160, (st["restarts"], d1))
+    check("判死时 healthy_since 必须归零（否则「稳定期」从崩溃前算起）",
+          st["healthy_since"] == 0.0, st["healthy_since"])
+    _alive["v"] = True
+    st["next_attempt"] = 0
+    wd.tick(base_flap)
+    check("恢复后首次健康不归零退避计数（关键回归）", st["restarts"] == 1, st["restarts"])
+    _alive["v"] = False
+    st["next_attempt"] = 0
+    wd.tick(base_flap)
+    d2 = st["next_attempt"] - time.time()
+    check("第 2 次判死：退避升到 ≈300s，而不是重来 150s",
+          st["restarts"] == 2 and 290 <= d2 <= 310, (st["restarts"], d2))
+finally:
+    wd.probe = _real_probe
 
 print("\n== 4. 快照与退避序列 ==")
 snap = wd.snapshot()
