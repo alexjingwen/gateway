@@ -27,10 +27,13 @@
   TG_SRC  被测网关文件，默认仓库根的 token-gateway.py
 """
 import ast
+import itertools
 import json
 import os
 import sys
 import threading
+import time
+from typing import List, Optional
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SRC = os.environ.get("TG_SRC") or os.path.join(os.path.dirname(HERE), "token-gateway.py")
@@ -48,16 +51,41 @@ def check(label, cond, detail=""):
         print(f"  ❌ {label}  {detail}")
 
 
+def _env_num(name, default, cast=int, minimum=None, maximum=None):
+    """与网关同名的桩：读环境变量，非法值退回默认值。"""
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        val = cast(raw)
+    except Exception:
+        return default
+    if minimum is not None:
+        val = max(minimum, val)
+    if maximum is not None:
+        val = min(maximum, val)
+    return val
+
+
 def load_module(src_path):
-    """从源码里抽真实定义（不是复制逻辑），注入桩函数后 exec。"""
+    """从源码里抽真实定义（不是复制逻辑），注入桩函数后 exec。
+
+    2026-11-14：串行锁从 `threading.Semaphore` 换成 `_PrioSerialGate`（能按 API key
+    优先级插队），于是这里要连带抽 `_norm_prio` / `_prio_turn` / `LANE_PRIO_HOLD_S` —
+    否则闸门内部的判定点在新环境里是 NameError，测试会"通过"得很虚假。
+    """
     tree = ast.parse(open(src_path, encoding="utf-8").read())
-    wanted_funcs = {"_mlx_upstream_models", "_mlx_lock_key", "_mlx_sem_for"}
+    wanted_funcs = {"_mlx_upstream_models", "_mlx_lock_key", "_mlx_gate_for",
+                    "_norm_prio", "_prio_turn"}
+    wanted_classes = {"_PrioSerialGate"}
     wanted_names = {"_MLX_UPSTREAM_IDS_TTL", "_mlx_upstream_ids", "_mlx_upstream_ids_lock",
-                    "_mlx_probe_lock", "_mlx_serial_sems", "_mlx_serial_sems_lock",
-                    "MLX_SERIAL_MODE"}
+                    "_mlx_probe_lock", "_mlx_gates", "_mlx_gates_lock",
+                    "MLX_SERIAL_MODE", "LANE_PRIO_HOLD_S", "KEY_PRIORITY_MAX"}
     nodes = []
     for n in tree.body:
         if isinstance(n, ast.FunctionDef) and n.name in wanted_funcs:
+            nodes.append(n)
+        elif isinstance(n, ast.ClassDef) and n.name in wanted_classes:
             nodes.append(n)
         elif isinstance(n, ast.AnnAssign) and getattr(n.target, "id", None) in wanted_names:
             nodes.append(n)
@@ -68,7 +96,8 @@ def load_module(src_path):
     if missing:
         raise SystemExit(f"源码里找不到这些定义：{sorted(missing)}")
     ns = {"json": json, "time": __import__("time"), "threading": threading, "Dict": dict,
-          "os": os}
+          "List": List, "Optional": Optional, "itertools": itertools,
+          "os": os, "_env_num": _env_num}
     for n in nodes:
         exec(compile(ast.Module(body=[n], type_ignores=[]), "<gateway>", "exec"), ns)
     if "MLX_SERIAL_MODE" not in ns:
@@ -98,7 +127,7 @@ def fake_request(host, method, api_path, body=None, timeout=30):
 
 NS["_rapid_mlx_request"] = fake_request
 lock_key = NS["_mlx_lock_key"]
-sem_for = NS["_mlx_sem_for"]
+gate_for = NS["_mlx_gate_for"]
 
 H1 = "http://127.0.0.1:8090"
 H2 = "http://127.0.0.1:8091"
@@ -106,7 +135,7 @@ H2 = "http://127.0.0.1:8091"
 
 def reset(models, fail=False, mode="spec"):
     NS["_mlx_upstream_ids"].clear()
-    NS["_mlx_serial_sems"].clear()
+    NS["_mlx_gates"].clear()
     NS["MLX_SERIAL_MODE"] = mode
     CALLS.clear()
     STATE["models"] = dict(models)
@@ -171,11 +200,11 @@ check("mode=host 时一律 host 锁", lock_key(H1, "gemma4-9b") == H1, lock_key(
 check("mode=host 时带投机的也走 host", lock_key(H1, "other") == H1)
 check("默认值确实是 spec", "TG_MLX_SERIAL_MODE\", \"spec\"" in SRC_TEXT or '"spec"' in SRC_TEXT)
 
-print("\n9. 信号量语义：同键复用、异键并行、不可重入")
+print("\n9. 闸门语义：同键复用、异键并行、不可重入")
 reset({"m1": True, "m2": True})
-s_a1 = sem_for(lock_key(H1, "m1"))
-s_a2 = sem_for(lock_key(H1, "m1"))
-s_b = sem_for(lock_key(H1, "m2"))
+s_a1 = gate_for(lock_key(H1, "m1"))
+s_a2 = gate_for(lock_key(H1, "m1"))
+s_b = gate_for(lock_key(H1, "m2"))
 check("同一键复用同一把锁", s_a1 is s_a2)
 check("不同键拿到不同锁", s_a1 is not s_b)
 s_a1.acquire()
@@ -188,12 +217,12 @@ s_a1.release()
 
 print("\n10. 空串键不会建信号量（放行路径不该留垃圾）")
 reset({"gemma4-9b": False})
-before = len(NS["_mlx_serial_sems"])
+before = len(NS["_mlx_gates"])
 key = lock_key(H1, "gemma4-9b")
 if not key:
-    pass                                  # 调用方直接跳过 _mlx_sem_for
+    pass                                  # 调用方直接跳过 _mlx_gate_for
 check("不带投机的模型不产出锁键", key == "", repr(key))
-check("（不会因为探测而创建信号量）", len(NS["_mlx_serial_sems"]) == before)
+check("（不会因为探测而创建信号量）", len(NS["_mlx_gates"]) == before)
 
 print(f"\n{PASS} 通过 / {FAIL} 失败")
 sys.exit(1 if FAIL else 0)

@@ -389,8 +389,8 @@ _MLX_UPSTREAM_IDS_TTL = 60.0                       # 上游模型清单缓存秒
 _mlx_upstream_ids: Dict[str, tuple] = {}           # host -> (ts, {id: speculative} | None)
 _mlx_upstream_ids_lock = threading.Lock()
 _mlx_probe_lock = threading.Lock()                 # 防惊群：同一时刻只让一个线程去探测
-_mlx_serial_sems: Dict[str, threading.Semaphore] = {}
-_mlx_serial_sems_lock = threading.Lock()
+_mlx_gates: Dict[str, "_PrioSerialGate"] = {}
+_mlx_gates_lock = threading.Lock()
 
 
 def _mlx_upstream_models(host: str):
@@ -451,14 +451,119 @@ def _mlx_lock_key(host: str, model: str = "") -> str:
     return host
 
 
-def _mlx_sem_for(key: str) -> threading.Semaphore:
-    """取该键专属的串行信号量（懒创建）。"""
-    with _mlx_serial_sems_lock:
-        sem = _mlx_serial_sems.get(key)
-        if sem is None:
-            sem = threading.Semaphore(1)
-            _mlx_serial_sems[key] = sem
-        return sem
+class _PrioSerialGate:
+    """按 lock_key 串行，但**等待顺序按 API key 优先级**（替代 threading.Semaphore）。
+
+    为什么换掉 Semaphore：它的唤醒顺序由解释器/内核决定，没有"谁更重要"的概念。
+    于是 VIP 在 8090 的串行锁前与普通请求完全同权 —— 实测这就是 dsh 主路径
+    （auto → qwen3.8-flash-next @ 8090）插不了队的真正原因：auto 解析出真实模型后
+    不走 LanePool，`_acquire_conc_slot` 又因为槽位（默认 10）通常不满而不排队，
+    真正那 74s / 300s 的等待全落在这把锁上。
+
+    实现刻意与 `_acquire_conc_slot` **同构**（ticket + Condition + `_prio_turn`），
+    因为"排队纪律只能有一个判定点"这条不变式比少写几行更重要：插队语义只在
+    `_prio_turn` 定义一次，泳道队列、并发槽、串行锁三处共用，不会各自漂移。
+
+    与 Semaphore 的语义差异（都是刻意的）：
+      · 高优先级可以越过先到的低优先级（这是本次要的行为）；
+      · 让路有窗口（LANE_PRIO_HOLD_S），过后恢复先来后到 → 不会饿死低优先级；
+      · release() 用 notify_all 而不是 notify(1)：醒来后由 `_prio_turn` 判定谁该上，
+        叫醒一个注定要让路的线程只是白转一圈（还容易漏掉真正该上的那个）。
+    """
+
+    __slots__ = ("_cv", "_waiters", "_seq", "_held")
+
+    def __init__(self):
+        self._cv = threading.Condition()
+        self._waiters: List[dict] = []
+        self._seq = itertools.count(1)
+        self._held = False
+
+    def acquire_ex(self, priority: int = 0, timeout: Optional[float] = None,
+                   blocking: bool = True):
+        """取锁。返回 (ok, how, waited_s, skipped)。
+
+        how ∈ direct|queued|timeout；skipped = 我到达时排在队里、优先级比我低的
+        等待者个数（>0 说明这次是插队拿到的，仅用于日志与观测）。
+        """
+        prio = _norm_prio(priority)
+        t0 = time.monotonic()
+        with self._cv:
+            if not self._held:
+                self._held = True
+                return True, "direct", 0.0, 0
+            if not blocking:
+                return False, "timeout", 0.0, 0
+            budget = float("inf") if timeout is None else max(0.0, float(timeout))
+            now = time.time()
+            skipped = sum(1 for t in self._waiters if t.get("prio", 0) < prio)
+            ticket = {"prio": prio, "seq": next(self._seq), "since": now,
+                      "expire_at": (now + budget) if budget != float("inf") else float("inf")}
+            self._waiters.append(ticket)
+            try:
+                while True:
+                    # strict_tie：串行锁资源唯一，同级也按到场顺序（见 _prio_turn）
+                    if not self._held and _prio_turn(self._waiters, ticket,
+                                                     LANE_PRIO_HOLD_S,
+                                                     strict_tie=True):
+                        self._held = True
+                        waited = time.monotonic() - t0
+                        return True, ("queued" if waited > 0.05 else "direct"), waited, skipped
+                    remain = budget - (time.monotonic() - t0)
+                    if remain <= 0:
+                        return False, "timeout", time.monotonic() - t0, skipped
+                    # 0.1s 只是兜底：让路窗口过期不会被 notify 触发，必须自己能醒
+                    self._cv.wait(min(remain, 0.1))
+            finally:
+                try:
+                    self._waiters.remove(ticket)
+                except ValueError:
+                    pass
+
+    def acquire(self, priority: int = 0, timeout: Optional[float] = None,
+                blocking: bool = True) -> bool:
+        """Semaphore 风格的窄接口（只要成败时用它，测试也按这个语义断言）。"""
+        return self.acquire_ex(priority=priority, timeout=timeout, blocking=blocking)[0]
+
+    def release(self):
+        with self._cv:
+            self._held = False
+            self._cv.notify_all()
+
+    def snapshot(self) -> dict:
+        now = time.time()
+        with self._cv:
+            return {"held": self._held, "waiting": len(self._waiters),
+                    "top_prio": max((t.get("prio", 0) for t in self._waiters), default=0),
+                    "max_wait_s": round(max((now - t.get("since", now)
+                                             for t in self._waiters), default=0.0), 1)}
+
+
+def _mlx_gate_for(key: str) -> "_PrioSerialGate":
+    """取该键专属的串行闸门（懒创建）。"""
+    with _mlx_gates_lock:
+        gate = _mlx_gates.get(key)
+        if gate is None:
+            gate = _PrioSerialGate()
+            _mlx_gates[key] = gate
+        return gate
+
+
+def _serial_gates_snapshot() -> dict:
+    """串行闸门的实时视图：谁占着、几个在等、最高优先级多少、等最久的等了多久。
+
+    只列"有动静"的键：闸门是懒创建的、永不回收，把空闲的全列出来会让这个接口
+    随运行时间越长越吵（每个 host|model 组合一条）。
+    """
+    with _mlx_gates_lock:
+        items = list(_mlx_gates.items())
+    active = []
+    for key, gate in items:
+        s = gate.snapshot()
+        if s["held"] or s["waiting"]:
+            active.append({"key": key, **s})
+    return {"total": len(items), "active": active}
+
 
 
 # ── 多模型泳道（lane pool）───────────────────────────────────────────────────
@@ -595,16 +700,18 @@ def _key_priority(key_cfg: Optional[dict]) -> int:
 
 
 def _prio_turn(waiters: List[dict], ticket: dict, hold_s: float,
-               now: Optional[float] = None) -> bool:
+               now: Optional[float] = None, strict_tie: bool = False) -> bool:
     """排队纪律：轮到我了吗？高优先级先上，同级按到场顺序，让路窗口过后恢复先来后到。
 
-    这是整套"插队"唯一的判定点（泳道队列与全局并发槽共用），语义因此只有一处：
+    这是整套"插队"唯一的判定点（泳道队列、全局并发槽、串行闸门共用），语义因此只有一处：
       · 我是排头 → 可以；
       · 排头优先级比我高、且它到场还没超过 hold_s → 我让一轮（这就是插队）；
       · 否则（排头优先级不高于我，或它已经等太久）→ 我也可以，避免饿死。
 
-    过期的登记（已超时、但还没来得及从队列里摘掉的线程）会被跳过：一个卡住的等待者
-    不该把整条队列一起挡住。
+    `strict_tie`（2026-11-14 新增）：同级也要求"我是排头"。默认关闭，因为泳道池里
+    排头可能用不上那条刚空出来的 lane（不同上下文绑定不同模型），强行让它会把可用
+    资源空转。串行闸门则相反 —— 那把锁对谁都一样，资源唯一 ⇒ 排头一定能用上，于是
+    可以也**应该**严格 FIFO。这一层差异源自资源性质，而不是两套纪律。
     """
     if not waiters or ticket not in waiters:
         return True
@@ -613,8 +720,12 @@ def _prio_turn(waiters: List[dict], ticket: dict, hold_s: float,
     head = min(alive or list(waiters), key=lambda t: (-t.get("prio", 0), t.get("seq", 0)))
     if head is ticket:
         return True
-    if (head.get("prio", 0) > ticket.get("prio", 0)
-            and (now - head.get("since", now)) <= hold_s):
+    hp, tp = head.get("prio", 0), ticket.get("prio", 0)
+    if hp > tp and (now - head.get("since", now)) <= hold_s:
+        return False
+    # 同级也让路，但只让给"还没过期"的排头：过期的排头已经不会再来拿了，
+    # 还让给它就等于把队列停在一张废票上。
+    if strict_tie and hp == tp and head.get("expire_at", float("inf")) > now:
         return False
     return True
 
@@ -4181,6 +4292,12 @@ iframe{{padding-top:0}}
         不同上游模型各有自己的 BatchGenerator，本来就互不干扰。
         锁键的取法见 _mlx_lock_key；`TG_MLX_SERIAL_MODE=model` 可回退到"每模型都串行"，
         `=host` 回退到最早的全 host 串行。
+
+        排队纪律：等待者是 `_PrioSerialGate`（见其文档），按 API key 的 priority 插队，
+        判定点仍只有 `_prio_turn` 一处，让路窗口 LANE_PRIO_HOLD_S 过后恢复先来后到。
+        这条很重要 —— `auto` 解析出真实模型后不走 LanePool，并发槽（默认 10）通常也
+        不满，所以**这条锁是 VIP 与普通请求唯一的相遇点**：它是裸 Semaphore 的时候，
+        Alex 的 priority=100 在 dsh 主路径上完完全全是空转。
         """
         path = self.path.split("?", 1)[0]
         is_gen = path.startswith("/v1/chat") or path.startswith("/v1/completions")
@@ -4195,9 +4312,13 @@ iframe{{padding-top:0}}
         if not lock_key:
             return self._proxy(method, client_ip, api_key, key_cfg, cfg,
                                upstream_host=host, **kw)
-        sem = _mlx_sem_for(lock_key)
+        # 优先级：与泳道队列/并发槽同一个来源（key 配置的 priority），也同一个判定点
+        # （_prio_turn）。这条锁是 auto → gmlx 带投机模型的必经之路，之前不给优先级，
+        # 于是 VIP 的插队在 dsh 主路径上是空转的。
+        prio = _key_priority(key_cfg)
+        gate = _mlx_gate_for(lock_key)
         t0 = time.time()
-        got = sem.acquire(timeout=MLX_SERIAL_WAIT)
+        got, _how, _wait, _skipped = gate.acquire_ex(priority=prio, timeout=MLX_SERIAL_WAIT)
         _wait = time.time() - t0          # 只记"等锁"的时长，不含生成耗时
         if not got:
             log(f"⏳ {lock_key} 串行队列等待 {MLX_SERIAL_WAIT}s 仍未空出，拒绝本次请求")
@@ -4205,11 +4326,14 @@ iframe{{padding-top:0}}
                 429, "too_many_requests",
                 f"上游模型正在处理其他请求，排队超过 {MLX_SERIAL_WAIT:g}s，请重试")
             return
+        if _skipped:
+            log(f"⏩ 优先级 {prio} 插队拿到串行锁 {lock_key}"
+                f"（等 {_wait:.2f}s，跳过 {_skipped} 个等待者）")
         try:
             return self._proxy(method, client_ip, api_key, key_cfg, cfg,
                                upstream_host=host, **kw)
         finally:
-            sem.release()
+            gate.release()
             if _wait > 1.0:
                 log(f"⏳ {lock_key} 串行排队 {_wait:.1f}s 后放行")
 
@@ -4967,7 +5091,11 @@ iframe{{padding-top:0}}
 
         # GET /api/admin/lanes — 泳道池实时视图（谁在跑、谁在等、各模型服务了几个上下文）
         if path == "/api/admin/lanes" and method == "GET":
-            self._send_json(LANE_POOL.snapshot())
+            snap = LANE_POOL.snapshot()
+            # auto 路径的等待不经过泳道池，而在串行闸门上 —— 这一块不带上就等于
+            # "最忙的时候看不到到底谁在排队、排了多久"。
+            snap["serial_gates"] = _serial_gates_snapshot()
+            self._send_json(snap)
             return
 
         # GET /api/admin/usage?key=xxx&days=7
