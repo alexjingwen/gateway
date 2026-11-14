@@ -61,10 +61,13 @@ def _env_num(name, default, cast=int, minimum=None, maximum=None):
     return val
 
 
+KEY_CONSTS = {"KEY_PRIORITY_MAX", "KEY_PRIO_SLOT_WAIT_S", "KEY_PRIO_YIELD_S"}
+
+
 def load_module(src_path):
     """从源码里抽真实定义（不是复制逻辑），注入桩函数后 exec。"""
     tree = ast.parse(open(src_path, encoding="utf-8").read())
-    wanted_funcs = {"_parse_lanes", "_lane_context_key"}
+    wanted_funcs = {"_parse_lanes", "_lane_context_key", "_norm_prio", "_prio_turn"}
     wanted_classes = {"LanePool", "LaneTimeout", "LaneQueueFull"}
     nodes = []
     for n in tree.body:
@@ -73,7 +76,8 @@ def load_module(src_path):
         elif isinstance(n, ast.ClassDef) and n.name in wanted_classes:
             nodes.append(n)
         elif isinstance(n, ast.Assign) and any(
-                getattr(t, "id", "").startswith("LANE_") for t in n.targets):
+                getattr(t, "id", "").startswith("LANE_")
+                or getattr(t, "id", "") in KEY_CONSTS for t in n.targets):
             nodes.append(n)
     found = {n.name for n in nodes if isinstance(n, (ast.FunctionDef, ast.ClassDef))}
     missing = (wanted_funcs | wanted_classes) - found

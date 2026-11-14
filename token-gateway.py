@@ -553,6 +553,71 @@ LANE_AUTOCAP_COOLDOWN_S = _env_num("TG_LANE_AUTOCAP_COOLDOWN", 120, minimum=1)
 # 用它算"并发膨胀倍数"会把 20 token 的工具调用读成 3 倍慢。见 release() 的注释。
 LANE_SAMPLE_MIN_TOKENS = _env_num("TG_LANE_SAMPLE_MIN", 32, minimum=1)
 
+# ── API key 优先级（插队）────────────────────────────────────────────────────
+# 优先级只有一个来源：**key 配置里的 `priority` 字段**（整数，缺省 0）。刻意不支持
+# 请求头自报 —— 能自报就等于人人 VIP，优先级本身就没有意义了。改它只有两条路：
+# 改 config.json，或走 /api/admin/keys（要 admin token）。
+#
+# 三个语义，各自对应一个真实场景：
+#   · priority > 0：可以插队。泳道全忙时排在队首；全局并发槽满时有界等待而不是 429。
+#   · priority = 0：默认值，行为与没有这个功能时**一致**：泳道按先来后到，槽满立即 429。
+#   · priority < 0：主动让路。排队排到后面，用于"后台批处理不要挡住交互流量"。
+KEY_PRIORITY_MAX = _env_num("TG_KEY_PRIORITY_MAX", 100, minimum=1)
+# 高优先级请求在全局并发槽满时最多等多久（秒）。注意这不是"排队时长"而是"插队窗口"：
+# 槽数（默认 10）通常远大于泳道容量（3），正常根本用不到；它只在有人把 TG_CONCURRENCY
+# 压得很低时才有意义。普通 key 仍是立刻 429 —— 把所有 429 都改成排队，等于把"快速
+# 失败让客户端退避"换成"一片连接挂在那里等"，那是雪崩的写法。
+KEY_PRIO_SLOT_WAIT_S = _env_num("TG_KEY_PRIO_WAIT", 6, cast=float, minimum=0)
+# 让路窗口（秒）：低优先级最多为更高优先级让这么久，过后恢复先来后到。没有它，持续的
+# 高优先级流量会把低优先级饿死（长尾请求永远排不上），这在共享网关上比慢更糟。
+LANE_PRIO_HOLD_S = _env_num("TG_LANE_PRIO_HOLD", 10, cast=float, minimum=0)
+# 普通 key 遇到"有 VIP 在等空位"时最多让路这么久。它比 VIP 的等待窗口短得多：
+# 让路是礼貌，不该让普通请求也变成排队。
+KEY_PRIO_YIELD_S = 0.25
+
+
+def _norm_prio(value) -> int:
+    """把配置里的 priority 归一成整数：非法/缺失 → 0，越界夹到 ±KEY_PRIORITY_MAX。
+
+    为什么不抛：这几行在请求路径上跑。一个写成 `"priority": "high"` 的配置不该让整个
+    key 变成 500，安静地降级成"普通优先级"是唯一合理的降级方向。
+    """
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return max(-KEY_PRIORITY_MAX, min(KEY_PRIORITY_MAX, v))
+
+
+def _key_priority(key_cfg: Optional[dict]) -> int:
+    """这条 API key 的调度优先级（只读配置，不看请求头）。"""
+    return _norm_prio((key_cfg or {}).get("priority", 0))
+
+
+def _prio_turn(waiters: List[dict], ticket: dict, hold_s: float,
+               now: Optional[float] = None) -> bool:
+    """排队纪律：轮到我了吗？高优先级先上，同级按到场顺序，让路窗口过后恢复先来后到。
+
+    这是整套"插队"唯一的判定点（泳道队列与全局并发槽共用），语义因此只有一处：
+      · 我是排头 → 可以；
+      · 排头优先级比我高、且它到场还没超过 hold_s → 我让一轮（这就是插队）；
+      · 否则（排头优先级不高于我，或它已经等太久）→ 我也可以，避免饿死。
+
+    过期的登记（已超时、但还没来得及从队列里摘掉的线程）会被跳过：一个卡住的等待者
+    不该把整条队列一起挡住。
+    """
+    if not waiters or ticket not in waiters:
+        return True
+    now = time.time() if now is None else now
+    alive = [t for t in waiters if t.get("expire_at", float("inf")) > now]
+    head = min(alive or list(waiters), key=lambda t: (-t.get("prio", 0), t.get("seq", 0)))
+    if head is ticket:
+        return True
+    if (head.get("prio", 0) > ticket.get("prio", 0)
+            and (now - head.get("since", now)) <= hold_s):
+        return False
+    return True
+
 
 def _parse_lanes(raw: str) -> List[dict]:
     """解析 TG_LANES → [{name, model, host, rank, cap}]。非法条目跳过（不抛）。"""
@@ -649,7 +714,7 @@ class LanePool:
                  queue_max: int = 0, sticky: bool = True, sticky_ttl_s: int = 0,
                  ctx_max: int = 0, fail_limit: int = 0, cooldown_s: int = 0,
                  prefer_wait_s: Optional[float] = None, sticky_wait_s: Optional[float] = None,
-                 default_spb_s: Optional[float] = None):
+                 default_spb_s: Optional[float] = None, prio_hold_s: Optional[float] = None):
         self.name = name or LANE_POOL_MODEL
         self.wait_s = float(wait_s) if wait_s else float(LANE_WAIT_S)
         self.queue_max = int(queue_max or LANE_QUEUE_MAX)
@@ -664,6 +729,9 @@ class LanePool:
                             else max(0.0, float(sticky_wait_s)))
         self.default_spb = (LANE_DEFAULT_SPB_S if default_spb_s is None
                             else max(1e-5, float(default_spb_s)))
+        # 让路窗口：低优先级最多为高优先级让这么久（秒，见 _prio_turn）
+        self.prio_hold_s = (LANE_PRIO_HOLD_S if prio_hold_s is None
+                            else max(0.0, float(prio_hold_s)))
         self._cv = threading.Condition(threading.Lock())
         self._lanes: List[dict] = []
         self._by_name: Dict[str, dict] = {}
@@ -696,12 +764,19 @@ class LanePool:
         self._ctx: "OrderedDict[str, tuple]" = OrderedDict()   # ctx -> (lane_name, ts)
         self._waiting = 0
         self._tickets = itertools.count(1)
+        # 排队登记簿：{prio, seq, since, expire_at, held}。与 _waiting 的分工 ——
+        # _waiting 是"此刻卡在 wait() 里的线程数"（队列上限用它），这里记的是"谁在等、
+        # 优先级多高、什么时候来的"，插队判定要用全局视野，所以不等到真阻塞就要登记。
+        self._waiters: List[dict] = []
         # 取道时的并发档位（thread-local）：acquire 在请求线程里决定 conc，release 也在
         # 同一个线程里归还，所以不需要把它塞进返回值（返回值是给调用方的 2 元组契约）。
         self._tls = threading.local()
         self._metrics = {"assigns": 0, "queued": 0, "timeouts": 0,
                          "queue_full": 0, "failures": 0, "quarantines": 0,
-                         "migrations": 0, "autocap_down": 0, "autocap_trials": 0}
+                         "migrations": 0, "autocap_down": 0, "autocap_trials": 0,
+                         # 插队：prio_inserts=高优先级拿到本来该给别人的位置；
+                         # prio_holds=有人为更高优先级让路过（含被让的那个自己）
+                         "prio_inserts": 0, "prio_holds": 0}
 
     # ---- 内部：选泳道 ----
     @property
@@ -886,68 +961,109 @@ class LanePool:
         return max(1, int(getattr(self._tls, "conc", 1) or 1))
 
     def acquire(self, ctx: str, *, lane: str = "", timeout: Optional[float] = None,
-                est_tokens: int = 0):
-        """取一条泳道。返回 (lane_dict, 等待秒数)；超时/队满抛异常。"""
+                est_tokens: int = 0, priority: int = 0):
+        """取一条泳道。返回 (lane_dict, 等待秒数)；超时/队满抛异常。
+
+        `priority > 0` 时**可以插队**：允许越过先到的低优先级等待者，去拿刚空出来的
+        泳道。这个判定只发生在 `_prio_turn` 一处，所以不存在"某条支路绕过优先级"。
+        普通（0）与低优先级（<0）的语义不变：先来后到，超时/队满照旧。
+        """
         limit = self.wait_s if timeout is None else float(timeout)
         deadline = time.monotonic() + limit
         t0 = time.monotonic()
         t_pref = None
         t_sticky = None
         with self._cv:
-            while True:
-                now = time.time()
-                # 粘性上下文等太久 + 别的模型空着 → 允许改派（默认关，见 LANE_STICKY_WAIT_S）
-                if self.sticky_wait > 0 and not lane:
-                    _rec = self._ctx.get(ctx)
-                    _bl = self._by_name.get(_rec[0]) if _rec else None
-                    if _bl is not None and _bl["busy"] >= self._cap_of(_bl, now) and self._pick_free(now) is not None:
-                        if t_sticky is None:
-                            t_sticky = now + self.sticky_wait
-                        if now >= t_sticky:
-                            self._ctx.pop(ctx, None)
-                            self._metrics["migrations"] += 1
-                            log(f"↔️ 上下文 {ctx} 等 {_bl['name']} 超过 {self.sticky_wait:g}s，改派")
-                        else:
-                            self._cv.wait(min(0.2, max(t_sticky - now, 0.01)))
-                            continue
-                chosen, why = self._select(ctx, lane, now, est_tokens,
-                                           allow_top_wait=(t_pref is None or now < t_pref))
-                if why == "top" and chosen is not None and chosen["busy"] >= self._cap_of(chosen, now) and t_pref is None:
-                    # 开始等"最好的那条"，等满 prefer_wait 还没空出来就改看预测
-                    t_pref = now + self.prefer_wait
-                if chosen is not None and chosen["busy"] < self._cap_of(chosen, now):
-                    chosen["busy"] += 1
-                    chosen["last_used"] = now
-                    chosen["ctx"] = ctx
-                    # 记下预计占用时长：队列里的后来者据此算"在谁那儿先做完"。
-                    # 用**加入后这一档**的速率（合批后每 token 更慢），否则一条 cap=2 的
-                    # 泳道会被算成两单都能全速跑完，排队者会误以为它马上就空。
-                    chosen["job_ends"].append(
-                        now + max(0.05, self.spb_at(chosen, chosen["busy"]) * max(1, est_tokens)))
-                    chosen["job_ends"].sort()
-                    self._bind(ctx, chosen["name"])
-                    self._tls.conc = chosen["busy"]      # release 里学"这一档"的画像
-                    waited = time.monotonic() - t0
-                    chosen["wait_sum"] += waited
-                    chosen["wait_max"] = max(chosen["wait_max"], waited)
-                    self._metrics["assigns"] += 1
-                    if waited > 0.05:
-                        self._metrics["queued"] += 1
-                    return chosen, waited
-                if time.monotonic() >= deadline:
-                    self._metrics["timeouts"] += 1
-                    raise LaneTimeout(
-                        f"等待空闲模型超过 {limit:g}s（{len(self._lanes)} 条泳道全忙，"
-                        f"队列 {self._waiting}）")
-                if self._waiting >= self.queue_max:
-                    self._metrics["queue_full"] += 1
-                    raise LaneQueueFull(f"等待队列已满（{self.queue_max}），请稍后重试")
-                self._waiting += 1
+            # 一进来就登记，而不是等真要 wait() 时才登记：插队判定需要"谁在等"的全局
+            # 视野，晚登记等于两只手同时摸最后一块，优先级来不及生效。
+            # expire_at 用 wall clock，和 _prio_turn 的比较基准保持一致。
+            ticket = {"prio": _norm_prio(priority), "seq": next(self._tickets),
+                      "since": time.time(), "expire_at": time.time() + limit,
+                      "held": False}
+            self._waiters.append(ticket)
+            try:
+                while True:
+                    now = time.time()
+                    # 插队：有更高优先级的请求在等，且它还没等过头 → 我先让一轮。
+                    # 只让"抢"这一步，不停表：deadline 照走，该超时还是超时。
+                    if not _prio_turn(self._waiters, ticket, self.prio_hold_s, now):
+                        if not ticket["held"]:
+                            ticket["held"] = True
+                            self._metrics["prio_holds"] += 1
+                        if time.monotonic() >= deadline:
+                            self._metrics["timeouts"] += 1
+                            raise LaneTimeout(
+                                f"等待空闲模型超过 {limit:g}s（{len(self._lanes)} 条泳道全忙，"
+                                f"队列 {self._waiting}，优先级 {ticket['prio']}）")
+                        # 20ms：足够让被让路的那个线程在同一轮 notify 里拿到资源，
+                        # 又不至于把让路变成"空转吃 CPU"。
+                        self._cv.wait(min(max(deadline - time.monotonic(), 0.01), 0.02))
+                        continue
+                    # 粘性上下文等太久 + 别的模型空着 → 允许改派（默认关，见 LANE_STICKY_WAIT_S）
+                    if self.sticky_wait > 0 and not lane:
+                        _rec = self._ctx.get(ctx)
+                        _bl = self._by_name.get(_rec[0]) if _rec else None
+                        if _bl is not None and _bl["busy"] >= self._cap_of(_bl, now) and self._pick_free(now) is not None:
+                            if t_sticky is None:
+                                t_sticky = now + self.sticky_wait
+                            if now >= t_sticky:
+                                self._ctx.pop(ctx, None)
+                                self._metrics["migrations"] += 1
+                                log(f"↔️ 上下文 {ctx} 等 {_bl['name']} 超过 {self.sticky_wait:g}s，改派")
+                            else:
+                                self._cv.wait(min(0.2, max(t_sticky - now, 0.01)))
+                                continue
+                    chosen, why = self._select(ctx, lane, now, est_tokens,
+                                               allow_top_wait=(t_pref is None or now < t_pref))
+                    if why == "top" and chosen is not None and chosen["busy"] >= self._cap_of(chosen, now) and t_pref is None:
+                        # 开始等"最好的那条"，等满 prefer_wait 还没空出来就改看预测
+                        t_pref = now + self.prefer_wait
+                    if chosen is not None and chosen["busy"] < self._cap_of(chosen, now):
+                        chosen["busy"] += 1
+                        chosen["last_used"] = now
+                        chosen["ctx"] = ctx
+                        # 记下预计占用时长：队列里的后来者据此算"在谁那儿先做完"。
+                        # 用**加入后这一档**的速率（合批后每 token 更慢），否则一条 cap=2 的
+                        # 泳道会被算成两单都能全速跑完，排队者会误以为它马上就空。
+                        chosen["job_ends"].append(
+                            now + max(0.05, self.spb_at(chosen, chosen["busy"]) * max(1, est_tokens)))
+                        chosen["job_ends"].sort()
+                        self._bind(ctx, chosen["name"])
+                        self._tls.conc = chosen["busy"]      # release 里学"这一档"的画像
+                        waited = time.monotonic() - t0
+                        chosen["wait_sum"] += waited
+                        chosen["wait_max"] = max(chosen["wait_max"], waited)
+                        self._metrics["assigns"] += 1
+                        if waited > 0.05:
+                            self._metrics["queued"] += 1
+                        if ticket["prio"] > 0 and waited > 0.05:
+                            # 只统计"等了才拿到"的高优先级：没等就拿到不算插队，
+                            # 否则这个计数会随流量线性涨，看不出插队是否真的发生。
+                            self._metrics["prio_inserts"] += 1
+                            log(f"⏩ 优先级 {ticket['prio']} 插队拿到泳道 {chosen['name']}"
+                                f"（等 {waited:.2f}s，队列 {len(self._waiters)}）")
+                        return chosen, waited
+                    if time.monotonic() >= deadline:
+                        self._metrics["timeouts"] += 1
+                        raise LaneTimeout(
+                            f"等待空闲模型超过 {limit:g}s（{len(self._lanes)} 条泳道全忙，"
+                            f"队列 {self._waiting}）")
+                    # 队满只挡普通请求：VIP 的等待窗口本来就短，被"队满"拒掉等于插队
+                    # 功能在最需要的时候失效。代价是队列上界对 VIP 不严格，可接受。
+                    if self._waiting >= self.queue_max and ticket["prio"] <= 0:
+                        self._metrics["queue_full"] += 1
+                        raise LaneQueueFull(f"等待队列已满（{self.queue_max}），请稍后重试")
+                    self._waiting += 1
+                    try:
+                        # 短轮询：任何一次 release 都会 notify，这里只是防丢通知的兜底
+                        self._cv.wait(min(max(deadline - time.monotonic(), 0.01), 0.05))
+                    finally:
+                        self._waiting -= 1
+            finally:
                 try:
-                    # 短轮询：任何一次 release 都会 notify，这里只是防丢通知的兜底
-                    self._cv.wait(min(max(deadline - time.monotonic(), 0.01), 0.05))
-                finally:
-                    self._waiting -= 1
+                    self._waiters.remove(ticket)
+                except ValueError:
+                    pass
 
     def release(self, lane: dict, *, error: bool = False, tokens: int = 0,
                 elapsed: float = 0.0, conc: int = 0):
@@ -1064,6 +1180,16 @@ class LanePool:
                             "samples": LANE_AUTOCAP_SAMPLES,
                             "cooldown_s": LANE_AUTOCAP_COOLDOWN_S},
                 "waiting": self._waiting, "contexts": len(self._ctx),
+                # 优先级（插队）观测：让路窗口 + 当前队列里各优先级的人数。
+                # 只有"高优先级是否真的插到了队"这个问题需要看 metrics.prio_inserts，
+                # 其余（谁在等、多高、等多久）看这里。
+                "priority": {
+                    "hold_s": self.prio_hold_s,
+                    "waiters": [{"prio": t["prio"], "seq": t["seq"],
+                                 "age_s": round(now - t["since"], 2)}
+                                for t in sorted(self._waiters,
+                                                key=lambda t: (-t["prio"], t["seq"]))][:8],
+                },
                 "lanes": lanes, "metrics": dict(self._metrics),
             }
 
@@ -1076,9 +1202,14 @@ LANE_POOL = LanePool(_parse_lanes(os.environ.get("TG_LANES", "")),
 # ==========================
 
 # 全局运行时状态
-state_lock = threading.Lock()
+# state_lock 同时是 Condition：并发槽被占满时，高优先级请求要在这里**等**一个空位，
+# 释放侧必须能唤醒它。`with state_lock:` 的写法与原来的 Lock 完全兼容。
+state_lock = threading.Condition(threading.Lock())
 key_qps_bucket: Dict[str, List[float]] = defaultdict(list)  # 每个 key 的请求时间戳
 active_concurrency = 0
+# 并发槽的等位登记簿（结构与泳道队列一致，插队判定共用 _prio_turn）
+_conc_waiters: List[dict] = []
+_conc_seq = itertools.count(1)
 
 # ── 并发槽位回收 ─────────────────────────────────────────────────────────────
 # 踩过的坑（真实事故）：客户端（挂机 bot）自己有步进预算，超时就断开重来；而网关这边
@@ -1110,6 +1241,68 @@ MODEL_REFRESH_INTERVAL_S = _env_num("TG_MODEL_REFRESH_INTERVAL", 60, minimum=0)
 # 现在列举只读缓存：超过这个陈旧度就**后台**触发一次刷新（不阻塞本次响应），
 # 因此删掉的模型最多在一个 TTL + 一次探测耗时内从列表消失，而在的模型不会因抖动请假。
 MODEL_LIST_TTL_S = _env_num("TG_MODEL_LIST_TTL", 5, minimum=0)
+
+
+def _conc_limit() -> int:
+    """当前全局并发上限（配置文件热改后立刻生效，不必算缓存）。"""
+    try:
+        return max(1, int(_cfg["global"]["max_concurrency"]))
+    except Exception:
+        return max(1, int(DEFAULT_MAX_CONCURRENCY))
+
+
+def _acquire_conc_slot(priority: int = 0, wait_s: float = 0.0):
+    """取一个全局并发槽，返回 (ok, how, waited_s)；how ∈ direct|queued|busy|timeout。
+
+    与泳道队列的分工：泳道队列等的是"某个模型空出来"（可能几十秒），这里等的是网关
+    自己的并发上限（默认 10，远大于泳道容量 3）。所以这个等待窗口很短 —— 它存在的
+    意义只是别让高优先级请求被一个瞬时打满的槽位直接 429 掉。
+
+    普通请求维持原语义：槽满就 busy，让客户端快速失败并退避。唯一例外是"槽里其实有
+    空位、但队列里有 VIP 在等"时让 0.25s —— 否则刚空出来的槽会被恰好路过的普通请求
+    抢走，插队就成了摆设。
+    """
+    global active_concurrency
+    prio = _norm_prio(priority)
+    t0 = time.monotonic()
+    with state_lock:
+        if prio <= 0 and active_concurrency >= _conc_limit():
+            return False, "busy", 0.0
+        budget = max(0.0, wait_s) if prio > 0 else min(KEY_PRIO_YIELD_S, max(0.0, wait_s))
+        ticket = {"prio": prio, "seq": next(_conc_seq), "since": time.time(),
+                  "expire_at": time.time() + budget}
+        _conc_waiters.append(ticket)
+        try:
+            while True:
+                if (active_concurrency < _conc_limit()
+                        and _prio_turn(_conc_waiters, ticket, LANE_PRIO_HOLD_S)):
+                    active_concurrency += 1
+                    waited = time.monotonic() - t0
+                    return True, ("queued" if waited > 0.05 else "direct"), waited
+                remain = budget - (time.monotonic() - t0)
+                if remain <= 0:
+                    return False, ("timeout" if prio > 0 else "busy"), time.monotonic() - t0
+                state_lock.wait(min(remain, 0.1))
+        finally:
+            try:
+                _conc_waiters.remove(ticket)
+            except ValueError:
+                pass
+
+
+def _drop_active_req(rid: int):
+    """归还一个并发槽并唤醒等位者（请求 finally 与 reaper 共用）。
+
+    用 notify_all 而不是 notify：等位者里普通请求和 VIP 混在一起，谁该先上由
+    `_prio_turn` 在醒来之后判定；notify(1) 可能刚好叫醒一个注定要让路的线程，
+    白白多转一圈（还顺手把真正该上的那个漏掉）。
+    """
+    global active_concurrency
+    with state_lock:
+        e = _active_reqs.pop(rid, None)
+        if e is None or not e.get("freed"):
+            active_concurrency = max(0, active_concurrency - 1)
+        state_lock.notify_all()
 
 
 def _slots_free_by_client_gone() -> int:
@@ -1144,6 +1337,10 @@ def _slots_free_by_client_gone() -> int:
                     e["freed"] = True
                     active_concurrency = max(0, active_concurrency - 1)
                     freed += 1
+        if freed:
+            # 回收出来的槽位必须唤醒等位者，否则"客户端走了"这件事对 VIP 仍然不可见，
+            # 它要等到下一个请求自己结束才可能拿到位置。
+            state_lock.notify_all()
     return freed
 
 
@@ -1420,8 +1617,8 @@ tr:hover td{background:var(--surface2)}
 <div class="card" style="padding:0">
 <div class="table-wrap">
 <table id="keysTable">
-<thead><tr><th>Key</th><th>名称</th><th>状态</th><th>今日用量</th><th>本月用量</th><th>QPS</th><th>创建</th><th>操作</th></tr></thead>
-<tbody id="keysBody"><tr><td colspan="8" class="empty">加载中...</td></tr></tbody>
+<thead><tr><th>Key</th><th>名称</th><th>状态</th><th>今日用量</th><th>本月用量</th><th>QPS</th><th>优先级</th><th>创建</th><th>操作</th></tr></thead>
+<tbody id="keysBody"><tr><td colspan="9" class="empty">加载中...</td></tr></tbody>
 </table>
 </div>
 </div>
@@ -1513,6 +1710,7 @@ tr:hover td{background:var(--surface2)}
 <div class="field"><label>QPS 限制 (次/秒)</label><input id="kQps" type="number" value="5"></div>
 <div class="field"><label>启用限流</label><select id="kLimited" style="width:100%"><option value="1">是</option><option value="0">否</option></select></div>
 </div>
+<div class="field"><label>调度优先级（&gt;0 可插队，0 普通，&lt;0 让路）</label><input id="kPriority" type="number" value="0" min="-100" max="100"></div>
 <div class="field"><label>状态</label><select id="kActive" style="width:100%"><option value="1">启用</option><option value="0">停用</option></select></div>
 <div class="actions">
 <button class="btn ghost" onclick="closeKeyModal()">取消</button>
@@ -1678,7 +1876,7 @@ const r=await fetch('/api/admin/keys/list',{headers:ah()});
 if(!r.ok){if(r.status===401){logout();return;}return;}
 const d=await r.json();
 const keys=d.keys||[];
-if(!keys.length){document.getElementById('keysBody').innerHTML='<tr><td colspan="8" class="empty">暂无 Key，点击右上角新建</td></tr>';return;}
+if(!keys.length){document.getElementById('keysBody').innerHTML='<tr><td colspan="9" class="empty">暂无 Key，点击右上角新建</td></tr>';return;}
 document.getElementById('keysBody').innerHTML=keys.map(k=>{
 const dp=pct(k.daily_used,k.daily_tokens);
 const mp=pct(k.monthly_used,k.monthly_tokens);
@@ -1689,6 +1887,7 @@ return `<tr>
 <td>${fmt(k.daily_used)}<div class="bar-wrap"><div class="bar-fill" style="width:${dp}%;background:${barColor(dp)}"></div></div><div style="font-size:10px;color:var(--dim)">${dp}% / ${fmt(k.daily_tokens)}</div></td>
 <td>${fmt(k.monthly_used)}<div class="bar-wrap"><div class="bar-fill" style="width:${mp}%;background:${barColor(mp)}"></div></div><div style="font-size:10px;color:var(--dim)">${mp}% / ${fmt(k.monthly_tokens)}</div></td>
 <td>${k.qps}/s</td>
+<td>${k.priority>0?'<span class="pill on">'+k.priority+'</span>':(k.priority<0?k.priority:0)}</td>
 <td style="font-size:11px;color:var(--dim)">${k.created||'-'}</td>
 <td><button class="icon-btn" onclick="editKey('${k.key}')">编辑</button> <button class="icon-btn danger" onclick="delKey('${k.key}','${k.name}')">删除</button></td>
 </tr>`;}).join('');
@@ -1697,7 +1896,7 @@ return `<tr>
 
 // Key 弹窗
 let editingKey=null;
-function openKeyModal(){editingKey=null;document.getElementById('keyModalTitle').textContent='新建 API Key';document.getElementById('kName').value='';document.getElementById('kDaily').value=1000000;document.getElementById('kMonthly').value=30000000;document.getElementById('kQps').value=5;document.getElementById('kLimited').value='1';document.getElementById('kActive').value='1';document.getElementById('keyModal').classList.add('show');}
+function openKeyModal(){editingKey=null;document.getElementById('keyModalTitle').textContent='新建 API Key';document.getElementById('kName').value='';document.getElementById('kDaily').value=1000000;document.getElementById('kMonthly').value=30000000;document.getElementById('kQps').value=5;document.getElementById('kPriority').value=0;document.getElementById('kLimited').value='1';document.getElementById('kActive').value='1';document.getElementById('keyModal').classList.add('show');}
 async function editKey(key){
 try{
 const r=await fetch('/api/admin/keys/list',{headers:ah()});
@@ -1710,6 +1909,7 @@ document.getElementById('kName').value=k.name||'';
 document.getElementById('kDaily').value=k.daily_tokens;
 document.getElementById('kMonthly').value=k.monthly_tokens;
 document.getElementById('kQps').value=k.qps;
+document.getElementById('kPriority').value=k.priority||0;
 document.getElementById('kLimited').value=k.rate_limited?'1':'0';
 document.getElementById('kActive').value=k.active?'1':'0';
 document.getElementById('keyModal').classList.add('show');
@@ -1717,7 +1917,7 @@ document.getElementById('keyModal').classList.add('show');
 }
 function closeKeyModal(){document.getElementById('keyModal').classList.remove('show');}
 async function saveKey(){
-const data={name:document.getElementById('kName').value.trim()||'未命名',daily_tokens:parseInt(document.getElementById('kDaily').value)||0,monthly_tokens:parseInt(document.getElementById('kMonthly').value)||0,qps:parseInt(document.getElementById('kQps').value)||5,rate_limited:document.getElementById('kLimited').value==='1',active:document.getElementById('kActive').value==='1'};
+const data={name:document.getElementById('kName').value.trim()||'未命名',daily_tokens:parseInt(document.getElementById('kDaily').value)||0,monthly_tokens:parseInt(document.getElementById('kMonthly').value)||0,qps:parseInt(document.getElementById('kQps').value)||5,priority:parseInt(document.getElementById('kPriority').value)||0,rate_limited:document.getElementById('kLimited').value==='1',active:document.getElementById('kActive').value==='1'};
 if(editingKey)data.key=editingKey;
 try{
 const r=await fetch('/api/admin/keys',{method:'POST',headers:ah(),body:JSON.stringify(data)});
@@ -2384,7 +2584,8 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers",
                          "Authorization,Content-Type,Accept,X-Admin-Token")
         self.send_header("Access-Control-Expose-Headers",
-                         "X-Token-Usage,X-Quota-Remaining,X-RateLimit-Limit")
+                         "X-Token-Usage,X-Quota-Remaining,X-RateLimit-Limit,"
+                         "X-TG-Priority,X-Gateway-Lane,X-Gateway-Model")
 
     # ---- 鉴权提取 ----
     def _extract_api_key(self) -> Optional[str]:
@@ -3654,11 +3855,11 @@ iframe{{padding-top:0}}
         # OpenAI 兼容 /v1/* GET
         if path.startswith("/v1/") or path.startswith("/api/"):
             client_ip = self._real_ip()
+            _ok, _how, _ = _acquire_conc_slot(_key_priority(key_cfg), KEY_PRIO_SLOT_WAIT_S)
+            if not _ok:
+                self._send_error(429, "too_many_requests", "服务器忙")
+                return
             with state_lock:
-                if active_concurrency >= cfg["global"]["max_concurrency"]:
-                    self._send_error(429, "too_many_requests", "服务器忙")
-                    return
-                active_concurrency += 1
                 _rid = next(_req_seq)
                 _active_reqs[_rid] = {"ts": time.time(), "sock": self.connection, "freed": False}
             try:
@@ -3670,10 +3871,7 @@ iframe{{padding-top:0}}
                 except Exception:
                     pass
             finally:
-                with state_lock:
-                    _e = _active_reqs.pop(_rid, None)
-                    if _e is None or not _e.get("freed"):
-                        active_concurrency = max(0, active_concurrency - 1)
+                _drop_active_req(_rid)
             return
 
         self._send_error(404, "not_found", "Not Found")
@@ -3708,6 +3906,10 @@ iframe{{padding-top:0}}
             return
         api_key, key_cfg = auth_result_ok
         cfg = _cfg
+        # 这条 key 的调度优先级（只来自配置）。后面两处排队都用它：
+        #   ① 全局并发槽（短窗口：槽满时 VIP 可以等一个空位，而不是立刻 429）；
+        #   ② 泳道队列（长窗口：VIP 排到队首，资源一空出来先给它）。
+        _prio = _key_priority(key_cfg)
 
         # 解析请求体（容错 BOM 和空白）
         try:
@@ -3840,7 +4042,8 @@ iframe{{padding-top:0}}
                 # 队列预测随之失真（实测表现为"明明该等快模型，却跑去慢模型"）。
                 _gen_est = int(req.get("max_tokens") or req.get("max_completion_tokens") or 512)
                 _pool_lane, _lane_wait = LANE_POOL.acquire(_lane_ctx, lane=_lane_hint,
-                                                           est_tokens=_gen_est)
+                                                           est_tokens=_gen_est,
+                                                           priority=_prio)
             except LaneQueueFull as e:
                 self._send_error(429, "lane_queue_full", str(e))
                 return
@@ -3859,17 +4062,27 @@ iframe{{padding-top:0}}
             body_bytes = json.dumps(req, ensure_ascii=False).encode("utf-8")
             log(f"🚦 泳道 {_pool_lane['name']} ← {_lane_ctx}"
                 f"{' ×%d' % self._lane_conc if self._lane_conc > 1 else ''}"
+                f"{' p%d' % _prio if _prio else ''}"
                 f"{'（等 %.2fs）' % _lane_wait if _lane_wait > 0.05 else ''} → {model}")
 
-        # 并发检查
-        with state_lock:
-            if active_concurrency >= cfg["global"]["max_concurrency"]:
-                self._release_lane()
+        # 并发检查（优先级在这里起作用：VIP 槽满时有界等待，普通请求仍快速 429）
+        _slot_ok, _slot_how, _slot_wait = _acquire_conc_slot(_prio, KEY_PRIO_SLOT_WAIT_S)
+        if not _slot_ok:
+            # 先把泳道还回去：等槽位的这段时间它一直被占着，超时后必须释放
+            self._release_lane()
+            if _slot_how == "timeout":
+                self._send_error(429, "priority_wait_timeout",
+                                 f"高优先级请求等待并发槽超过 {KEY_PRIO_SLOT_WAIT_S:g}s"
+                                 f"（并发上限 {_conc_limit()}）")
+            else:
                 self._send_error(429, "too_many_requests", "服务器忙，请稍后再试")
-                return
-            active_concurrency += 1
+            return
+        with state_lock:
             _rid = next(_req_seq)
             _active_reqs[_rid] = {"ts": time.time(), "sock": self.connection, "freed": False}
+        if _slot_wait > 0.05:
+            log(f"⏳ 优先级 {_prio} 等并发槽 {_slot_wait:.2f}s 后拿到"
+                f"（{active_concurrency}/{_conc_limit()}）")
 
         client_ip = self._real_ip()
         # 记录该模型在飞请求数：auto 的 least-busy 策略据此判断哪个模型繁忙
@@ -3899,11 +4112,8 @@ iframe{{padding-top:0}}
             # _proxy 通常已经在上游读完时释放过；这里只兜底真正漏掉的情况
             if not getattr(self, "_inflight_released", False):
                 model_inflight_dec(_inflight_model)
-            # 释放槽位；如果 reaper 已经因为"客户端走了"提前回收过，这里就不要再减
-            with state_lock:
-                _e = _active_reqs.pop(_rid, None)
-                if _e is None or not _e.get("freed"):
-                    active_concurrency = max(0, active_concurrency - 1)
+            # 释放槽位；reaper 若已因"客户端走了"提前回收过，这里就不要再减
+            _drop_active_req(_rid)
 
     def _release_lane(self, error: bool = False):
         """归还泳道（幂等：多次调用只生效一次）。"""
@@ -4415,6 +4625,8 @@ iframe{{padding-top:0}}
             self.send_header("X-Quota-Remaining-Monthly",
                            str(max(0, limit_m - used_m) if limit_m else "unlimited"))
             self.send_header("X-RateLimit-Limit", str(key_cfg.get("qps", DEFAULT_QPS)))
+            # 回显这条 key 的调度优先级（0 也发，客户端据此确认自己没配错）
+            self.send_header("X-TG-Priority", str(_key_priority(key_cfg)))
             # auto 命中时回传实际选中的模型，便于客户端确认与问题定位
             _auto_hit = getattr(self, "_auto_resolved", None)
             if _auto_hit:
@@ -4809,6 +5021,9 @@ iframe{{padding-top:0}}
                 "monthly_tokens": int(data.get("monthly_tokens", 30_000_000)),
                 "qps": int(data.get("qps", DEFAULT_QPS)),
                 "rate_limited": bool(data.get("rate_limited", True)),
+                # 调度优先级：高的能插队（见 KEY_PRIORITY_MAX 那段）。缺省 0 = 老行为；
+                # 存的是夹紧后的整数，避免配置里出现 "high"/9999 这类让调度器失智的值。
+                "priority": _norm_prio(data.get("priority", 0)),
                 "active": bool(data.get("active", True)),
                 "created": time.strftime("%Y-%m-%d"),
             }
@@ -4851,6 +5066,7 @@ iframe{{padding-top:0}}
                     "monthly_tokens": kc.get("monthly_tokens", 0),
                     "qps": kc.get("qps", DEFAULT_QPS),
                     "rate_limited": kc.get("rate_limited", True),
+                    "priority": _key_priority(kc),
                     "created": kc.get("created", ""),
                     "daily_used": ud,
                     "monthly_used": um,

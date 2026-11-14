@@ -967,6 +967,72 @@ pred(lane) = 该泳道最早空出时间 + 每 token 秒数(spb) × 本次生成
 > 这就是"第二/第三条泳道该选谁"的唯一判据 —— 本机 gemma4-9B 是基座模型、qwen2.5vl:3b
 > 只有 33 tok/s，都不合格。
 
+### API key 优先级：谁可以插队（2026-11-14）
+
+泳道只有 3 个位置（flash cap=1 + gptoss cap=2），第 4 个上下文开始排队。排队本身是对的，
+但**顺序**之前只有先来后到：一个后台批处理任务先到，就能让交互请求排在它后面——哪怕它
+要跑十分钟。这一节给 key 加一个整数优先级，让"重要的请求先上"变成配置而不是运气。
+
+配置（只认配置，**不接受请求头自报**——能自报就等于人人 VIP）：
+
+```jsonc
+// config.json
+"keys": {
+  "sk-interactive-xxx": { "name": "交互", "priority": 10,  ... },
+  "sk-batch-xxx":       { "name": "批处理", "priority": -5, ... }
+}
+```
+
+```bash
+# 或者走管理接口（需要 admin token；不传 key 就是新建）
+curl -s -X POST http://127.0.0.1:3000/api/admin/keys \
+  -H "X-Admin-Token: $ADMIN" -H 'Content-Type: application/json' \
+  -d '{"key":"sk-xxx","name":"交互","priority":10,"qps":20}'
+```
+
+三个取值，对应三种真实场景：
+
+| `priority` | 语义 | 实现 |
+|---|---|---|
+| `> 0` | 可以插队 | 泳道队列排到队首；全局并发槽满时有界等待（`TG_KEY_PRIO_WAIT`，默认 6s）而不是 429 |
+| `0` | 默认，**行为与没这个功能时一致** | 泳道先来后到；槽满立刻 429（快速失败让客户端退避） |
+| `< 0` | 主动让路 | 排队排到后面，用于"后台任务不要挡住交互流量" |
+
+**插队发生在"抢资源"这一步，不是"抢正在跑的请求"。** 已经在生成的那一单不可能被中断
+（除非取消上游连接，那会把已经算了几万 token 的 prefill 一起丢掉），所以插队的含义是：
+资源一空出来，先给队首。落点是两处排队：
+
+1. **泳道队列**（长窗口，通常几十秒）：`LanePool.acquire(priority=...)` 把 key 的优先级
+   写进排队登记簿；判定只在一处 `_prio_turn` —— 排头优先级更高、且它到场没超过
+   `TG_LANE_PRIO_HOLD`（默认 10s）时，其他人让一轮。
+2. **全局并发槽**（短窗口）：`_acquire_conc_slot` 让 VIP 在槽满时等一个空位；普通请求
+   仍是立刻 429，唯一例外是"槽有空位但有 VIP 在等"时让 0.25s，否则刚空出来的位置
+   会被恰好路过的普通请求抢走，插队就成了摆设。
+
+**防饿死**：让路有窗口（`TG_LANE_PRIO_HOLD`，默认 10s）。没有它，持续的高优先级流量
+会让低优先级的长尾请求永远排不上；窗口过后恢复先来后到——慢一点可以，饿死不行。
+
+**为什么不在请求头上**：`X-TG-Priority` 只是**响应**头（回显这条 key 的优先级，方便
+客户端确认自己没配错）。如果允许请求头抬优先级，任何人加一行 header 就绕过整套调度，
+那这个字段等于没有。
+
+实测（隔离实例 + 假上游，单泳道 cap=1、每个请求固定 0.9s）：
+
+```
+A(low, prio=0)  0.91s
+C(VIP, prio=10) 1.52s   ← 比 B 晚到 0.15s，但插到 B 前面
+B(low, prio=0)  2.57s
+metrics: {"prio_inserts": 1, "prio_holds": 1}
+```
+
+观测：
+
+- 响应头 `X-TG-Priority`；
+- `/api/admin/lanes` 顶层 `priority.hold_s` 与 `priority.waiters`（谁在等、多高、等了多久），
+  每条泳道的 `metrics.prio_inserts` / `prio_holds`；
+- 日志：`⏩ 优先级 10 插队拿到泳道 flash（等 0.61s，队列 2）`、
+  `⏳ 优先级 10 等并发槽 1.20s 后拿到（9/10）`。
+
 ### 怎么用
 
 ```bash
@@ -1019,6 +1085,9 @@ TG_LANES='[{"name":"flash","model":"qwen3.8-flash-next","rank":100,"cap":1}]'
 | `TG_LANE_AUTOCAP_SAMPLES` | 3 | 连续几个样本才降档 |
 | `TG_LANE_AUTOCAP_COOLDOWN` | 120 | 降档冷却（秒）；每多降一次翻倍，到期自动试探恢复 |
 | `TG_LANE_SAMPLE_MIN` | 32 | 参与学习的样本最短生成 token 数（短样本被 prefill 主导） |
+| `TG_KEY_PRIORITY_MAX` | 100 | key 优先级的绝对值上限（超出会被夹紧；非法值退回 0） |
+| `TG_KEY_PRIO_WAIT` | 6 | 高优先级请求在全局并发槽满时最多等多久（秒）；普通请求仍立刻 429 |
+| `TG_LANE_PRIO_HOLD` | 10 | 低优先级为高优先级让路的窗口（秒）；过后恢复先来后到，防饿死 |
 | `TG_MODEL_EXTRA` | 空 | 按模型补**缺省**请求体字段（JSON），只补客户端没给的 |
 
 ### 为什么需要保活（Ollama 类上游）
@@ -1071,7 +1140,8 @@ curl -s -X POST http://127.0.0.1:11434/api/generate \
 | `daily_tokens` | int | `0` | 每日 token 上限；`0` = 不限 |
 | `monthly_tokens` | int | `0` | 每月 token 上限；`0` = 不限 |
 | `qps` | int | `5` | 该 key 每秒请求数上限 |
-| `rate_limited` | bool | `false` | 是否启用速率限制 |
+| `rate_limited` | bool | `true` | 是否启用速率限制（新建接口默认 `true`；手写配置不填时也按 `true` 处理） |
+| `priority` | int | `0` | 调度优先级：`>0` 可插队、`0` 普通、`<0` 让路；见「API key 优先级」 |
 | `active` | bool | `true` | 是否启用该 key（`false` 时请求返回 403） |
 | `created` | string | 今天 | 创建日期（仅展示） |
 
@@ -1839,6 +1909,7 @@ python3 tests/test_flash_runtime.py # gmlx 运行时：config 模式命令 / env
 python3 tests/test_serial_lock.py   # 串行锁范围：按 speculative 分档 / 回退开关 / TTL（26 项）
 python3 tests/test_lane_pool.py     # 多模型泳道：解析 / 上下文指纹 / 粘性 / 独占 / 排队 / 速度画像 / 隔离 / 保活 / cap>1（76 项）
 python3 tests/test_lane_capacity.py # 并发感知分派：分档画像 / 按加入档位预测 / host 摊平 / 自动降档与试探恢复（45 项）
+python3 tests/test_key_priority.py # API key 优先级：配置归一 / 排队纪律 / 泳道插队 / 并发槽有界等待（34 项）
 python3 tests/test_model_extra.py   # 按模型补缺省请求体字段：只补客户端没给的 / 坏配置忽略（19 项）
 python3 tools/bench-parallel.py     # 需要真实模型，不是回归用例：并发矩阵（见「小模型并行实测」）
 python3 tools/bench-pool.py         # 需要真实模型：泳道池端到端（串行 vs 并行、粘性、排队，见「多模型泳道」）
@@ -1862,6 +1933,7 @@ python3 tools/mirror-from-github.py --dest ~/gateway-repo  # 用 API 重建本�
 
 | 日期 | 提交 | 内容 |
 |---|---|---|
+| 2026-11-14 | 本次推送 | **API key 优先级：高优先级可以插队**。泳道只有 3 个位置，第 4 个开始排队；排队本身是设计，但之前只有先来后到 —— 后台批处理先到就能把交互请求挡在后面。现在 key 配置多一个 `priority`（整数，缺省 0）：`>0` 插队、`0` 与旧行为一致、`<0` 主动让路。**只认配置、不接受请求头自报**（能自报就等于人人 VIP）。两个落点：① 泳道队列 —— `LanePool.acquire(priority=)` 把优先级写进排队登记簿，判定只在 `_prio_turn` 一处，高优先级越过先到的低优先级去拿刚空出来的泳道；② 全局并发槽 —— `_acquire_conc_slot` 让 VIP 槽满时有界等待（`TG_KEY_PRIO_WAIT`，默认 6s），普通请求仍立刻 429。**防饿死**：让路有窗口 `TG_LANE_PRIO_HOLD`（默认 10s），过后恢复先来后到 —— 慢可以，饿死不行。观测：响应头 `X-TG-Priority`、`/api/admin/lanes` 的 `priority.waiters` 与 `metrics.prio_inserts/prio_holds`、日志 `⏩ …插队拿到泳道…` / `⏳ …等并发槽…`。端到端（隔离实例 + 假上游，单泳道 0.9s/请求）：普通 A 0.91s → **VIP C 1.52s** → 普通 B 2.57s，C 比 B 晚到 0.15s 却先完成。新增 `tests/test_key_priority.py` 34 项；管理 UI 与 `POST /api/admin/keys` 可设该字段。 |
 | 2026-11-14 | 本次推送 | **修掉看门狗两处「误杀健康服务」的缺陷**（均由 11-12 的专项复核定位，属于实现看起来对、只在特定时序下错的类型）。① **判死时 `healthy_since` 未清零**：它的语义是「自这一次连续健康起」，被当成「自上次重启起」用，于是长跑数小时后再崩、恢复的第一探直接判定「已稳定」并把 `restarts` 归零 —— `300/600/1200/1800` 与封顶全部失效，抖动期退化成每 150s 捅一次上游。线上留痕 `16:36:58 判死 → 16:37:18 已稳定 149972s，退避计数归零`。修法一行：判死处补 `healthy_since = 0.0`。② **`probe()` 依赖 `NO_PROXY=*`**：裸 `urlopen` 的默认 opener 在**首次使用**时读 `HTTP_PROXY` 并缓存，进程启动时若有死代理，一个完全健康的上游被判不健康 → 重启没病的服务 → 再探还是红，形成「健康时的自杀循环」；现改为 `build_opener(ProxyHandler({}))`，与代理配置彻底解耦（plist 里的 `NO_PROXY` 保留为第二道保险）。两条都配了回归测试：`tests/test_watchdog.py` 新增 2b/3b 两节共 7 项断言，并做了**双向验证**——旧模块跑新测试失败 5 项（退避 300s 退化为 150s、健康上游被死代理判死），新模块全通过。过程中发现一个测试方法学问题：代理那条**必须用子进程**测，默认 opener 的代理表在第一次 `urlopen` 时就缓存，同进程改环境变量是空断言（第一版测试旧代码也能过）。全仓 21 个测试文件 0 失败，`tg_watchdog.py` 365 行。 |
 | 2026-11-12 | 本次推送 | **并行模型机制升级：从"单请求速度"到"并发感知分派 + 自动降档"**。cap=2 之后调度器必须回答"再塞一单是赚是亏"，实测把并发收益拆成三类：A 跨后端（免费，gpt-oss 与 125B 同跑 83/71，合计 154 tok/s）、B 同后端合批（吞吐 1.44×，但单请求 1.44× 时长）、C 超过 `NUM_PARALLEL` 的排队（单请求 2.0×+，吞吐不涨，净亏）。机制四项：① `spb_by_conc` 按加入时的并发档位分别学 EWMA；② 预测改成 `最早空出 + spb[busy+1] × 生成长度`（往忙泳道塞第二单会被如实定价）；③ `pred` 同分时优先 host 上没人跑的那条（先吃 A 类）；④ **自动降档**——某档膨胀 ≥1.75×（B/C 分界线 1.44 vs 2.0）且连续 3 个样本，就把 `eff_cap` 压回去，冷却 120s 后试探恢复、再挤则冷却翻倍，上游后来开了并行度无需重启。端到端验证两例：生产池 gptoss（NUM_PARALLEL=2）`conc_ratio=0.86` **不降档**；故意给 NUM_PARALLEL=1 的 :11434 配 cap=2（qwen2.5vl:3b）→ 两路 1.96s/3.59s（第二单在排队），日志 `并发 2 档实测慢 1.77x…有效容量 2→1`，之后新请求改为"等 2.69s"而不是假并行。`/api/admin/lanes` 增 `eff_cap`/`cap_reason`/`cap_down_for_s`/`spb_by_conc`/`conc_ratio` 与顶层 `autocap`。新增 `tests/test_lane_capacity.py`（45 项），`test_lane_pool.py` 保持 76 项全绿，全仓 21 个测试文件 0 失败。**已知限制**：`elapsed` 含 prefill，43 token 的冷样本曾把 125B 画像从 0.029 拉到 0.064 s/tok（真值 0.034），故样本门槛 32 token。 |
 | 2026-11-12 | 本次推送 | **只跑这两个模型时再挤一个槽：gpt-oss 泳道 cap=2**。`OLLAMA_NUM_PARALLEL` 默认 1，两个请求进同一模型是**排队**（两并发 2.36s + 4.33s，墙钟等于串行）；设成 2 后两条各 3.30s（同一泳道 1.44×），因为 gpt-oss 是 MoE（3.6B 激活），合批几乎不涨计算量。A/B（同提示、temperature=0、串行基线同为 9.3s）：cap=1 → 1.29/1.34×；**cap=2 → 1.78/1.70×**；5 上下文 1.44~1.46×。为不碰 App 托管的 :11434（没有可靠写 env 的位置），新增 `tools/start-ollama-lane.py` 起专属实例 :11436，`maintain-gateway.sh` 加「2b」段自动拉起。顺带查清一笔账：网关的「输出预算下限」把 `max_tokens: 120` 抬到 2048，gpt-oss 即使 `reasoning_effort=low` 也会生成 ~263 token —— 一句「数到 120」按 260+ token 记账、耗时翻倍，这不是并发变慢（直连同实例两并发仅 2.69s）。 |
