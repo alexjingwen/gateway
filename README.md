@@ -24,6 +24,7 @@
 - [多模型泳道（一个模型一个上下文）](#多模型泳道一个模型一个上下文)
 - [配置字段速查](#配置字段速查)
 - [安全加固](#安全加固)
+- [管理面板：💾 系统资源（内存 / 显存 / 进程 RSS）](#管理面板-系统资源内存--显存--进程-rss)
 - [mem-guard.mjs —— 设备级内存守卫](#mem-guardmjs--设备级内存守卫)
 - [运行时看门狗（内置自愈）](#运行时看门狗内置自愈)
 - [故障排查 / 常见问题](#故障排查--常见问题)
@@ -1267,6 +1268,29 @@ python3 token-gateway.py
 - **令牌不入日志**：启动横幅与日志不打印 admin token / API key 明文。
 - **最小权限**：为每个调用方分配独立 key，设 `qps` / `daily_tokens` / `monthly_tokens`，便于审计与止损。
 
+## 管理面板：💾 系统资源（内存 / 显存 / 进程 RSS）
+
+打开 `http://<host>:3000/` 的仪表盘，第三张卡片就是实时资源视图，随仪表盘 5s 轮询刷新。
+macOS / Apple Silicon 是统一内存架构，"显存"与"内存"同池，所以卡片报告的是三组数据：
+
+| 区块 | 内容 | 数据来源 |
+|---|---|---|
+| 整机内存 | 已用 / 总量、占比条（active/wired/compressed 分段）、free / inactive | `vm_stat` + `sysctl hw.memsize` |
+| GPU | Metal 占用（In use system memory）、device / renderer / tiler 利用率 | `ioreg -r -d 1 IOAccelerator` |
+| 进程 Top 8 | 按 RSS 倒序的进程名与占用，可直接看出是谁在吃内存 | `libproc` 的 `proc_listpids` / `proc_pidinfo` |
+
+- 接口：`GET /api/admin/status` 的顶层 `system` 字段（`ok` / `ts` / `mem` / `gpu` / `swap` / `procs`）；
+- 口径与 [mem-guard](#mem-guardmjs--设备级内存守卫) 一致（活动监视器，不是 free 反推）；
+- 带 2s 缓存，多标签页同时打开不会反复起子进程；
+- **fail-soft**：读不到就返回 `{"ok": false, "error": "unavailable"}`，面板降级显示，绝不让整页崩；
+- 进程枚举走 `libproc` 而不是 `ps`：沙箱/受限环境下 `ps` 常被禁，`libproc` 是同一份内核数据。
+
+> ⚠️ **这块功能丢过一次**（2026-11-14）。它当初只加在生产副本上没有回推仓库，于是
+> "从仓库部署"（一次正常的升级）就把 300 行整块覆盖了，而且**不报任何错** —— 面板少一张卡片，
+> 接口少一个字段，其它一切正常。现在 `tests/test_system_metrics.py` 盯的是**链路四段**
+> （采集函数 → `status` 注入 → `sysCard` DOM → `renderSys` 调用），少一段就红。
+> 教训很直接：**生产副本不是真相，仓库才是**；任何"只在机器上改过"的功能都会在下次部署时蒸发。
+
 ## mem-guard.mjs —— 设备级内存守卫
 
 监控**整台设备**的物理内存使用率，在触及上限前报警 / 采取行动，把"事后 OOM 救火"变成"事前预警"。
@@ -1931,6 +1955,7 @@ python3 tests/test_lane_pool.py     # 多模型泳道：解析 / 上下文指纹
 python3 tests/test_lane_capacity.py # 并发感知分派：分档画像 / 按加入档位预测 / host 摊平 / 自动降档与试探恢复（45 项）
 python3 tests/test_key_priority.py # API key 优先级：配置归一 / 排队纪律 / 泳道插队 / 并发槽有界等待（34 项）
 python3 tests/test_serial_priority.py # 串行闸门优先级：插队 / 同级 FIFO / 唤醒不漏 / 超时不泄漏（30 项）
+python3 tests/test_system_metrics.py # 面板「系统资源」：链路四段 / 内存口径 / 容错降级 / 缓存（27 项）
 python3 tests/test_model_extra.py   # 按模型补缺省请求体字段：只补客户端没给的 / 坏配置忽略（19 项）
 python3 tools/bench-parallel.py     # 需要真实模型，不是回归用例：并发矩阵（见「小模型并行实测」）
 python3 tools/bench-pool.py         # 需要真实模型：泳道池端到端（串行 vs 并行、粘性、排队，见「多模型泳道」）
@@ -1954,6 +1979,7 @@ python3 tools/mirror-from-github.py --dest ~/gateway-repo  # 用 API 重建本�
 
 | 日期 | 提交 | 内容 |
 |---|---|---|
+| 2026-11-14 | 本次推送 | **找回丢失的「💾 系统资源」面板**（整机内存 / Metal 占用 / 进程 RSS Top 8）。它当初只加在生产副本、没有回推仓库，于是 12:42 用仓库版部署（API key 优先级那轮）时整块约 300 行被覆盖，**且不报任何错** —— 面板少一张卡片、`/api/admin/status` 少一个 `system` 字段，其它一切正常，所以直到人工发现才暴露。恢复方式不是「重写一遍」：从 `token-gateway.py.bak.20261114-124234` 按行段提取（采集 202 行 + CSS 18 行 + DOM 4 行 + 渲染 67 行 + 注入 1 行 + `import ctypes`），逐段带边界断言合并回当前版（当前版已含 `_PrioSerialGate`，不能整体回滚），合并后 5755 → 6051 行。顺带发现进程列表在受限环境会返回空（`libproc` 与 `ps` 是同一份内核数据，但 `ps` 常被沙箱禁掉，所以这里坚持用 `libproc`）。新增 `tests/test_system_metrics.py` 27 项，盯**链路四段**（采集 → status 注入 → sysCard DOM → renderSys 调用），少一段即红 —— 这类「静默消失」只能靠断言防。真机读数核对：内存 274.9GB / 已用 69.7% / GPU 99% / llama-server 80.3GB。 |
 | 2026-11-14 | 本次推送 | **串行锁也认优先级：补上 VIP 在主路径上的盲区**。上一版把优先级接进泳道队列与并发槽，但 `auto` 解析出真实模型后**不走 LanePool**，并发槽（默认 10）通常也不满——于是 VIP 与普通请求唯一相遇的地方是 `_proxy_serialized` 里那把 `threading.Semaphore`，而它唤醒顺序不可控、不认优先级。线上表现：`⏳ ... 串行排队 74.1s 后放行` 全是等这把锁，配了 `priority: 100` 也完全空转。改为 `_PrioSerialGate`（ticket + Condition + `_prio_turn`），判定点仍是**同一处**，只是锁这一层传 `strict_tie=True`：锁只有一把、排头必然用得上，所以同级也严格按到场顺序（泳道队列不传——那里排头可能用不上刚空出的那条 lane）。顺带修了 `_prio_turn` 的同级乱序：之前只有在"排头优先级严格更高"时才让路，同级多个线程被 `notify_all` 一起醒来后谁抢到算谁，docstring 承诺的"同级按到场顺序"其实没实现。观测：`/api/admin/lanes` 新增 `serial_gates`（哪个 `host\|model` 被占、几个在等、最高优先级、等最久多久），日志 `⏩ 优先级 100 插队拿到串行锁 <key>（等 0.50s，跳过 N 个等待者）`。端到端（隔离实例走非泳道路径，1.5s/请求）：A 占锁 1.51s → **C Alex(100) 3.02s** → B Open(0) 4.54s，C 后到 0.5s 先完成。新增 `tests/test_serial_priority.py` 30 项，`tests/test_serial_lock.py` 随闸门类型迁移更新为 26 项。 |
 | 2026-11-14 | 本次推送 | **API key 优先级：高优先级可以插队**。泳道只有 3 个位置，第 4 个开始排队；排队本身是设计，但之前只有先来后到 —— 后台批处理先到就能把交互请求挡在后面。现在 key 配置多一个 `priority`（整数，缺省 0）：`>0` 插队、`0` 与旧行为一致、`<0` 主动让路。**只认配置、不接受请求头自报**（能自报就等于人人 VIP）。两个落点：① 泳道队列 —— `LanePool.acquire(priority=)` 把优先级写进排队登记簿，判定只在 `_prio_turn` 一处，高优先级越过先到的低优先级去拿刚空出来的泳道；② 全局并发槽 —— `_acquire_conc_slot` 让 VIP 槽满时有界等待（`TG_KEY_PRIO_WAIT`，默认 6s），普通请求仍立刻 429。**防饿死**：让路有窗口 `TG_LANE_PRIO_HOLD`（默认 10s），过后恢复先来后到 —— 慢可以，饿死不行。观测：响应头 `X-TG-Priority`、`/api/admin/lanes` 的 `priority.waiters` 与 `metrics.prio_inserts/prio_holds`、日志 `⏩ …插队拿到泳道…` / `⏳ …等并发槽…`。端到端（隔离实例 + 假上游，单泳道 0.9s/请求）：普通 A 0.91s → **VIP C 1.52s** → 普通 B 2.57s，C 比 B 晚到 0.15s 却先完成。新增 `tests/test_key_priority.py` 34 项；管理 UI 与 `POST /api/admin/keys` 可设该字段。 |
 | 2026-11-14 | 本次推送 | **修掉看门狗两处「误杀健康服务」的缺陷**（均由 11-12 的专项复核定位，属于实现看起来对、只在特定时序下错的类型）。① **判死时 `healthy_since` 未清零**：它的语义是「自这一次连续健康起」，被当成「自上次重启起」用，于是长跑数小时后再崩、恢复的第一探直接判定「已稳定」并把 `restarts` 归零 —— `300/600/1200/1800` 与封顶全部失效，抖动期退化成每 150s 捅一次上游。线上留痕 `16:36:58 判死 → 16:37:18 已稳定 149972s，退避计数归零`。修法一行：判死处补 `healthy_since = 0.0`。② **`probe()` 依赖 `NO_PROXY=*`**：裸 `urlopen` 的默认 opener 在**首次使用**时读 `HTTP_PROXY` 并缓存，进程启动时若有死代理，一个完全健康的上游被判不健康 → 重启没病的服务 → 再探还是红，形成「健康时的自杀循环」；现改为 `build_opener(ProxyHandler({}))`，与代理配置彻底解耦（plist 里的 `NO_PROXY` 保留为第二道保险）。两条都配了回归测试：`tests/test_watchdog.py` 新增 2b/3b 两节共 7 项断言，并做了**双向验证**——旧模块跑新测试失败 5 项（退避 300s 退化为 150s、健康上游被死代理判死），新模块全通过。过程中发现一个测试方法学问题：代理那条**必须用子进程**测，默认 opener 的代理表在第一次 `urlopen` 时就缓存，同进程改环境变量是空断言（第一版测试旧代码也能过）。全仓 21 个测试文件 0 失败，`tg_watchdog.py` 365 行。 |

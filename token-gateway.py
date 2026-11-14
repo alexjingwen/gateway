@@ -33,6 +33,8 @@ import ssl
 import base64
 import hashlib
 import struct
+import ctypes
+import ctypes.util
 from pathlib import Path
 from collections import defaultdict, deque, OrderedDict
 from typing import Dict, List, Optional, Tuple
@@ -1560,6 +1562,208 @@ def _pull_worker(task_id: str, model_name: str):
                 pull_tasks[task_id]["error"] = str(e)
                 pull_tasks[task_id]["finished"] = time.time()
 
+# ========== 系统资源采集（面板实时内存 / 显存） ==========
+# Apple Silicon 是统一内存架构，"显存"与"内存"同池，没有独立的 VRAM。因此这里报告三组数据：
+#   1) 整机内存：vm_stat + hw.memsize，口径 = active + wired + compressed（对齐活动监视器"已用内存"）
+#   2) GPU 侧：ioreg IOAccelerator 上报的 Metal 占用（In use system memory）与利用率
+#   3) 进程常驻内存 Top N：libproc proc_pidinfo（等价 ps 的 RSS），不依赖 ps 命令
+# 之所以不按监听端口归因：Ollama 的权重在 runner 子进程里、gmlx 的缓冲由 Metal 驱动持有，
+# 监听进程自身 RSS 只有 0.2–1.1 GB，按端口归因会严重失真（实测 8181 的权重在一个独立
+# llama-server 进程里占 80 GB）。枚举全部进程按 RSS 排序才反映真实占用。
+SYS_CACHE_TTL = 2.0
+_SYS_CACHE = {"ts": 0.0, "data": None}
+_SYS_CACHE_LOCK = threading.Lock()
+
+
+def _sh_text(argv, timeout=4.0):
+    """执行命令并返回 stdout；失败返回空串（面板不得因采集失败而报错）。"""
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        return r.stdout if r.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+class _ProcTaskInfo(ctypes.Structure):
+    """对应 macOS <libproc.h> 的 struct proc_taskinfo（96 字节）。"""
+    _fields_ = [
+        ("pti_virtual_size", ctypes.c_uint64),
+        ("pti_resident_size", ctypes.c_uint64),
+        ("pti_total_user", ctypes.c_uint64),
+        ("pti_total_system", ctypes.c_uint64),
+        ("pti_threads_user", ctypes.c_uint64),
+        ("pti_threads_system", ctypes.c_uint64),
+        ("pti_policy", ctypes.c_int32),
+        ("pti_faults", ctypes.c_int32),
+        ("pti_pageins", ctypes.c_int32),
+        ("pti_cow_faults", ctypes.c_int32),
+        ("pti_messages_sent", ctypes.c_int32),
+        ("pti_messages_received", ctypes.c_int32),
+        ("pti_syscalls_mach", ctypes.c_int32),
+        ("pti_syscalls_unix", ctypes.c_int32),
+        ("pti_csw", ctypes.c_int32),
+        ("pti_threadnum", ctypes.c_int32),
+        ("pti_numrunning", ctypes.c_int32),
+        ("pti_priority", ctypes.c_int32),
+    ]
+
+
+def _libproc_init():
+    try:
+        lib = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+        lib.proc_listpids.restype = ctypes.c_int
+        lib.proc_listpids.argtypes = [ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_uint32]
+        lib.proc_pidinfo.restype = ctypes.c_int
+        lib.proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
+                                     ctypes.c_void_p, ctypes.c_int]
+        lib.proc_name.restype = ctypes.c_int
+        lib.proc_name.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+        return lib
+    except Exception:
+        return None
+
+
+_LIBPROC = _libproc_init()
+PROC_ALL_PIDS = 1
+PROC_PIDTASKINFO = 4
+
+
+def _top_process_rss(limit=8):
+    """枚举全部进程按 RSS 倒序返回 [{'pid','name','rss'}]。非 macOS 或库不可用时返回空。"""
+    if _LIBPROC is None:
+        return []
+    try:
+        n = _LIBPROC.proc_listpids(PROC_ALL_PIDS, 0, None, 0)
+        if n <= 0:
+            return []
+        cnt = n // ctypes.sizeof(ctypes.c_int)
+        buf = (ctypes.c_int * (cnt * 2))()
+        got = _LIBPROC.proc_listpids(PROC_ALL_PIDS, 0, buf, ctypes.sizeof(buf))
+        if got <= 0:
+            return []
+        pids = [buf[i] for i in range(got // ctypes.sizeof(ctypes.c_int)) if buf[i] > 0]
+        rows = []
+        for pid in pids:
+            info = _ProcTaskInfo()
+            if _LIBPROC.proc_pidinfo(pid, PROC_PIDTASKINFO, 0,
+                                     ctypes.byref(info), ctypes.sizeof(info)) > 0:
+                if info.pti_resident_size > 0:
+                    rows.append([info.pti_resident_size, pid])
+        rows.sort(reverse=True)
+        out = []
+        for rss, pid in rows[:limit]:
+            namebuf = ctypes.create_string_buffer(64)
+            nm = "?"
+            if _LIBPROC.proc_name(pid, namebuf, 64) > 0:
+                nm = namebuf.value.decode("utf-8", "replace")
+            out.append({"pid": pid, "name": nm, "rss": rss})
+        return out
+    except Exception:
+        return []
+
+
+def _mem_stats():
+    """整机内存（字节）。解析失败时返回 None。"""
+    out = _sh_text(["/usr/bin/vm_stat"])
+    if not out:
+        return None
+    m = re.search(r"page size of (\d+) bytes", out)
+    if not m:
+        return None
+    page = int(m.group(1))
+    pages = {}
+    for line in out.splitlines():
+        mm = re.match(r'"?([A-Za-z][^:"]*)"?:\s+(\d+)\.?\s*$', line.strip())
+        if mm:
+            pages[mm.group(1).strip().lower()] = int(mm.group(2))
+    if "pages active" not in pages:
+        return None
+    total = 0
+    raw = _sh_text(["/usr/sbin/sysctl", "-n", "hw.memsize"]).strip()
+    if raw.isdigit():
+        total = int(raw)
+    if total <= 0:
+        total = int(_sh_text(["/usr/sbin/sysctl", "-n", "hw.memsize"]).strip() or 0)
+    active = pages.get("pages active", 0) * page
+    wired = pages.get("pages wired down", 0) * page
+    compressed = pages.get("pages occupied by compressor", 0) * page
+    free = pages.get("pages free", 0) * page
+    inactive = pages.get("pages inactive", 0) * page
+    used = active + wired + compressed
+    return {
+        "total": total, "used": used, "active": active, "wired": wired,
+        "compressed": compressed, "free": free, "inactive": inactive,
+        "used_pct": round(used / total * 100, 1) if total else 0,
+    }
+
+
+def _gpu_stats():
+    """Metal/GPU 侧占用（统一内存中由 GPU 驱动持有的部分）。"""
+    out = _sh_text(["/usr/sbin/ioreg", "-r", "-d", "1", "-c", "IOAccelerator"], timeout=5.0)
+    if not out:
+        return None
+
+    def grab(key):
+        mm = re.search(r'"%s"=(\d+)' % re.escape(key), out)
+        return int(mm.group(1)) if mm else None
+
+    in_use = grab("In use system memory")
+    pool = grab("Alloc system memory")
+    if in_use is None and pool is None:
+        return None
+    return {
+        "in_use": in_use or 0,
+        "pool": pool or 0,
+        "device_util": grab("Device Utilization %"),
+        "renderer_util": grab("Renderer Utilization %"),
+        "tiler_util": grab("Tiler Utilization %"),
+    }
+
+
+def _swap_stats():
+    out = _sh_text(["/usr/sbin/sysctl", "-n", "vm.swapusage"]).strip()
+    if not out:
+        return None
+
+    def parse(tag):
+        mm = re.search(r"%s = ([\d.]+)([MG])" % tag, out)
+        if not mm:
+            return 0
+        val = float(mm.group(1))
+        return int(val * (1073741824 if mm.group(2) == "G" else 1048576))
+
+    total, used = parse("total"), parse("used")
+    if total <= 0:
+        return None
+    return {"total": total, "used": used}
+
+
+def collect_system_metrics():
+    """面板用的系统资源快照（带 2s 缓存，避免多标签页反复触发子进程）。"""
+    now = time.time()
+    with _SYS_CACHE_LOCK:
+        cached = _SYS_CACHE["data"]
+        if cached is not None and now - _SYS_CACHE["ts"] < SYS_CACHE_TTL:
+            return cached
+    mem = _mem_stats()
+    if mem is None:
+        data = {"ok": False, "error": "unavailable", "ts": now}
+    else:
+        data = {
+            "ok": True,
+            "ts": now,
+            "platform": sys.platform,
+            "mem": mem,
+            "gpu": _gpu_stats(),
+            "swap": _swap_stats(),
+            "procs": _top_process_rss(8),
+        }
+    with _SYS_CACHE_LOCK:
+        _SYS_CACHE["data"] = data
+        _SYS_CACHE["ts"] = now
+    return data
+
+
 # ========== 管理 UI HTML ==========
 ADMIN_UI_HTML = r"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -1615,6 +1819,24 @@ header .logout:hover{border-color:var(--red);color:var(--red)}
 /* 进度条 */
 .bar-wrap{height:6px;background:var(--bg);border-radius:3px;overflow:hidden;margin-top:8px}
 .bar-fill{height:100%;border-radius:3px;transition:width .6s}
+/* 系统资源（内存/显存） */
+.res-head{display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:6px}
+.res-big{font-size:21px;font-weight:700;letter-spacing:-.3px}
+.res-big small{font-size:13px;font-weight:500;color:var(--dim);margin-left:4px}
+.res-stamp{font-size:11px;color:var(--dim)}
+.res-bar{display:flex;height:11px;background:var(--bg);border-radius:6px;overflow:hidden;margin:10px 0}
+.res-seg{height:100%;transition:width .6s ease}
+.res-legend{display:flex;flex-wrap:wrap;gap:14px;font-size:12px;color:var(--dim);margin-bottom:14px}
+.res-legend span{display:flex;align-items:center;gap:5px}
+.res-legend i{width:8px;height:8px;border-radius:2px;display:inline-block;border:1px solid rgba(255,255,255,.14)}
+.res-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+@media(max-width:760px){.res-grid{grid-template-columns:1fr}}
+.res-box{background:var(--surface2);border:1px solid var(--border);border-radius:10px;padding:12px 14px}
+.res-box h3{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.8px;margin-bottom:8px;font-weight:600}
+.res-row{display:flex;justify-content:space-between;align-items:center;gap:10px;font-size:12px;color:var(--dim);padding:3px 0}
+.res-row b{color:var(--text);font-weight:600;font-variant-numeric:tabular-nums}
+.res-mini{height:4px;background:var(--bg);border-radius:2px;overflow:hidden;margin-top:5px}
+.res-mini div{height:100%;border-radius:2px;transition:width .6s}
 /* Key 表格 */
 .table-wrap{overflow-x:auto}
 table{width:100%;border-collapse:collapse;font-size:13px}
@@ -1702,6 +1924,10 @@ tr:hover td{background:var(--surface2)}
 <!-- 仪表盘 -->
 <div class="view active" id="v-dashboard">
 <div class="stats-grid" id="dashStats"></div>
+<div class="card" id="sysCard">
+<h2>💾 系统资源 <span class="res-stamp" id="sysStamp"></span></h2>
+<div id="sysRes"><div class="empty">读取中…</div></div>
+</div>
 <div class="card">
 <h2>📈 近 7 天 Token 用量</h2>
 <div class="chart-wrap"><div class="chart-bar" id="chart7d"></div><div class="chart-x" id="chart7x"></div></div>
@@ -1960,8 +2186,77 @@ document.getElementById('dashStats').innerHTML=`
 <div class="stat"><div class="label">并发</div><div class="value">${d.active_concurrency}/${d.max_concurrency}</div><div class="sub">${d.ollama}</div></div>
 <div class="stat"><div class="label">日志大小</div><div class="value">${d.log_size_mb}MB</div><div class="sub">${d.listen}</div></div>
 `;
+renderSys(d.system);
 load7dChart();
 }catch(e){console.error(e);}
+}
+
+// 系统资源（内存 / 显存）——数据来自后端 collect_system_metrics()，随仪表盘 5s 轮询刷新
+function gb(b){return ((b||0)/1073741824).toFixed(1);}
+function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+function resSeg(v,total,color){
+const w=total?Math.min(100,Math.max(0,v/total*100)):0;
+return `<div class="res-seg" style="width:${w}%;background:${color}"></div>`;
+}
+function renderSys(s){
+const el=document.getElementById('sysRes');
+if(!el)return;
+if(!s||!s.ok||!s.mem){
+el.innerHTML='<div class="empty">系统资源采集不可用（该能力依赖 macOS 的 vm_stat / ioreg）</div>';
+return;
+}
+const m=s.mem,g=s.gpu||{},sw=s.swap||{},procs=s.procs||[];
+const cActive='var(--accent)',cWired='var(--accent2)',cComp='var(--yellow)',cFree='#0d1220';
+const avail=Math.max(0,m.total-m.used);
+const pressure=m.used_pct>90?'var(--red)':(m.used_pct>75?'var(--yellow)':'var(--text)');
+const bar=resSeg(m.active,m.total,cActive)+resSeg(m.wired,m.total,cWired)
++resSeg(m.compressed,m.total,cComp)+resSeg(avail,m.total,cFree);
+let gpuBox='';
+if(g&&(g.in_use||g.pool)){
+const util=g.device_util;
+// GPU 利用率高是 MLX 满载的常态，不是告警项，用主色而非红色
+gpuBox=`<div class="res-box">
+<h3>GPU · Metal（统一内存）</h3>
+<div class="res-row"><span>驱动占用</span><b>${gb(g.in_use)} GB</b></div>
+<div class="res-mini"><div style="width:${g.pool?Math.min(100,g.in_use/g.pool*100).toFixed(1):0}%;background:var(--accent)"></div></div>
+<div class="res-row" style="margin-top:8px"><span>可分配池</span><b>${gb(g.pool)} GB</b></div>
+<div class="res-row"><span>GPU 利用率</span><b style="color:var(--accent)">${util==null?'n/a':util+'%'}</b></div>
+<div class="res-row" style="margin-top:8px;font-size:11px;opacity:.75"><span>Apple Silicon 显存与内存同池，此处为其中被 GPU 驱动持有的部分</span></div>
+</div>`;
+}else{
+gpuBox=`<div class="res-box"><h3>GPU · Metal（统一内存）</h3><div class="res-row"><span>未采集到 GPU 数据</span></div></div>`;
+}
+const maxRss=procs.length?procs[0].rss:1;
+const procRows=procs.map(p=>`<div class="res-row"><span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(p.name)} <span style="opacity:.6">· ${p.pid}</span></span><b>${gb(p.rss)} GB</b></div>
+<div class="res-mini"><div style="width:${Math.max(1.5,p.rss/maxRss*100)}%;background:var(--accent)"></div></div>`).join('');
+el.innerHTML=`
+<div class="res-head">
+<div class="res-big" style="color:${pressure}">${gb(m.used)}<small>/ ${gb(m.total)} GB · ${m.used_pct}% 已用</small></div>
+<div class="res-stamp">可用 ${gb(avail)} GB</div>
+</div>
+<div class="res-bar">${bar}</div>
+<div class="res-legend">
+<span><i style="background:${cActive}"></i>活跃 ${gb(m.active)}G</span>
+<span><i style="background:${cWired}"></i>固定 ${gb(m.wired)}G</span>
+<span><i style="background:${cComp}"></i>压缩 ${gb(m.compressed)}G</span>
+<span><i style="background:${cFree}"></i>空闲 ${gb(avail)}G</span>
+</div>
+<div class="res-grid">
+${gpuBox}
+<div class="res-box">
+<h3>交换 / 余量</h3>
+<div class="res-row"><span>Swap 已用</span><b>${sw.total?gb(sw.used)+' / '+gb(sw.total)+' GB':'未启用'}</b></div>
+<div class="res-row"><span>进程常驻合计</span><b>${gb(procs.reduce((s,p)=>s+p.rss,0))} GB</b></div>
+<div class="res-row"><span>压缩内存</span><b>${gb(m.compressed)} GB</b></div>
+<div class="res-row"><span>缓存(inactive)</span><b>${gb(m.inactive)} GB</b></div>
+</div>
+</div>
+<div class="res-box" style="margin-top:12px">
+<h3>常驻内存 Top ${procs.length} 进程（RSS）</h3>
+${procRows||'<div class="res-row"><span>无数据</span></div>'}
+</div>`;
+const t=new Date((s.ts||Date.now()/1000)*1000);
+document.getElementById('sysStamp').textContent='更新于 '+t.toLocaleTimeString('zh-CN',{hour12:false});
 }
 
 // 7 天图表
@@ -5086,6 +5381,7 @@ iframe{{padding-top:0}}
                 "tailscale_ip": ts_ip,
                 "tailscale_dns": ts_dns,
                 "lane_pool": LANE_POOL.snapshot(),
+                "system": collect_system_metrics(),
             })
             return
 
